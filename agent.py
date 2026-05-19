@@ -23,8 +23,8 @@ logging.basicConfig(
 )
 
 CONFIG_FILE = os.getenv("CFG_FILE", "/opt/render/project/src/config.yaml")
-TRADES_FILE = "/opt/render/project/src/transactions.csv"
-STATE_FILE  = "/opt/render/project/src/state.json"
+TRADES_FILE = "/opt/render/project/src/grid_transactions.csv"
+STATE_FILE  = "/opt/render/project/src/grid_state.json"
 
 GMAIL_USER     = "joshuatec7@gmail.com"
 GMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "").strip()
