@@ -1,4 +1,4 @@
 #!/bin/bash
-# Start bot en agent tegelijk
+# Start grid bot en agent tegelijk
 python3 agent.py &
-python3 diamond_bot.py
+python3 grid_bot.py
