@@ -29,11 +29,11 @@ logging.basicConfig(
 STATE_FILE  = "/opt/render/project/src/grid_state.json"
 TRADES_FILE = "/opt/render/project/src/grid_transactions.csv"
 
-GRID_COINS     = ["BTC/EUR", "ETH/EUR", "XRP/EUR", "SOL/EUR"]
-STAKE_PER_COIN = 75.0   # totaal per coin
-GRID_LEVELS    = 10     # aantal levels
+GRID_COINS     = ["BTC/EUR", "ETH/EUR"]
+STAKE_PER_COIN = 125.0  # totaal per coin
+GRID_LEVELS    = 5      # aantal levels
 RANGE_PCT      = 6.0    # ±6% range
-EUR_RESERVE    = 25.0
+EUR_RESERVE    = 50.0
 LOOP_SLEEP     = 60     # seconden tussen checks
 TAKER_FEE_PCT  = 0.25
 MAX_POSITIONS  = 3      # max open posities per coin tegelijk
@@ -302,3 +302,4 @@ class GridBot:
 if __name__ == "__main__":
     bot = GridBot()
     bot.run()
+    
