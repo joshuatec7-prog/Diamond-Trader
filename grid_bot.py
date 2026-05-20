@@ -30,7 +30,7 @@ STATE_FILE  = "/opt/render/project/src/grid_state.json"
 TRADES_FILE = "/opt/render/project/src/grid_transactions.csv"
 
 GRID_COINS     = ["BTC/EUR", "ETH/EUR"]
-STAKE_PER_COIN = 125.0  # totaal per coin
+STAKE_PER_COIN = 50.0   # €50 per trade
 GRID_LEVELS    = 8      # aantal levels
 RANGE_PCT      = 3.0    # ±3% range
 EUR_RESERVE    = 50.0
@@ -102,7 +102,7 @@ class GridBot:
         high = p * (1 + RANGE_PCT / 100)
         step = (high - low) / GRID_LEVELS
         levels = [round(low + i * step, 8) for i in range(GRID_LEVELS + 1)]
-        stake_per_level = STAKE_PER_COIN / GRID_LEVELS
+        stake_per_level = STAKE_PER_COIN  # €125 per trade, niet gedeeld door levels
 
         LOG.info("GRID SETUP %s | prijs=%.4f | laag=%.4f | hoog=%.4f | stap=%.4f | per_level=%.2f EUR",
                  symbol, p, low, high, step, stake_per_level)
