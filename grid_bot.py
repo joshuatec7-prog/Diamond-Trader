@@ -233,14 +233,27 @@ class GridBot:
             if price >= level:
                 current_level = i
 
-        # KOOP: alle levels onder huidige prijs die nog geen positie hebben
-        for i in range(current_level):
-            if str(i) not in grid["positions"]:
-                self.buy_level(symbol, grid, i)
+        # KOOP: max 3 open posities per coin, alleen dichtstbijzijnde levels
+        max_positions = 3
+        open_pos = len(grid["positions"])
+        if open_pos < max_positions:
+            # Koop de dichtstbijzijnde levels onder huidige prijs
+            slots = max_positions - open_pos
+            bought = 0
+            for i in range(current_level - 1, -1, -1):  # van hoog naar laag
+                if bought >= slots:
+                    break
+                if str(i) not in grid["positions"]:
+                    self.buy_level(symbol, grid, i)
+                    bought += 1
 
-        # VERKOOP: posities waarvan de sell_at prijs geraakt is
+        # VERKOOP: alleen als prijs OMHOOG gaat naar het volgende level
+        # Nooit verkopen onder aankoopprijs
         for level_key, pos in list(grid["positions"].items()):
-            if price >= pos["sell_at"] * 0.999:
+            sell_at = pos["sell_at"]
+            buy_price = pos["buy_price"]
+            # Alleen verkopen als sell_at hoger is dan buy_price EN prijs dat niveau bereikt
+            if sell_at > buy_price * 1.001 and price >= sell_at * 0.999:
                 self.sell_level(symbol, grid, int(level_key))
 
     def run(self):
