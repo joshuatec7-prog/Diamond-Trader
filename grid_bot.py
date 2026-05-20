@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-Diamond Grid Bot
-- Grid trading op BTC/EUR, ETH/EUR, XRP/EUR, SOL/EUR
-- €75 per coin, 10 grid levels per coin
-- Koopt laag, verkoopt hoog binnen een prijsrange
-- Geen trend analyse nodig
+Diamond Grid Bot v2
+- Koopt direct bij opstart op alle levels onder huidige prijs
+- Verkoopt zodra prijs het volgende level bereikt
 """
 import json
 import logging
@@ -13,7 +11,7 @@ import time
 import csv
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 
 import ccxt
 from dotenv import load_dotenv
@@ -27,14 +25,13 @@ logging.basicConfig(
 STATE_FILE  = "/opt/render/project/src/grid_state.json"
 TRADES_FILE = "/opt/render/project/src/grid_transactions.csv"
 
-GRID_COINS = ["BTC/EUR", "ETH/EUR", "XRP/EUR", "SOL/EUR"]
-STAKE_PER_COIN = 75.0
-GRID_LEVELS = 10
-EUR_RESERVE = 25.0
-LOOP_SLEEP = 60  # elke minuut checken
-RANGE_PCT = 8.0  # range is ±8% van huidige prijs bij opstart
-MIN_PROFIT_PCT = 0.3  # minimaal 0.3% winst per grid trade
-TAKER_FEE_PCT = 0.25
+GRID_COINS      = ["BTC/EUR", "ETH/EUR", "XRP/EUR", "SOL/EUR"]
+STAKE_PER_COIN  = 75.0
+GRID_LEVELS     = 10
+EUR_RESERVE     = 25.0
+LOOP_SLEEP      = 30
+RANGE_PCT       = 8.0
+TAKER_FEE_PCT   = 0.25
 
 
 def now_iso():
@@ -69,8 +66,8 @@ def append_csv(row: Dict[str, Any]):
 class GridBot:
     def __init__(self):
         load_dotenv()
-        self.api_key    = os.getenv("BITVAVO_API_KEY", "").strip()
-        self.api_secret = os.getenv("BITVAVO_API_SECRET", "").strip()
+        self.api_key     = os.getenv("BITVAVO_API_KEY", "").strip()
+        self.api_secret  = os.getenv("BITVAVO_API_SECRET", "").strip()
         self.operator_id = os.getenv("BITVAVO_OPERATOR_ID", "").strip()
 
         self.exchange = ccxt.bitvavo({
@@ -81,191 +78,14 @@ class GridBot:
         self.exchange.load_markets()
         self.state = load_state()
 
-    def order_params(self):
+    def params(self):
         return {"operatorId": self.operator_id} if self.operator_id else {}
 
     def get_price(self, symbol: str) -> float:
         ticker = self.exchange.fetch_ticker(symbol)
         return float(ticker.get("last") or 0)
 
-    def setup_grid(self, symbol: str, current_price: float):
-        """Bereken grid levels op basis van huidige prijs."""
-        low  = current_price * (1 - RANGE_PCT / 100)
-        high = current_price * (1 + RANGE_PCT / 100)
-        step = (high - low) / GRID_LEVELS
-
-        levels = []
-        for i in range(GRID_LEVELS + 1):
-            levels.append(round(low + i * step, 8))
-
-        # Verdeel stake over grid levels
-        amount_per_level = (STAKE_PER_COIN / GRID_LEVELS) / current_price
-
-        grid = {
-            "symbol": symbol,
-            "low": low,
-            "high": high,
-            "step": step,
-            "levels": levels,
-            "amount_per_level": amount_per_level,
-            "current_price": current_price,
-            "buy_orders": {},   # level_index -> {"price", "amount", "filled"}
-            "sell_orders": {},  # level_index -> {"price", "amount", "buy_price"}
-            "active": True,
-            "created_at": now_iso(),
-        }
-
-        LOG.info(
-            "GRID SETUP %s | prijs=%.4f | range=%.4f-%.4f | step=%.4f | levels=%s",
-            symbol, current_price, low, high, step, GRID_LEVELS,
-        )
-        return grid
-
-    def check_and_trade(self, symbol: str, grid: Dict[str, Any]):
-        """Check huidige prijs en voer grid trades uit."""
-        try:
-            price = self.get_price(symbol)
-        except Exception as e:
-            LOG.warning("Prijs ophalen mislukt voor %s: %s", symbol, e)
-            return
-
-        levels = grid["levels"]
-        amount = grid["amount_per_level"]
-        low    = grid["low"]
-        high   = grid["high"]
-
-        # Check of prijs buiten range is
-        if price < low * 0.98 or price > high * 1.02:
-            LOG.info("GRID RESET %s | prijs %.4f buiten range %.4f-%.4f", symbol, price, low, high)
-            self.state["grids"][symbol] = self.setup_grid(symbol, price)
-            save_state(self.state)
-            return
-
-        # Zoek het huidige grid level
-        current_level = 0
-        for i, level in enumerate(levels):
-            if price >= level:
-                current_level = i
-
-        # Koop orders: voor elk level onder huidige prijs dat nog niet gekocht is
-        for i in range(current_level):
-            level_key = str(i)
-            buy_price = levels[i]
-            sell_price = levels[i + 1]
-
-            # Skip als al een verkoop order op dit level staat
-            if level_key in grid["sell_orders"]:
-                continue
-
-            # Skip als al een koop order op dit level staat
-            if level_key in grid["buy_orders"]:
-                # Check of koop prijs geraakt is
-                if price <= buy_price * 1.002:
-                    # Voer koop uit
-                    self._execute_buy(symbol, grid, i, buy_price, sell_price, amount)
-                continue
-
-            # Plaats nieuw koop order als prijs dicht bij dit level is
-            if abs(price - buy_price) / buy_price < 0.005:  # binnen 0.5%
-                self._execute_buy(symbol, grid, i, buy_price, sell_price, amount)
-
-        # Verkoop orders: check of prijs een sell level geraakt heeft
-        for level_key, sell_order in list(grid["sell_orders"].items()):
-            sell_price = sell_order["sell_price"]
-            if price >= sell_price * 0.998:
-                self._execute_sell(symbol, grid, int(level_key), sell_order)
-
-    def _execute_buy(self, symbol: str, grid: Dict, level_idx: int, buy_price: float, sell_price: float, amount: float):
-        """Voer een koop uit op een grid level."""
-        level_key = str(level_idx)
-        try:
-            # Controleer minimale orderwaarde
-            min_notional = self._get_min_notional(symbol)
-            order_value = amount * buy_price
-            if order_value < min_notional:
-                amount = (min_notional * 1.05) / buy_price
-
-            amount_str = float(self.exchange.amount_to_precision(symbol, amount))
-            if amount_str <= 0:
-                return
-
-            order = self.exchange.create_order(
-                symbol, "market", "buy", amount_str, None, self.order_params()
-            )
-            actual_price = float(order.get("average") or order.get("price") or buy_price)
-            actual_amount = float(order.get("filled") or order.get("amount") or amount_str)
-            cost = float(order.get("cost") or actual_amount * actual_price)
-            fee = cost * (TAKER_FEE_PCT / 100)
-
-            grid["buy_orders"][level_key] = {
-                "price": actual_price,
-                "amount": actual_amount,
-                "cost": cost,
-            }
-            grid["sell_orders"][level_key] = {
-                "sell_price": sell_price,
-                "amount": actual_amount,
-                "buy_price": actual_price,
-                "buy_cost": cost,
-            }
-
-            save_state(self.state)
-            append_csv({
-                "ts": now_iso(), "market": symbol, "side": "BUY",
-                "price": round(actual_price, 8), "amount": actual_amount,
-                "quote": round(cost, 4), "fee": round(fee, 4), "pnl": "",
-            })
-            LOG.info(
-                "GRID KOOP %s | level=%s | prijs=%.6f | amount=%.6f | cost=%.2f EUR",
-                symbol, level_idx, actual_price, actual_amount, cost,
-            )
-        except Exception as e:
-            LOG.warning("GRID KOOP mislukt %s level %s: %s", symbol, level_idx, e)
-
-    def _execute_sell(self, symbol: str, grid: Dict, level_idx: int, sell_order: Dict):
-        """Voer een verkoop uit op een grid level."""
-        level_key = str(level_idx)
-        try:
-            amount = sell_order["amount"]
-            amount_str = float(self.exchange.amount_to_precision(symbol, amount))
-            if amount_str <= 0:
-                return
-
-            order = self.exchange.create_order(
-                symbol, "market", "sell", amount_str, None, self.order_params()
-            )
-            actual_price = float(order.get("average") or order.get("price") or sell_order["sell_price"])
-            actual_amount = float(order.get("filled") or order.get("amount") or amount_str)
-            sell_revenue = float(order.get("cost") or actual_amount * actual_price)
-            sell_fee = sell_revenue * (TAKER_FEE_PCT / 100)
-            buy_cost = sell_order["buy_cost"]
-            buy_fee = buy_cost * (TAKER_FEE_PCT / 100)
-            pnl = sell_revenue - sell_fee - buy_cost - buy_fee
-
-            self.state["pnl"] = round(self.state.get("pnl", 0.0) + pnl, 4)
-            self.state["trades"] = self.state.get("trades", 0) + 1
-            if pnl > 0:
-                self.state["wins"] = self.state.get("wins", 0) + 1
-
-            # Verwijder sell order, houd level vrij voor nieuwe koop
-            grid["sell_orders"].pop(level_key, None)
-            grid["buy_orders"].pop(level_key, None)
-
-            save_state(self.state)
-            append_csv({
-                "ts": now_iso(), "market": symbol, "side": "SELL",
-                "price": round(actual_price, 8), "amount": actual_amount,
-                "quote": round(sell_revenue, 4), "fee": round(sell_fee, 4),
-                "pnl": round(pnl, 4),
-            })
-            LOG.info(
-                "GRID VERKOOP %s | level=%s | prijs=%.6f | pnl=%.4f EUR | totaal_pnl=%.2f EUR",
-                symbol, level_idx, actual_price, pnl, self.state["pnl"],
-            )
-        except Exception as e:
-            LOG.warning("GRID VERKOOP mislukt %s level %s: %s", symbol, level_idx, e)
-
-    def _get_min_notional(self, symbol: str) -> float:
+    def get_min_notional(self, symbol: str) -> float:
         m = self.exchange.market(symbol)
         limit_cost = (((m.get("limits") or {}).get("cost") or {}).get("min"))
         if limit_cost:
@@ -274,21 +94,160 @@ class GridBot:
         raw = info.get("minOrderInQuoteAsset") or info.get("minOrderInBaseAsset")
         return float(raw) if raw else 5.0
 
-    def print_status(self):
-        pnl    = self.state.get("pnl", 0.0)
-        trades = self.state.get("trades", 0)
-        wins   = self.state.get("wins", 0)
-        winrate = (wins / trades * 100) if trades else 0
-        active_grids = len([g for g in self.state.get("grids", {}).values() if g.get("active")])
-        LOG.info(
-            "STATUS | grids=%s | trades=%s | winrate=%.1f%% | pnl=%.2f EUR",
-            active_grids, trades, winrate, pnl,
-        )
+    def setup_grid(self, symbol: str, price: float) -> Dict:
+        low  = price * (1 - RANGE_PCT / 100)
+        high = price * (1 + RANGE_PCT / 100)
+        step = (high - low) / GRID_LEVELS
+        levels = [round(low + i * step, 8) for i in range(GRID_LEVELS + 1)]
+        amount_per_level = (STAKE_PER_COIN / GRID_LEVELS) / price
+
+        LOG.info("GRID SETUP %s | prijs=%.4f | range=%.4f-%.4f | step=%.4f",
+                 symbol, price, low, high, step)
+
+        return {
+            "symbol": symbol,
+            "low": low, "high": high, "step": step,
+            "levels": levels,
+            "amount_per_level": amount_per_level,
+            "start_price": price,
+            "positions": {},  # level_idx -> {amount, buy_price, buy_cost}
+            "active": True,
+            "created_at": now_iso(),
+        }
+
+    def buy_level(self, symbol: str, grid: Dict, level_idx: int):
+        """Koop op een specifiek grid level."""
+        level_key = str(level_idx)
+        if level_key in grid["positions"]:
+            return  # al gekocht op dit level
+
+        buy_price = grid["levels"][level_idx]
+        amount    = grid["amount_per_level"]
+        min_not   = self.get_min_notional(symbol)
+
+        # Zorg dat order groot genoeg is
+        if amount * buy_price < min_not:
+            amount = (min_not * 1.1) / buy_price
+
+        try:
+            amount_f = float(self.exchange.amount_to_precision(symbol, amount))
+            if amount_f <= 0:
+                return
+
+            order = self.exchange.create_order(
+                symbol, "market", "buy", amount_f, None, self.params()
+            )
+            actual_price  = float(order.get("average") or order.get("price") or buy_price)
+            actual_amount = float(order.get("filled") or order.get("amount") or amount_f)
+            cost          = float(order.get("cost") or actual_amount * actual_price)
+            fee           = cost * (TAKER_FEE_PCT / 100)
+
+            grid["positions"][level_key] = {
+                "amount":    actual_amount,
+                "buy_price": actual_price,
+                "buy_cost":  cost,
+                "sell_at":   grid["levels"][level_idx + 1] if level_idx + 1 < len(grid["levels"]) else actual_price * 1.01,
+            }
+            save_state(self.state)
+            append_csv({
+                "ts": now_iso(), "market": symbol, "side": "BUY",
+                "price": round(actual_price, 8), "amount": actual_amount,
+                "quote": round(cost, 4), "fee": round(fee, 4), "pnl": "",
+            })
+            LOG.info("KOOP %s | level=%s | prijs=%.6f | amount=%.6f | cost=%.2f EUR",
+                     symbol, level_idx, actual_price, actual_amount, cost)
+            time.sleep(0.5)
+
+        except Exception as e:
+            LOG.warning("KOOP mislukt %s level %s: %s", symbol, level_idx, e)
+
+    def sell_level(self, symbol: str, grid: Dict, level_idx: int):
+        """Verkoop positie op een grid level."""
+        level_key = str(level_idx)
+        pos = grid["positions"].get(level_key)
+        if not pos:
+            return
+
+        try:
+            amount_f = float(self.exchange.amount_to_precision(symbol, pos["amount"]))
+            if amount_f <= 0:
+                return
+
+            order = self.exchange.create_order(
+                symbol, "market", "sell", amount_f, None, self.params()
+            )
+            actual_price  = float(order.get("average") or order.get("price") or pos["sell_at"])
+            actual_amount = float(order.get("filled") or order.get("amount") or amount_f)
+            revenue       = float(order.get("cost") or actual_amount * actual_price)
+            sell_fee      = revenue * (TAKER_FEE_PCT / 100)
+            buy_fee       = pos["buy_cost"] * (TAKER_FEE_PCT / 100)
+            pnl           = revenue - sell_fee - pos["buy_cost"] - buy_fee
+
+            self.state["pnl"]    = round(self.state.get("pnl", 0.0) + pnl, 4)
+            self.state["trades"] = self.state.get("trades", 0) + 1
+            if pnl > 0:
+                self.state["wins"] = self.state.get("wins", 0) + 1
+
+            del grid["positions"][level_key]
+            save_state(self.state)
+            append_csv({
+                "ts": now_iso(), "market": symbol, "side": "SELL",
+                "price": round(actual_price, 8), "amount": actual_amount,
+                "quote": round(revenue, 4), "fee": round(sell_fee, 4),
+                "pnl": round(pnl, 4),
+            })
+            LOG.info("VERKOOP %s | level=%s | prijs=%.6f | pnl=%.4f EUR | totaal=%.2f EUR",
+                     symbol, level_idx, actual_price, pnl, self.state["pnl"])
+            time.sleep(0.5)
+
+        except Exception as e:
+            LOG.warning("VERKOOP mislukt %s level %s: %s", symbol, level_idx, e)
+
+    def manage_grid(self, symbol: str):
+        grid = self.state["grids"].get(symbol)
+        if not grid or not grid.get("active"):
+            return
+
+        try:
+            price  = self.get_price(symbol)
+            levels = grid["levels"]
+            low    = grid["low"]
+            high   = grid["high"]
+        except Exception as e:
+            LOG.warning("Prijs ophalen mislukt %s: %s", symbol, e)
+            return
+
+        # Reset als prijs buiten range breekt
+        if price < low * 0.97 or price > high * 1.03:
+            LOG.info("GRID RESET %s | prijs=%.4f buiten range %.4f-%.4f", symbol, price, low, high)
+            # Verkoop eerst alle open posities
+            for level_key in list(grid["positions"].keys()):
+                self.sell_level(symbol, grid, int(level_key))
+            self.state["grids"][symbol] = self.setup_grid(symbol, price)
+            save_state(self.state)
+            return
+
+        # Bepaal huidig level
+        current_level = 0
+        for i, level in enumerate(levels[:-1]):
+            if price >= level:
+                current_level = i
+
+        # KOOP: alle levels onder huidige prijs die nog geen positie hebben
+        for i in range(current_level):
+            if str(i) not in grid["positions"]:
+                self.buy_level(symbol, grid, i)
+
+        # VERKOOP: posities waarvan de sell_at prijs geraakt is
+        for level_key, pos in list(grid["positions"].items()):
+            if price >= pos["sell_at"] * 0.999:
+                self.sell_level(symbol, grid, int(level_key))
 
     def run(self):
-        LOG.info("Diamond Grid Bot gestart | coins=%s | stake=%.0f EUR/coin", GRID_COINS, STAKE_PER_COIN)
+        LOG.info("Diamond Grid Bot v2 gestart | coins=%s | stake=%.0f EUR/coin",
+                 GRID_COINS, STAKE_PER_COIN)
 
-        # Setup grids voor alle coins
+        # Setup grids
         for symbol in GRID_COINS:
             if symbol not in self.state.get("grids", {}):
                 try:
@@ -297,26 +256,23 @@ class GridBot:
                     save_state(self.state)
                     time.sleep(1)
                 except Exception as e:
-                    LOG.error("Grid setup mislukt voor %s: %s", symbol, e)
+                    LOG.error("Grid setup mislukt %s: %s", symbol, e)
 
-        last_status = 0.0
         loop = 0
-
         while True:
             try:
                 for symbol in GRID_COINS:
-                    grid = self.state.get("grids", {}).get(symbol)
-                    if grid and grid.get("active"):
-                        self.check_and_trade(symbol, grid)
+                    self.manage_grid(symbol)
                     time.sleep(1)
-
                 loop += 1
-                if loop % 10 == 0:
-                    self.print_status()
-
+                if loop % 20 == 0:
+                    LOG.info("STATUS | grids=4 | trades=%s | winrate=%.1f%% | pnl=%.2f EUR",
+                             self.state.get("trades", 0),
+                             (self.state.get("wins", 0) / self.state["trades"] * 100)
+                             if self.state.get("trades") else 0,
+                             self.state.get("pnl", 0.0))
             except Exception as e:
                 LOG.exception("Loop fout: %s", e)
-
             time.sleep(LOOP_SLEEP)
 
 
