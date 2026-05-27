@@ -29,11 +29,11 @@ logging.basicConfig(
 STATE_FILE  = "/opt/render/project/src/grid_state.json"
 TRADES_FILE = "/opt/render/project/src/grid_transactions.csv"
 
-GRID_COINS     = ["BTC/EUR", "ETH/EUR", "WLD/EUR"]
+GRID_COINS     = ["BTC/EUR", "ETH/EUR", "SOL/EUR"]
 STAKE_PER_COIN = 50.0   # €50 per trade
 GRID_LEVELS    = 8      # aantal levels
 RANGE_PCT      = 3.0    # ±3% range
-EUR_RESERVE    = 50.0
+EUR_RESERVE    = 100.0  # altijd €100 vrij houden
 LOOP_SLEEP     = 60     # seconden tussen checks
 TAKER_FEE_PCT  = 0.25
 MAX_POSITIONS  = 3      # max open posities per coin tegelijk
@@ -136,6 +136,16 @@ class GridBot:
         min_not = self.min_order(symbol)
         if stake < min_not:
             stake = min_not * 1.1
+
+        # Check of er genoeg saldo is inclusief reserve
+        try:
+            balance = self.exchange.fetch_balance()
+            free_eur = float((balance.get("free") or {}).get("EUR", 0))
+            if free_eur < stake + EUR_RESERVE:
+                LOG.debug("Onvoldoende saldo voor %s: %.2f EUR beschikbaar", symbol, free_eur)
+                return False
+        except Exception:
+            pass
 
         try:
             current_price = self.price(symbol)
