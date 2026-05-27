@@ -30,10 +30,10 @@ STATE_FILE  = "/opt/render/project/src/grid_state.json"
 TRADES_FILE = "/opt/render/project/src/grid_transactions.csv"
 
 GRID_COINS     = ["BTC/EUR", "ETH/EUR", "SOL/EUR"]
-STAKE_PER_COIN = 50.0   # €50 per trade
+STAKE_PER_COIN = 45.0   # €45 per trade
 GRID_LEVELS    = 8      # aantal levels
 RANGE_PCT      = 3.0    # ±3% range
-EUR_RESERVE    = 100.0  # altijd €100 vrij houden
+EUR_RESERVE    = 75.0   # altijd €75 vrij houden
 LOOP_SLEEP     = 60     # seconden tussen checks
 TAKER_FEE_PCT  = 0.25
 MAX_POSITIONS  = 3      # max open posities per coin tegelijk
