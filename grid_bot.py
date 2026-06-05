@@ -261,7 +261,7 @@ class GridBot:
                 break
 
         # VERKOOP: check alle open posities of sell_at bereikt is of stop-loss geraakt
-        stop_loss_pct = 8.0
+        stop_loss_pct = 5.0
         for lk, pos in list(grid["positions"].items()):
             buy_price = pos["buy_price"]
             stop_price = buy_price * (1 - stop_loss_pct / 100)
