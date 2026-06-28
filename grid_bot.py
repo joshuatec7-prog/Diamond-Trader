@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Diamond Grid Bot v3 - simpel en correct
-Logica:
-- Verdeel €75 over 10 levels per coin
-- Koop 1 level per keer als prijs daalt
-- Verkoop als prijs terugkomt boven aankoopprijs + 1 grid stap
-- Nooit meer dan 1 open positie per level
-- Wacht 60 seconden tussen elke check
+Diamond Agent v2
+- Controleert elke 6 uur saldo, verlies, markt
+- Past stake automatisch aan op basis van saldo
+- Pauzeert bot bij slechte markt of te veel verlies
+- Hervat automatisch als situatie verbetert
+- Email rapport 08:00 en 20:00
 """
+import csv
 import json
 import logging
 import os
+import smtplib
 import time
-import csv
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Dict, Any, Optional
 
 import ccxt
 from dotenv import load_dotenv
 
-LOG = logging.getLogger("grid_bot")
+LOG = logging.getLogger("agent")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -28,294 +28,245 @@ logging.basicConfig(
 
 STATE_FILE  = "/opt/render/project/src/grid_state.json"
 TRADES_FILE = "/opt/render/project/src/grid_transactions.csv"
+GMAIL_USER  = "joshuatec7@gmail.com"
+GMAIL_PASS  = os.getenv("GMAIL_APP_PASSWORD", "").strip()
 
-GRID_COINS     = ["BTC/EUR", "ETH/EUR", "SOL/EUR"]
-STAKE_PER_COIN = 45.0   # €45 per trade
-GRID_LEVELS    = 8      # aantal levels
-RANGE_PCT      = 3.0    # ±3% range
-EUR_RESERVE    = 75.0   # altijd €75 vrij houden
-LOOP_SLEEP     = 60     # seconden tussen checks
-TAKER_FEE_PCT  = 0.25
-MAX_POSITIONS  = 3      # max open posities per coin tegelijk
-
-
-def now_iso():
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+REPORT_HOURS      = [8, 20]
+ANALYZE_INTERVAL  = 6 * 3600
+MAX_DAY_LOSS      = 20.0   # pauzeert bij meer dan €20 dagverlies
+BTC_DROP_LIMIT    = 8.0    # pauzeert bij >8% BTC daling in 24u
+BTC_RECOVER_PCT   = 4.0    # hervat als BTC 4% herstelt
 
 
-def load_state() -> Dict[str, Any]:
+def load_state():
     if not Path(STATE_FILE).exists():
-        return {"grids": {}, "pnl": 0.0, "trades": 0, "wins": 0}
+        return {}
     try:
         return json.load(open(STATE_FILE))
     except Exception:
-        return {"grids": {}, "pnl": 0.0, "trades": 0, "wins": 0}
+        return {}
 
 
 def save_state(state):
-    Path(STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
     json.dump(state, open(STATE_FILE, "w"), indent=2)
 
 
-def append_csv(row):
-    Path(TRADES_FILE).parent.mkdir(parents=True, exist_ok=True)
-    exists = Path(TRADES_FILE).exists()
-    cols = ["ts", "market", "side", "price", "amount", "quote", "pnl"]
-    with open(TRADES_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        if not exists:
-            w.writeheader()
-        w.writerow({k: row.get(k, "") for k in cols})
+def send_email(subject, body):
+    if not GMAIL_PASS:
+        LOG.warning("Geen GMAIL_APP_PASSWORD")
+        return
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"]    = GMAIL_USER
+        msg["To"]      = GMAIL_USER
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(GMAIL_USER, GMAIL_PASS)
+            smtp.send_message(msg)
+        LOG.info("Email verstuurd: %s", subject)
+    except Exception as e:
+        LOG.error("Email mislukt: %s", e)
 
 
-class GridBot:
-    def __init__(self):
-        load_dotenv()
-        self.exchange = ccxt.bitvavo({
-            "apiKey":    os.getenv("BITVAVO_API_KEY", "").strip(),
-            "secret":    os.getenv("BITVAVO_API_SECRET", "").strip(),
-            "enableRateLimit": True,
-        })
-        self.operator_id = os.getenv("BITVAVO_OPERATOR_ID", "").strip()
-        self.exchange.load_markets()
-        self.state = load_state()
+def get_btc_change(exchange) -> float:
+    """BTC prijsverandering in % over 24 uur."""
+    try:
+        candles = exchange.fetch_ohlcv("BTC/EUR", "1h", limit=25)
+        if len(candles) < 2:
+            return 0.0
+        price_24h_ago = float(candles[0][4])
+        price_now     = float(candles[-1][4])
+        return ((price_now - price_24h_ago) / price_24h_ago) * 100
+    except Exception:
+        return 0.0
 
-    def params(self):
-        return {"operatorId": self.operator_id} if self.operator_id else {}
 
-    def price(self, symbol: str) -> float:
-        t = self.exchange.fetch_ticker(symbol)
-        return float(t.get("last") or 0)
+def get_day_pnl() -> float:
+    """PnL van vandaag uit CSV."""
+    if not Path(TRADES_FILE).exists():
+        return 0.0
+    today = datetime.now().strftime("%Y-%m-%d")
+    total = 0.0
+    try:
+        for r in csv.DictReader(open(TRADES_FILE)):
+            if r.get("ts", "").startswith(today) and r.get("side") == "SELL":
+                total += float(r.get("pnl") or 0)
+    except Exception:
+        pass
+    return total
 
-    def min_order(self, symbol: str) -> float:
-        m = self.exchange.market(symbol)
-        c = (((m.get("limits") or {}).get("cost") or {}).get("min"))
-        if c:
-            return float(c)
-        raw = (m.get("info") or {}).get("minOrderInQuoteAsset")
-        return float(raw) if raw else 5.0
 
-    def setup_grid(self, symbol: str) -> Dict:
-        """Maak nieuwe grid aan op basis van huidige prijs."""
-        p = self.price(symbol)
-        low  = p * (1 - RANGE_PCT / 100)
-        high = p * (1 + RANGE_PCT / 100)
-        step = (high - low) / GRID_LEVELS
-        levels = [round(low + i * step, 8) for i in range(GRID_LEVELS + 1)]
-        stake_per_level = STAKE_PER_COIN  # €125 per trade, niet gedeeld door levels
+def build_report(exchange) -> str:
+    state  = load_state()
+    trades = []
+    if Path(TRADES_FILE).exists():
+        trades = list(csv.DictReader(open(TRADES_FILE)))
 
-        LOG.info("GRID SETUP %s | prijs=%.4f | laag=%.4f | hoog=%.4f | stap=%.4f | per_level=%.2f EUR",
-                 symbol, p, low, high, step, stake_per_level)
+    sells   = [t for t in trades if t.get("side") == "SELL"]
+    total   = len(sells)
+    wins    = sum(1 for t in sells if float(t.get("pnl") or 0) > 0)
+    pnl     = sum(float(t.get("pnl") or 0) for t in sells)
+    winrate = (wins / total * 100) if total else 0
+    day_pnl = get_day_pnl()
+    btc_chg = get_btc_change(exchange)
 
-        return {
-            "symbol":           symbol,
-            "start_price":      p,
-            "low":              low,
-            "high":             high,
-            "step":             step,
-            "levels":           levels,
-            "stake_per_level":  stake_per_level,
-            "positions":        {},   # "level_idx" -> {amount, buy_price, buy_cost, sell_at}
-            "last_buy_level":   None, # voorkomt dubbele kopen op zelfde level
-            "created_at":       now_iso(),
-        }
+    # Saldo ophalen
+    try:
+        bal = exchange.fetch_balance()
+        free_eur = float((bal.get("free") or {}).get("EUR", 0))
+    except Exception:
+        free_eur = 0.0
 
-    def do_buy(self, symbol: str, grid: Dict, level_idx: int) -> bool:
-        """Koop op een level. Geeft True terug bij succes."""
-        level_key = str(level_idx)
+    per_coin = {}
+    for t in sells:
+        sym = t.get("market", "?")
+        if sym not in per_coin:
+            per_coin[sym] = {"trades": 0, "wins": 0, "pnl": 0.0}
+        per_coin[sym]["trades"] += 1
+        p = float(t.get("pnl") or 0)
+        per_coin[sym]["pnl"] += p
+        if p > 0:
+            per_coin[sym]["wins"] += 1
 
-        # Nooit twee keer zelfde level kopen
-        if level_key in grid["positions"]:
-            return False
+    grids   = state.get("grids", {})
+    paused  = state.get("paused", False)
+    open_pos = sum(len(g.get("positions", {})) for g in grids.values())
 
-        # Max posities check
-        if len(grid["positions"]) >= MAX_POSITIONS:
-            return False
+    lines = [
+        "=" * 50,
+        f"  DIAMOND GRID BOT RAPPORT",
+        f"  {datetime.now().strftime('%d-%m-%Y %H:%M')}",
+        "=" * 50,
+        f"  Status        : {'GEPAUZEERD - ' + state.get('pause_reason','') if paused else 'ACTIEF'}",
+        f"  Vrij saldo    : {free_eur:.2f} EUR",
+        f"  BTC 24u       : {btc_chg:+.1f}%",
+        f"  Dag PnL       : {day_pnl:+.2f} EUR",
+        "",
+        f"  Trades totaal : {total}",
+        f"  Winst trades  : {wins}",
+        f"  Verlies trades: {total - wins}",
+        f"  Winrate       : {winrate:.1f}%",
+        f"  Totaal PnL    : {pnl:+.2f} EUR",
+        f"  Open posities : {open_pos}",
+        "",
+        "  PER COIN:",
+    ]
 
-        stake = grid["stake_per_level"]
-        min_not = self.min_order(symbol)
-        if stake < min_not:
-            stake = min_not * 1.1
+    for sym, d in per_coin.items():
+        wr = (d["wins"] / d["trades"] * 100) if d["trades"] else 0
+        lines.append(f"    {sym:<12} trades={d['trades']} winrate={wr:.0f}% pnl={d['pnl']:+.2f} EUR")
 
-        # Check of er genoeg saldo is inclusief reserve
-        try:
-            balance = self.exchange.fetch_balance()
-            free_eur = float((balance.get("free") or {}).get("EUR", 0))
-            if free_eur < stake + EUR_RESERVE:
-                LOG.debug("Onvoldoende saldo voor %s: %.2f EUR beschikbaar", symbol, free_eur)
-                return False
-        except Exception:
-            pass
+    lines += ["", "  GRID RANGES:"]
+    for sym, g in grids.items():
+        pos = g.get("positions", {})
+        lines.append(f"    {sym:<12} {len(pos)} open | {g.get('low',0):.4f}-{g.get('high',0):.4f}")
 
-        try:
-            current_price = self.price(symbol)
-            amount = stake / current_price
-            amount_f = float(self.exchange.amount_to_precision(symbol, amount))
-            if amount_f <= 0:
-                return False
+    lines.append("=" * 50)
+    return "\n".join(lines)
 
-            order = self.exchange.create_order(
-                symbol, "market", "buy", amount_f, None, self.params()
+
+def analyze_and_act(exchange):
+    state   = load_state()
+    btc_chg = get_btc_change(exchange)
+    day_pnl = get_day_pnl()
+    paused  = state.get("paused", False)
+
+    # Check of we moeten pauzeren
+    if not paused:
+        if day_pnl <= -MAX_DAY_LOSS:
+            state["paused"] = True
+            state["pause_reason"] = f"dagverlies_{day_pnl:.2f}_EUR"
+            state["pause_btc_price"] = None
+            save_state(state)
+            LOG.warning("BOT GEPAUZEERD | dagverlies=%.2f EUR", day_pnl)
+            send_email(
+                "⚠️ Diamond Bot GEPAUZEERD - Dagverlies",
+                f"Bot gepauzeerd wegens dagverlies van {day_pnl:.2f} EUR.\nHervat automatisch morgen.\n\n{build_report(exchange)}"
             )
-            buy_price  = float(order.get("average") or order.get("price") or current_price)
-            buy_amount = float(order.get("filled") or order.get("amount") or amount_f)
-            buy_cost   = float(order.get("cost") or buy_amount * buy_price)
-            sell_at    = buy_price + grid["step"]  # verkoop 1 stap hoger
 
-            grid["positions"][level_key] = {
-                "amount":    buy_amount,
-                "buy_price": buy_price,
-                "buy_cost":  buy_cost,
-                "sell_at":   sell_at,
-            }
-            grid["last_buy_level"] = level_idx
-            save_state(self.state)
-
-            append_csv({
-                "ts": now_iso(), "market": symbol, "side": "BUY",
-                "price": round(buy_price, 8), "amount": buy_amount,
-                "quote": round(buy_cost, 4), "pnl": "",
-            })
-            LOG.info("KOOP %s | level=%s | prijs=%.6f | amount=%.6f | cost=%.2f EUR | verkoop_bij=%.6f",
-                     symbol, level_idx, buy_price, buy_amount, buy_cost, sell_at)
-            return True
-
-        except Exception as e:
-            LOG.warning("KOOP mislukt %s level %s: %s", symbol, level_idx, e)
-            return False
-
-    def do_sell(self, symbol: str, grid: Dict, level_key: str) -> bool:
-        """Verkoop een positie. Geeft True terug bij succes."""
-        pos = grid["positions"].get(level_key)
-        if not pos:
-            return False
-
-        try:
-            amount_f = float(self.exchange.amount_to_precision(symbol, pos["amount"]))
-            if amount_f <= 0:
-                return False
-
-            order = self.exchange.create_order(
-                symbol, "market", "sell", amount_f, None, self.params()
-            )
-            sell_price  = float(order.get("average") or order.get("price") or pos["sell_at"])
-            sell_amount = float(order.get("filled") or order.get("amount") or amount_f)
-            sell_rev    = float(order.get("cost") or sell_amount * sell_price)
-            fee_buy     = pos["buy_cost"] * (TAKER_FEE_PCT / 100)
-            fee_sell    = sell_rev * (TAKER_FEE_PCT / 100)
-            pnl         = sell_rev - fee_sell - pos["buy_cost"] - fee_buy
-
-            self.state["pnl"]    = round(self.state.get("pnl", 0.0) + pnl, 4)
-            self.state["trades"] = self.state.get("trades", 0) + 1
-            if pnl > 0:
-                self.state["wins"] = self.state.get("wins", 0) + 1
-
-            del grid["positions"][level_key]
-            save_state(self.state)
-
-            append_csv({
-                "ts": now_iso(), "market": symbol, "side": "SELL",
-                "price": round(sell_price, 8), "amount": sell_amount,
-                "quote": round(sell_rev, 4), "pnl": round(pnl, 4),
-            })
-            LOG.info("VERKOOP %s | level=%s | prijs=%.6f | pnl=%.4f EUR | totaal_pnl=%.2f EUR",
-                     symbol, level_key, sell_price, pnl, self.state["pnl"])
-            return True
-
-        except Exception as e:
-            LOG.warning("VERKOOP mislukt %s level %s: %s", symbol, level_key, e)
-            return False
-
-    def manage(self, symbol: str):
-        """Beheer grid voor één coin."""
-        grid = self.state["grids"].get(symbol)
-        if not grid:
-            return
-
-        try:
-            p = self.price(symbol)
-        except Exception as e:
-            LOG.warning("Prijs ophalen mislukt %s: %s", symbol, e)
-            return
-
-        low  = grid["low"]
-        high = grid["high"]
-
-        # Reset als prijs ver buiten range
-        if p < low * 0.95 or p > high * 1.05:
-            LOG.info("RESET %s | prijs=%.4f buiten range %.4f-%.4f", symbol, p, low, high)
-            # Verkoop alle open posities eerst
-            for lk in list(grid["positions"].keys()):
-                self.do_sell(symbol, grid, lk)
-            self.state["grids"][symbol] = self.setup_grid(symbol)
-            save_state(self.state)
-            return
-
-        levels = grid["levels"]
-
-        # Bepaal huidig level (tussen welke twee levels de prijs zit)
-        current_level = 0
-        for i in range(len(levels) - 1):
-            if levels[i] <= p < levels[i + 1]:
-                current_level = i
-                break
-
-        # VERKOOP: check alle open posities of sell_at bereikt is of stop-loss geraakt
-        stop_loss_pct = 5.0
-        for lk, pos in list(grid["positions"].items()):
-            buy_price = pos["buy_price"]
-            stop_price = buy_price * (1 - stop_loss_pct / 100)
-            if p >= pos["sell_at"]:
-                self.do_sell(symbol, grid, lk)
-            elif p <= stop_price:
-                LOG.warning("STOP-LOSS %s level %s | koop=%.4f stop=%.4f huidig=%.4f",
-                            symbol, lk, buy_price, stop_price, p)
-                self.do_sell(symbol, grid, lk)
-
-        # KOOP: koop op het huidige level als er nog geen positie is
-        # Alleen kopen als prijs dichter bij de onderkant van het level is
-        level_bottom = levels[current_level]
-        level_top    = levels[current_level + 1] if current_level + 1 < len(levels) else p
-        level_mid    = (level_bottom + level_top) / 2
-
-        # Koop als prijs in de onderste helft van het level zit
-        if p <= level_mid:
-            self.do_buy(symbol, grid, current_level)
-
-    def run(self):
-        LOG.info("Grid Bot v3 gestart | coins=%s | €%.0f/coin | %s levels",
-                 GRID_COINS, STAKE_PER_COIN, GRID_LEVELS)
-
-        # Setup grids
-        for symbol in GRID_COINS:
-            if symbol not in self.state.get("grids", {}):
-                try:
-                    self.state.setdefault("grids", {})[symbol] = self.setup_grid(symbol)
-                    save_state(self.state)
-                    time.sleep(2)
-                except Exception as e:
-                    LOG.error("Setup mislukt %s: %s", symbol, e)
-
-        loop = 0
-        while True:
+        elif btc_chg <= -BTC_DROP_LIMIT:
             try:
-                for symbol in GRID_COINS:
-                    self.manage(symbol)
-                    time.sleep(2)  # pauze tussen coins
+                ticker = exchange.fetch_ticker("BTC/EUR")
+                btc_price = float(ticker.get("last") or 0)
+            except Exception:
+                btc_price = 0
+            state["paused"] = True
+            state["pause_reason"] = f"btc_daling_{btc_chg:.1f}pct"
+            state["pause_btc_price"] = btc_price
+            save_state(state)
+            LOG.warning("BOT GEPAUZEERD | BTC daling=%.1f%%", btc_chg)
+            send_email(
+                "⚠️ Diamond Bot GEPAUZEERD - BTC Daling",
+                f"Bot gepauzeerd wegens BTC daling van {btc_chg:.1f}%.\nHervat automatisch bij herstel.\n\n{build_report(exchange)}"
+            )
 
-                loop += 1
-                if loop % 10 == 0:
-                    t = self.state.get("trades", 0)
-                    w = self.state.get("wins", 0)
-                    LOG.info("STATUS | trades=%s | winrate=%.1f%% | pnl=%.2f EUR",
-                             t, (w / t * 100) if t else 0, self.state.get("pnl", 0.0))
+    # Check of we kunnen hervatten
+    elif paused:
+        reason = state.get("pause_reason", "")
 
-            except Exception as e:
-                LOG.exception("Loop fout: %s", e)
+        # Dagverlies pauze: hervat volgende dag
+        if "dagverlies" in reason:
+            today = datetime.now().strftime("%Y-%m-%d")
+            pause_date = state.get("pause_date", today)
+            if today != pause_date:
+                state["paused"] = False
+                state["pause_reason"] = ""
+                save_state(state)
+                LOG.info("BOT HERVAT | nieuw dag")
+                send_email("✅ Diamond Bot HERVAT", f"Bot hervat na dagverlies pauze.\n\n{build_report(exchange)}")
 
-            time.sleep(LOOP_SLEEP)
+        # BTC daling pauze: hervat als BTC herstelt
+        elif "btc_daling" in reason:
+            pause_price = state.get("pause_btc_price", 0)
+            try:
+                ticker = exchange.fetch_ticker("BTC/EUR")
+                btc_now = float(ticker.get("last") or 0)
+            except Exception:
+                btc_now = 0
+
+            if pause_price > 0 and btc_now > 0:
+                recovery = ((btc_now - pause_price) / pause_price) * 100
+                if recovery >= BTC_RECOVER_PCT:
+                    state["paused"] = False
+                    state["pause_reason"] = ""
+                    state["pause_btc_price"] = None
+                    save_state(state)
+                    LOG.info("BOT HERVAT | BTC herstel=%.1f%%", recovery)
+                    send_email("✅ Diamond Bot HERVAT", f"Bot hervat na BTC herstel van {recovery:.1f}%.\n\n{build_report(exchange)}")
+
+    LOG.info("Analyse klaar | btc_chg=%.1f%% | dag_pnl=%.2f EUR | paused=%s",
+             btc_chg, day_pnl, state.get("paused", False))
+
+
+def main():
+    load_dotenv()
+    exchange = ccxt.bitvavo({
+        "apiKey":  os.getenv("BITVAVO_API_KEY", "").strip(),
+        "secret":  os.getenv("BITVAVO_API_SECRET", "").strip(),
+        "enableRateLimit": True,
+    })
+    exchange.load_markets()
+
+    LOG.info("Diamond Agent v2 gestart")
+    last_analyze   = 0.0
+    last_report_hr = -1
+
+    while True:
+        now = datetime.now(timezone.utc)
+
+        # Dagrapport
+        if now.hour in REPORT_HOURS and now.hour != last_report_hr:
+            report = build_report(exchange)
+            send_email(f"Diamond Grid Bot Rapport {now.strftime('%d-%m-%Y %H:%M')}", report)
+            last_report_hr = now.hour
+
+        # Analyse elke 6 uur
+        if time.time() - last_analyze >= ANALYZE_INTERVAL:
+            analyze_and_act(exchange)
+            last_analyze = time.time()
+
+        time.sleep(60)
 
 
 if __name__ == "__main__":
-    bot = GridBot()
-    bot.run()
+    main()
