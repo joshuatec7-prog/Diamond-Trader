@@ -31,7 +31,7 @@ TRADES_FILE = "/opt/render/project/src/grid_transactions.csv"
 GMAIL_USER  = "joshuatec7@gmail.com"
 GMAIL_PASS  = os.getenv("GMAIL_APP_PASSWORD", "").strip()
 
-REPORT_HOURS      = [8, 20]
+REPORT_HOURS      = [6, 18]  # 06:00 en 18:00 UTC = 08:00 en 20:00 Nederlandse tijd
 ANALYZE_INTERVAL  = 6 * 3600
 MAX_DAY_LOSS      = 20.0   # pauzeert bij meer dan €20 dagverlies
 BTC_DROP_LIMIT    = 8.0    # pauzeert bij >8% BTC daling in 24u
@@ -348,7 +348,7 @@ def main():
             last_report_hr = now.hour
 
         # Wekelijks rapport elke zondag om 09:00
-        if now.weekday() == 6 and now.hour == 9 and now.day != last_weekly_report:
+        if now.weekday() == 6 and now.hour == 7 and now.day != last_weekly_report:  # 07:00 UTC = 09:00 NL
             report = build_weekly_report(exchange)
             send_email(f"📊 Diamond Bot WEEKRAPPORT {now.strftime('%d-%m-%Y')}", report)
             last_weekly_report = now.day
@@ -364,4 +364,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
