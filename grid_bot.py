@@ -117,8 +117,19 @@ class GridBot:
         return total
 
     def get_scaling(self) -> Dict:
-        """Bepaal stake en max posities op basis van saldo."""
-        saldo = self.free_eur()
+        """Bepaal stake en max posities op basis van totaal saldo."""
+        # Gebruik totaal saldo (vrij + ingezet) voor schaling
+        bal = self.fetch_balance()
+        free = float((bal.get("free") or {}).get("EUR", 0))
+        used = float((bal.get("used") or {}).get("EUR", 0))
+        # Tel ook ingezette grid posities mee
+        ingezet = sum(
+            float(p.get("buy_cost", 0))
+            for g in self.state.get("grids", {}).values()
+            for p in g.get("positions", {}).values()
+        )
+        saldo = free + ingezet
+        LOG.debug("Schaling check | vrij=%.2f ingezet=%.2f totaal=%.2f", free, ingezet, saldo)
         for s in SCALING:
             if s["min"] <= saldo < s["max"]:
                 return s
