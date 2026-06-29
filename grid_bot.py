@@ -43,7 +43,7 @@ SCALING = [
     {"min": 2500,  "max": 3500,  "stake": 110, "max_pos": 4},
     {"min": 3500,  "max": 99999, "stake": 140, "max_pos": 5},
 ]
-RESERVE_PCT = 20  # altijd 20% van saldo als reserve
+RESERVE_PCT = 10  # altijd 10% van totaal inleg als reserve
 
 
 def now_iso():
@@ -148,7 +148,9 @@ class GridBot:
         LOG.info("Totaal inleg bijgewerkt: %.2f EUR (+%.2f)", self.state["total_inleg"], extra)
 
     def reserve(self) -> float:
-        return self.free_eur() * (RESERVE_PCT / 100)
+        # Reserve = 10% van totaal inleg, minimaal €100
+        total_inleg = float(self.state.get("total_inleg", self.free_eur()))
+        return max(100.0, total_inleg * (RESERVE_PCT / 100))
 
     def price(self, symbol: str) -> float:
         t = self.exchange.fetch_ticker(symbol)
