@@ -250,6 +250,35 @@ def build_weekly_report(exchange) -> str:
 
 
 
+def update_inleg_if_needed(exchange):
+    """Check of er nieuwe stortingen zijn en update total_inleg."""
+    state = load_state()
+    try:
+        # Haal transacties op van Bitvavo
+        bal = exchange.fetch_balance()
+        free = float((bal.get("free") or {}).get("EUR", 0))
+        ingezet = sum(
+            float(p.get("buy_cost", 0))
+            for g in state.get("grids", {}).values()
+            for p in g.get("positions", {}).values()
+        )
+        actueel_totaal = free + ingezet
+        opgeslagen = float(state.get("total_inleg", 0))
+
+        # Als actueel totaal meer dan €50 hoger is dan opgeslagen → nieuwe storting
+        if actueel_totaal > opgeslagen + 50:
+            verschil = actueel_totaal - opgeslagen
+            state["total_inleg"] = actueel_totaal
+            save_state(state)
+            LOG.info("Nieuwe storting gedetecteerd: +%.2f EUR | totaal inleg: %.2f EUR", verschil, actueel_totaal)
+            send_email(
+                "💰 Diamond Bot - Storting gedetecteerd",
+                f"Nieuwe storting van ~{verschil:.0f} EUR gedetecteerd. Totaal inleg: {actueel_totaal:.2f} EUR. Bot schaalt automatisch op."
+            )
+    except Exception as e:
+        LOG.warning("Inleg check mislukt: %s", e)
+
+
 def analyze_and_act(exchange):
     state   = load_state()
     btc_chg = get_btc_change(exchange)
@@ -356,6 +385,7 @@ def main():
 
         # Analyse elke 6 uur
         if time.time() - last_analyze >= ANALYZE_INTERVAL:
+            update_inleg_if_needed(exchange)
             analyze_and_act(exchange)
             last_analyze = time.time()
 
@@ -364,3 +394,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
