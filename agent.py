@@ -33,7 +33,7 @@ TRADES_FILE = "/opt/render/project/src/grid_transactions.csv"
 GMAIL_USER  = "joshuatec7@gmail.com"
 GMAIL_PASS  = os.getenv("GMAIL_APP_PASSWORD", "").strip()
 
-REPORT_HOURS_UTC = [6, 18]   # 08:00 en 20:00 NL tijd
+REPORT_HOURS_UTC = [6, 10, 14, 18]   # 08:00, 12:00, 16:00 en 20:00 NL tijd
 ANALYZE_INTERVAL = 6 * 3600  # elke 6 uur analyseren
 BTC_DROP_LIMIT   = 8.0        # % daling om te pauzeren
 BTC_RECOVER_PCT  = 4.0        # % herstel om te hervatten
