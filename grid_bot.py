@@ -37,11 +37,11 @@ STOP_LOSS_PCT = 5.0
 
 # Automatische schaling op basis van saldo
 SCALING = [
-    {"min": 0,     "max": 1000,  "stake": 30,  "max_pos": 2},
-    {"min": 1000,  "max": 2000,  "stake": 60,  "max_pos": 3},
-    {"min": 2000,  "max": 3000,  "stake": 90,  "max_pos": 4},
-    {"min": 3000,  "max": 4000,  "stake": 110, "max_pos": 4},
-    {"min": 4000,  "max": 99999, "stake": 140, "max_pos": 5},
+    {"min": 0,     "max": 800,   "stake": 30,  "max_pos": 2},
+    {"min": 800,   "max": 1500,  "stake": 60,  "max_pos": 3},
+    {"min": 1500,  "max": 2500,  "stake": 90,  "max_pos": 4},
+    {"min": 2500,  "max": 3500,  "stake": 110, "max_pos": 4},
+    {"min": 3500,  "max": 99999, "stake": 140, "max_pos": 5},
 ]
 RESERVE_PCT = 20  # altijd 20% van saldo als reserve
 
@@ -117,23 +117,35 @@ class GridBot:
         return total
 
     def get_scaling(self) -> Dict:
-        """Bepaal stake en max posities op basis van totaal saldo."""
-        # Gebruik totaal saldo (vrij + ingezet) voor schaling
-        bal = self.fetch_balance()
-        free = float((bal.get("free") or {}).get("EUR", 0))
-        used = float((bal.get("used") or {}).get("EUR", 0))
-        # Tel ook ingezette grid posities mee
-        ingezet = sum(
-            float(p.get("buy_cost", 0))
-            for g in self.state.get("grids", {}).values()
-            for p in g.get("positions", {}).values()
-        )
-        saldo = free + ingezet
-        LOG.debug("Schaling check | vrij=%.2f ingezet=%.2f totaal=%.2f", free, ingezet, saldo)
+        """Bepaal stake en max posities op basis van totaal gestort bedrag."""
+        # Gebruik opgeslagen totaal inleg voor schaling - niet het vrije saldo
+        total_inleg = float(self.state.get("total_inleg", 0))
+        if total_inleg == 0:
+            # Eerste keer: bereken totaal saldo en sla op
+            bal = self.fetch_balance()
+            free = float((bal.get("free") or {}).get("EUR", 0))
+            ingezet = sum(
+                float(p.get("buy_cost", 0))
+                for g in self.state.get("grids", {}).values()
+                for p in g.get("positions", {}).values()
+            )
+            total_inleg = free + ingezet
+            self.state["total_inleg"] = total_inleg
+            save_state(self.state)
+            LOG.info("Totaal inleg opgeslagen: %.2f EUR", total_inleg)
+
+        LOG.debug("Schaling op basis van inleg: %.2f EUR", total_inleg)
         for s in SCALING:
-            if s["min"] <= saldo < s["max"]:
+            if s["min"] <= total_inleg < s["max"]:
                 return s
         return SCALING[-1]
+
+    def update_total_inleg(self, extra: float) -> None:
+        """Verhoog totaal inleg bij nieuwe storting."""
+        current = float(self.state.get("total_inleg", 0))
+        self.state["total_inleg"] = current + extra
+        save_state(self.state)
+        LOG.info("Totaal inleg bijgewerkt: %.2f EUR (+%.2f)", self.state["total_inleg"], extra)
 
     def reserve(self) -> float:
         return self.free_eur() * (RESERVE_PCT / 100)
