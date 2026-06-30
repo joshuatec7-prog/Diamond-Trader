@@ -34,8 +34,8 @@ MAX_POSITIONS = 4        # max open posities per coin
 LOOP_SLEEP   = 60        # seconden tussen checks
 TAKER_FEE    = 0.25      # 0.25% Bitvavo fee
 
-STATE_FILE  = "/opt/render/project/src/grid_state.json"
-TRADES_FILE = "/opt/render/project/src/grid_transactions.csv"
+STATE_FILE  = "/var/data/grid_state.json"
+TRADES_FILE = "/var/data/grid_transactions.csv"
 
 # Schaling op basis van total_inleg
 # (min_inleg, stake_per_trade, max_positions)
