@@ -243,6 +243,13 @@ def manage_coin(exchange, symbol: str, op_id: str, state: dict):
             try_sell(exchange, symbol, key, pos, price, op_id, state, "stop_loss")
             time.sleep(0.5)
 
+    # Geen nieuwe aankopen als er nog gesyncte posities open staan
+    positions = grid.get("positions", {})
+    has_synced = any(p.get("ts", "").startswith("2026-06-30T06:00") for p in positions.values())
+    if has_synced:
+        LOG.info("SKIP KOOP %s | gesyncte posities nog open", symbol)
+        return
+
     # Nieuwe aankopen op grid levels
     total_inleg = float(state.get("total_inleg", 1795))
     stake, _ = get_stake_and_max(total_inleg)
