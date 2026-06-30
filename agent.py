@@ -28,8 +28,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-STATE_FILE  = "/opt/render/project/src/grid_state.json"
-TRADES_FILE = "/opt/render/project/src/grid_transactions.csv"
+STATE_FILE  = "/var/data/grid_state.json"
+TRADES_FILE = "/var/data/grid_transactions.csv"
 GMAIL_USER  = "joshuatec7@gmail.com"
 GMAIL_PASS  = os.getenv("GMAIL_APP_PASSWORD", "").strip()
 
