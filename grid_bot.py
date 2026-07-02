@@ -259,8 +259,8 @@ def manage_coin(exchange, symbol: str, op_id: str, state: dict):
     levels = grid.get("levels", [])
 
     for i, level in enumerate(levels[:-1]):  # niet het hoogste level kopen
-        # Koop als prijs binnen 0.6% van dit level is en level onder huidige prijs
-        if abs(price - level) / level < 0.006 and price > level:
+        # Koop als prijs binnen 1% van dit level is en level onder huidige prijs
+        if abs(price - level) / level < 0.01 and price > level:
             try_buy(exchange, symbol, i, level, stake, op_id, state)
             time.sleep(0.3)
 
