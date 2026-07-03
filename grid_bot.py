@@ -48,11 +48,49 @@ SCHALING = [
 ]
 
 
-def get_stake_and_max(total_inleg: float):
+WEEKLY_STAKE_STEP = 5
+WEEKLY_STAKE_MAX  = 140
+
+
+def get_stake_and_max(total_inleg: float, state: dict = None):
+    """Max_positions blijft uit SCHALING komen (o.b.v. total_inleg).
+    De stake zelf komt uit state['manual_stake'] als die bestaat
+    (wekelijks opgehoogd), anders val terug op de SCHALING-tabel."""
+    default_stake, max_pos_default = 45, 3
     for min_inleg, stake, max_pos in SCHALING:
         if total_inleg >= min_inleg:
-            return stake, max_pos
-    return 45, 3
+            default_stake, max_pos_default = stake, max_pos
+            break
+
+    if state is not None and "manual_stake" in state:
+        return float(state["manual_stake"]), max_pos_default
+    return default_stake, max_pos_default
+
+
+def maybe_bump_weekly_stake(state: dict):
+    """Verhoogt de stake elke zondag met WEEKLY_STAKE_STEP, tot max WEEKLY_STAKE_MAX.
+    Verhoogt maar 1x per week, ongeacht hoe vaak de loop op zondag draait."""
+    now = datetime.now(timezone.utc)
+    if now.weekday() != 6:  # 6 = zondag
+        return
+
+    today_str = now.strftime("%Y-%m-%d")
+    if state.get("last_stake_bump") == today_str:
+        return  # vandaag al gebeurd
+
+    if "manual_stake" not in state:
+        # start bij de huidige schaling-stake
+        total_inleg = float(state.get("total_inleg", 1795))
+        current_stake, _ = get_stake_and_max(total_inleg)
+        state["manual_stake"] = current_stake
+
+    if state["manual_stake"] < WEEKLY_STAKE_MAX:
+        oud = state["manual_stake"]
+        state["manual_stake"] = min(state["manual_stake"] + WEEKLY_STAKE_STEP, WEEKLY_STAKE_MAX)
+        LOG.info("WEKELIJKSE STAKE VERHOOGD | %.0f -> %.0f EUR", oud, state["manual_stake"])
+
+    state["last_stake_bump"] = today_str
+    save_state(state)
 
 
 def load_state() -> dict:
@@ -117,7 +155,7 @@ def try_buy(exchange, symbol: str, level_idx: int, level_price: float,
 
     # Check: max posities bereikt?
     total_inleg = float(state.get("total_inleg", 1795))
-    _, max_pos = get_stake_and_max(total_inleg)
+    _, max_pos = get_stake_and_max(total_inleg, state)
     if len(grid["positions"]) >= max_pos:
         return False
 
@@ -255,7 +293,7 @@ def manage_coin(exchange, symbol: str, op_id: str, state: dict):
 
     # Nieuwe aankopen op grid levels
     total_inleg = float(state.get("total_inleg", 1795))
-    stake, _ = get_stake_and_max(total_inleg)
+    stake, _ = get_stake_and_max(total_inleg, state)
     levels = grid.get("levels", [])
 
     for i, level in enumerate(levels[:-1]):  # niet het hoogste level kopen
@@ -283,15 +321,16 @@ def main():
         save_state(state)
 
     total_inleg = float(state.get("total_inleg", 1795))
-    stake, max_pos = get_stake_and_max(total_inleg)
+    stake, max_pos = get_stake_and_max(total_inleg, state)
     LOG.info("Diamond Grid Bot v4 gestart | total_inleg=%.2f EUR | stake=%d EUR | max_pos=%d",
              total_inleg, stake, max_pos)
 
     while True:
         try:
             state = load_state()  # herlaad state elke loop (agent kan pauzeren)
+            maybe_bump_weekly_stake(state)  # elke zondag stake +5, max 140
             total_inleg = float(state.get("total_inleg", 1795))
-            stake, _ = get_stake_and_max(total_inleg)
+            stake, _ = get_stake_and_max(total_inleg, state)
 
             if state.get("paused", False):
                 LOG.info("Bot gepauzeerd: %s", state.get("pause_reason", ""))
