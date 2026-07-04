@@ -86,10 +86,18 @@ def cleanup_rapport_emails(bewaar: int = 2):
             imap.login(GMAIL_USER, GMAIL_PASS)
 
             # Zoek in alle mail (ook gearchiveerde/gelabelde mails)
-            imap.select('"[Gmail]/All Mail"')
+            # BELANGRIJK: select() moet OK teruggeven, anders blijft de IMAP-sessie
+            # in AUTH-state hangen en faalt search() met "illegal in state AUTH".
+            status, _ = imap.select('"[Gmail]/All Mail"')
+            if status != "OK":
+                LOG.error("Cleanup mislukt: kon '[Gmail]/All Mail' niet selecteren (status=%s)", status)
+                return
 
             # Zoek rapport-mails van onszelf met "Diamond" in het onderwerp
-            _, data = imap.search(None, '(FROM "joshuatec7@gmail.com" SUBJECT "Diamond")')
+            status, data = imap.search(None, '(FROM "joshuatec7@gmail.com" SUBJECT "Diamond")')
+            if status != "OK":
+                LOG.error("Cleanup mislukt: search gaf status=%s terug", status)
+                return
             mail_ids = data[0].split()
 
             if len(mail_ids) <= bewaar:
