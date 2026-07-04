@@ -33,9 +33,32 @@ MAX_POSITIONS = 4
 STAKE        = 125.0      # fictief bedrag, geen echt geld
 LOOP_SLEEP   = 60
 TAKER_FEE    = 0.25
+TREND_FILTER_PCT = 0.0    # alleen shorten als 24u-verandering onder dit % ligt (negatief = dalend)
+COIN_STOP_LOSS = {        # per-coin override, whipsaw-coins krijgen krappere stop
+    "ADA/EUR": 2.5,
+}
+MOMENTUM_CANDLES   = 12    # aantal 5-min candles terugkijken (~1 uur)
+MOMENTUM_TIMEFRAME = "5m"
 
 STATE_FILE  = "/var/data/short_test_state.json"
 TRADES_FILE = "/var/data/short_test_transactions.csv"
+
+
+def get_momentum_direction(exchange, symbol):
+    """Simpel momentum-signaal: vergelijkt de laatste candle-close met het
+    gemiddelde van de vorige MOMENTUM_CANDLES candles. Negatief = dalende trend
+    (goed voor shorts), positief = stijgende trend (niet shorten)."""
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=MOMENTUM_TIMEFRAME, limit=MOMENTUM_CANDLES + 1)
+        if len(ohlcv) < MOMENTUM_CANDLES + 1:
+            return 0.0
+        closes = [c[4] for c in ohlcv]
+        avg_prev = sum(closes[:-1]) / len(closes[:-1])
+        last = closes[-1]
+        return (last - avg_prev) / avg_prev * 100  # % afwijking t.o.v. gemiddelde
+    except Exception as e:
+        LOG.warning("Momentum ophalen mislukt %s: %s", symbol, e)
+        return 0.0
 
 
 def load_state():
@@ -85,10 +108,11 @@ def try_short(symbol, level_idx, level_price, price, state):
     if len(grid["positions"]) >= MAX_POSITIONS:
         return
 
+    stop_pct = COIN_STOP_LOSS.get(symbol, STOP_LOSS)
     amount = STAKE / price
     entry_cost = STAKE
     take_profit_at = price * (1 - SELL_MARGIN / 100)   # winst bij daling
-    stop_at        = price * (1 + STOP_LOSS / 100)     # verlies-stop bij stijging
+    stop_at        = price * (1 + stop_pct / 100)      # verlies-stop bij stijging
 
     grid["positions"][key] = {
         "amount": amount, "entry_price": price, "entry_cost": entry_cost,
@@ -129,6 +153,9 @@ def manage_coin(exchange, symbol, state):
     try:
         ticker = exchange.fetch_ticker(symbol)
         price = float(ticker.get("last") or ticker.get("close") or 0)
+        change_pct = ticker.get("percentage")  # 24u verandering in %
+        if change_pct is None:
+            change_pct = 0.0
         if price <= 0:
             return
     except Exception as e:
@@ -151,6 +178,17 @@ def manage_coin(exchange, symbol, state):
             try_close(symbol, key, pos, price, state, "take_profit")
         elif price >= pos["stop_at"]:
             try_close(symbol, key, pos, price, state, "stop_loss")
+
+    # Trend-filter: alleen nieuwe shorts als 24u-trend niet positief is
+    if change_pct > TREND_FILTER_PCT:
+        LOG.info("SKIP SHORT %s | 24u-trend=%+.2f%% (positief, niet shorten)", symbol, change_pct)
+        return
+
+    # Momentum-filter: alleen shorten als kortetermijn-momentum ook niet stijgend is
+    momentum = get_momentum_direction(exchange, symbol)
+    if momentum > 0:
+        LOG.info("SKIP SHORT %s | momentum=%+.2f%% (stijgend, niet shorten)", symbol, momentum)
+        return
 
     # Nieuwe shorts openen: prijs binnen 1% boven een grid-level
     levels = grid.get("levels", [])
