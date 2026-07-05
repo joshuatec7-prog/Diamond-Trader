@@ -29,7 +29,7 @@ logging.basicConfig(
 GRID_COINS   = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR", "ADA/EUR"]
 GRID_LEVELS  = 8
 RANGE_PCT    = 3.0       # ±3% range
-STOP_LOSS    = 5.0       # 5% stop-loss per positie
+STOP_LOSS    = 3.0       # 3% stop-loss per positie (was 5% — verlaagt max verlies bij worst-case)
 MAX_POSITIONS = 4        # max open posities per coin
 LOOP_SLEEP   = 60        # seconden tussen checks
 TAKER_FEE    = 0.25      # 0.25% Bitvavo fee
