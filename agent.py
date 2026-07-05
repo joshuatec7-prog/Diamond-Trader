@@ -37,7 +37,7 @@ GMAIL_USER  = "joshuatec7@gmail.com"
 GMAIL_PASS  = os.getenv("GMAIL_APP_PASSWORD", "").strip()
 
 REPORT_HOURS_UTC = [4, 8, 12, 16, 20]   # 06:00, 10:00, 14:00, 18:00 en 22:00 NL tijd
-ANALYZE_INTERVAL = 6 * 3600  # elke 6 uur analyseren
+ANALYZE_INTERVAL = 15 * 60  # elke 15 minuten analyseren (sneller ingrijpen bij verlies)
 BTC_DROP_LIMIT   = 8.0        # % daling om te pauzeren
 BTC_RECOVER_PCT  = 4.0        # % herstel om te hervatten
 MAX_DAY_LOSS_PCT = 1.5        # % van total_inleg als dagverlies limiet
