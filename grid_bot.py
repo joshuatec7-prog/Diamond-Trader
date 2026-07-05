@@ -47,6 +47,10 @@ SCHALING = [
     (0,    45,  3),
 ]
 
+COIN_MAX_POSITIONS = {   # per-coin override op max_pos, ADA whipsaws vaak -> minder blootstelling
+    "ADA/EUR": 2,
+}
+
 
 WEEKLY_STAKE_STEP = 5
 WEEKLY_STAKE_MAX  = 140
@@ -156,6 +160,7 @@ def try_buy(exchange, symbol: str, level_idx: int, level_price: float,
     # Check: max posities bereikt?
     total_inleg = float(state.get("total_inleg", 1795))
     _, max_pos = get_stake_and_max(total_inleg, state)
+    max_pos = COIN_MAX_POSITIONS.get(symbol, max_pos)
     if len(grid["positions"]) >= max_pos:
         return False
 
