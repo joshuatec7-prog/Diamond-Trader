@@ -88,9 +88,9 @@ def cleanup_rapport_emails(bewaar: int = 2):
             # Zoek in alle mail (ook gearchiveerde/gelabelde mails)
             # BELANGRIJK: select() moet OK teruggeven, anders blijft de IMAP-sessie
             # in AUTH-state hangen en faalt search() met "illegal in state AUTH".
-            status, _ = imap.select('"[Gmail]/All Mail"')
+            status, _ = imap.select('"[Gmail]/Alle e-mail"')
             if status != "OK":
-                LOG.error("Cleanup mislukt: kon '[Gmail]/All Mail' niet selecteren (status=%s)", status)
+                LOG.error("Cleanup mislukt: kon '[Gmail]/Alle e-mail' niet selecteren (status=%s)", status)
                 return
 
             # Zoek rapport-mails van onszelf met "Diamond" in het onderwerp
