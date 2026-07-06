@@ -51,6 +51,8 @@ COIN_MAX_POSITIONS = {   # per-coin override op max_pos, ADA whipsaws vaak -> mi
     "ADA/EUR": 2,
 }
 
+TREND_DROP_LIMIT = -3.0  # % 24u-daling waarboven geen nieuwe aankopen meer worden gedaan
+
 
 WEEKLY_STAKE_STEP = 5
 WEEKLY_STAKE_MAX  = 140
@@ -257,6 +259,9 @@ def manage_coin(exchange, symbol: str, op_id: str, state: dict):
     try:
         ticker = exchange.fetch_ticker(symbol)
         price  = float(ticker.get("last") or ticker.get("close") or 0)
+        change_pct = ticker.get("percentage")
+        if change_pct is None:
+            change_pct = 0.0
         if price <= 0:
             return
     except Exception as e:
@@ -300,6 +305,11 @@ def manage_coin(exchange, symbol: str, op_id: str, state: dict):
     total_inleg = float(state.get("total_inleg", 1795))
     stake, _ = get_stake_and_max(total_inleg, state)
     levels = grid.get("levels", [])
+
+    # Trend-filter: bij sterke 24u-daling geen nieuwe aankopen (voorkomt bijkopen in dalende markt)
+    if change_pct <= TREND_DROP_LIMIT:
+        LOG.info("SKIP KOOP %s | 24u-trend=%+.2f%% (te negatief, geen nieuwe aankopen)", symbol, change_pct)
+        return
 
     for i, level in enumerate(levels[:-1]):  # niet het hoogste level kopen
         # Koop als prijs binnen 1% van dit level is en level onder huidige prijs
