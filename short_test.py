@@ -39,6 +39,7 @@ COIN_STOP_LOSS = {        # per-coin override, whipsaw-coins krijgen krappere st
 }
 MOMENTUM_CANDLES   = 12    # aantal 5-min candles terugkijken (~1 uur)
 MOMENTUM_TIMEFRAME = "5m"
+MAX_HOLD_HOURS = 12         # sluit positie automatisch als tp/stop niet binnen deze tijd geraakt wordt
 
 STATE_FILE  = "/var/data/short_test_state.json"
 TRADES_FILE = "/var/data/short_test_transactions.csv"
@@ -171,13 +172,19 @@ def manage_coin(exchange, symbol, state):
         state["grids"][symbol]["positions"] = old_positions
         grid = state["grids"][symbol]
 
-    # Bestaande shorts checken: winst nemen of stop-loss
+    # Bestaande shorts checken: winst nemen, stop-loss, of max-houdtijd overschreden
     for key in list(grid["positions"].keys()):
         pos = grid["positions"][key]
         if price <= pos["take_profit_at"]:
             try_close(symbol, key, pos, price, state, "take_profit")
-        elif price >= pos["stop_at"]:
+            continue
+        if price >= pos["stop_at"]:
             try_close(symbol, key, pos, price, state, "stop_loss")
+            continue
+        opened = datetime.fromisoformat(pos["ts"])
+        hours_open = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
+        if hours_open >= MAX_HOLD_HOURS:
+            try_close(symbol, key, pos, price, state, "max_hold_tijd")
 
     # Trend-filter: alleen nieuwe shorts als 24u-trend niet positief is
     if change_pct > TREND_FILTER_PCT:
