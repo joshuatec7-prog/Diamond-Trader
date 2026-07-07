@@ -101,6 +101,14 @@ def print_matched_trades(n=10):
         print(f"  {m['coin']}: koop {m['buy_time']} -> verkoop {m['sell_time']} | "
               f"{m['amount']} | PnL €{m['pnl']:+.2f}")
 
+    # totaal over alle matched trades (niet alleen de laatste n)
+    totaal_pnl = sum(m["pnl"] for m in matched if m["pnl"] is not None)
+    totaal_trades = sum(1 for m in matched if m["pnl"] is not None)
+    wins = sum(1 for m in matched if m["pnl"] is not None and m["pnl"] > 0)
+    winrate = (wins / totaal_trades * 100) if totaal_trades else 0
+    print(f"\n=== TOTAAL (alle gematchte trades) ===")
+    print(f"  Trades: {totaal_trades} | Wins: {wins} | Winrate: {winrate:.1f}% | Totaal PnL: €{totaal_pnl:+.2f}")
+
     print("\n=== NOG OPEN KOOPPOSITIES (ongematcht) ===")
     for coin, buys in open_buys.items():
         for b in buys:
