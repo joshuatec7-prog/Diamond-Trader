@@ -30,12 +30,16 @@ RANGE_PCT    = 3.0
 STOP_LOSS    = 5.0        # % stijging t.o.v. short-entry = stop-loss
 SELL_MARGIN  = 0.8        # % daling t.o.v. entry = winst nemen (zelfde als live bot)
 MAX_POSITIONS = 4
+COIN_MAX_POSITIONS = {    # per-coin override, whipsaw-coins krijgen minder blootstelling
+    "ETH/EUR": 2,
+}
 STAKE        = 125.0      # fictief bedrag, geen echt geld
 LOOP_SLEEP   = 60
 TAKER_FEE    = 0.25
 TREND_FILTER_PCT = 0.0    # alleen shorten als 24u-verandering onder dit % ligt (negatief = dalend)
 COIN_STOP_LOSS = {        # per-coin override, whipsaw-coins krijgen krappere stop
     "ADA/EUR": 2.5,
+    "ETH/EUR": 2.5,
 }
 MOMENTUM_CANDLES   = 12    # aantal 5-min candles terugkijken (~1 uur)
 MOMENTUM_TIMEFRAME = "5m"
@@ -106,7 +110,7 @@ def try_short(symbol, level_idx, level_price, price, state):
     key = str(level_idx)
     if key in grid["positions"]:
         return
-    if len(grid["positions"]) >= MAX_POSITIONS:
+    if len(grid["positions"]) >= COIN_MAX_POSITIONS.get(symbol, MAX_POSITIONS):
         return
 
     stop_pct = COIN_STOP_LOSS.get(symbol, STOP_LOSS)
