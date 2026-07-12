@@ -51,7 +51,8 @@ COIN_MAX_POSITIONS = {   # per-coin override op max_pos, ADA whipsaws vaak -> mi
     "ADA/EUR": 2,
 }
 
-TREND_DROP_LIMIT = -3.0  # % 24u-daling waarboven geen nieuwe aankopen meer worden gedaan
+TREND_DROP_LIMIT = -3.0            # % 24u-daling waarboven geen nieuwe aankopen meer worden gedaan
+STOP_LOSS_COOLDOWN_HOURS = 4        # geen nieuwe aankopen bij een coin binnen dit aantal uur na een stop-loss
 
 
 WEEKLY_STAKE_STEP = 5
@@ -236,6 +237,10 @@ def try_sell(exchange, symbol: str, key: str, pos: dict,
             state["wins"] += 1
         state["pnl"] = round(state.get("pnl", 0) + pnl, 4)
         del state["grids"][symbol]["positions"][key]
+
+        if reason == "stop_loss":
+            state.setdefault("cooldowns", {})[symbol] = datetime.now(timezone.utc).isoformat()
+
         save_state(state)
 
         log_trade("SELL", symbol, amount, sell_price, sell_rev, pnl)
@@ -310,6 +315,16 @@ def manage_coin(exchange, symbol: str, op_id: str, state: dict):
     if change_pct <= TREND_DROP_LIMIT:
         LOG.info("SKIP KOOP %s | 24u-trend=%+.2f%% (te negatief, geen nieuwe aankopen)", symbol, change_pct)
         return
+
+    # Cooldown: net een stop-loss geraakt? Niet meteen weer instappen (vallend mes)
+    cooldown_ts = state.get("cooldowns", {}).get(symbol)
+    if cooldown_ts:
+        last_sl = datetime.fromisoformat(cooldown_ts)
+        hours_since = (datetime.now(timezone.utc) - last_sl).total_seconds() / 3600
+        if hours_since < STOP_LOSS_COOLDOWN_HOURS:
+            LOG.info("SKIP KOOP %s | cooldown na stop-loss, nog %.1f uur te gaan",
+                     symbol, STOP_LOSS_COOLDOWN_HOURS - hours_since)
+            return
 
     for i, level in enumerate(levels[:-1]):  # niet het hoogste level kopen
         # Koop als prijs binnen 1% van dit level is en level onder huidige prijs
