@@ -53,6 +53,9 @@ COIN_MAX_POSITIONS = {   # per-coin override op max_pos, ADA whipsaws vaak -> mi
 
 TREND_DROP_LIMIT = -3.0            # % 24u-daling waarboven geen nieuwe aankopen meer worden gedaan
 STOP_LOSS_COOLDOWN_HOURS = 4        # geen nieuwe aankopen bij een coin binnen dit aantal uur na een stop-loss
+MARKET_WIDE_SL_COUNT = 3            # aantal coins dat binnen het tijdsvenster hieronder stop-loss moet raken
+MARKET_WIDE_SL_WINDOW_MIN = 30      # tijdsvenster in minuten om gelijktijdige stop-losses te detecteren
+MARKET_WIDE_COOLDOWN_HOURS = 6      # pauze voor ALLE coins na een markt-brede crash
 
 
 WEEKLY_STAKE_STEP = 5
@@ -98,6 +101,25 @@ def maybe_bump_weekly_stake(state: dict):
 
     state["last_stake_bump"] = today_str
     save_state(state)
+
+
+def market_wide_pause_active(state: dict) -> bool:
+    """Kijkt of er recent (binnen MARKET_WIDE_SL_WINDOW_MIN) genoeg verschillende
+    coins een stop-loss hebben geraakt om als markt-brede crash te gelden, en of
+    de daaropvolgende cooldown-periode nog loopt."""
+    events = state.get("recent_stop_losses", [])
+    now = datetime.now(timezone.utc)
+    window_start = now.timestamp() - (MARKET_WIDE_SL_WINDOW_MIN * 60)
+    recent = [e for e in events if datetime.fromisoformat(e["ts"]).timestamp() >= window_start]
+    coins_hit = {e["symbol"] for e in recent}
+
+    if len(coins_hit) < MARKET_WIDE_SL_COUNT:
+        return False
+
+    # laatste stop-loss in deze cluster bepaalt start van de cooldown
+    laatste = max(datetime.fromisoformat(e["ts"]) for e in recent)
+    hours_since = (now - laatste).total_seconds() / 3600
+    return hours_since < MARKET_WIDE_COOLDOWN_HOURS
 
 
 def load_state() -> dict:
@@ -240,6 +262,15 @@ def try_sell(exchange, symbol: str, key: str, pos: dict,
 
         if reason == "stop_loss":
             state.setdefault("cooldowns", {})[symbol] = datetime.now(timezone.utc).isoformat()
+            state.setdefault("recent_stop_losses", []).append({
+                "symbol": symbol, "ts": datetime.now(timezone.utc).isoformat()
+            })
+            # oude entries opruimen (ouder dan het detectie-venster, ruim gemarged)
+            cutoff = datetime.now(timezone.utc).timestamp() - (MARKET_WIDE_SL_WINDOW_MIN * 60 * 3)
+            state["recent_stop_losses"] = [
+                e for e in state["recent_stop_losses"]
+                if datetime.fromisoformat(e["ts"]).timestamp() >= cutoff
+            ]
 
         save_state(state)
 
@@ -253,7 +284,7 @@ def try_sell(exchange, symbol: str, key: str, pos: dict,
         return False
 
 
-def manage_coin(exchange, symbol: str, op_id: str, state: dict):
+def manage_coin(exchange, symbol: str, op_id: str, state: dict, skip_new_buys: bool = False):
     """Beheer grid voor één coin."""
     if state.get("paused", False):
         return
@@ -311,6 +342,9 @@ def manage_coin(exchange, symbol: str, op_id: str, state: dict):
     stake, _ = get_stake_and_max(total_inleg, state)
     levels = grid.get("levels", [])
 
+    if skip_new_buys:
+        return
+
     # Trend-filter: bij sterke 24u-daling geen nieuwe aankopen (voorkomt bijkopen in dalende markt)
     if change_pct <= TREND_DROP_LIMIT:
         LOG.info("SKIP KOOP %s | 24u-trend=%+.2f%% (te negatief, geen nieuwe aankopen)", symbol, change_pct)
@@ -364,6 +398,16 @@ def main():
 
             if state.get("paused", False):
                 LOG.info("Bot gepauzeerd: %s", state.get("pause_reason", ""))
+                time.sleep(LOOP_SLEEP)
+                continue
+
+            if market_wide_pause_active(state):
+                LOG.info("MARKT-BREDE COOLDOWN actief | geen nieuwe aankopen, bestaande posities lopen door")
+                for symbol in GRID_COINS:
+                    manage_coin(exchange, symbol, op_id, state, skip_new_buys=True)
+                    time.sleep(1)
+                LOG.info("Loop klaar (markt-brede cooldown) | total_inleg=%.2f | stake=%.0f | pnl=%+.2f | trades=%d",
+                         total_inleg, stake, state.get("pnl", 0), state.get("trades", 0))
                 time.sleep(LOOP_SLEEP)
                 continue
 
