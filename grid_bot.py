@@ -3,9 +3,15 @@
 Diamond Grid Bot v4
 - 5 coins: BTC, ETH, SOL, XRP, ADA
 - Stake automatisch op basis van total_inleg in state.json
-- Stop-loss 5% per positie
+- Stop-loss 3% per positie
 - Bestaande posities lopen door, nieuwe op juiste stake
 - Reserve = 10% van total_inleg, minimaal €100
+
+WIJZIGING 14-07-2026: paused blokkeert nu alleen nieuwe aankopen.
+Bestaande posities houden hun stop-loss en take-profit. Voorheen zette
+paused ALLES stil, waardoor open posities onbeheerd bleven staan tijdens
+precies die momenten (BTC-crash, dagverlies) waarop bewaking het hardst
+nodig is.
 """
 
 import csv
@@ -285,10 +291,11 @@ def try_sell(exchange, symbol: str, key: str, pos: dict,
 
 
 def manage_coin(exchange, symbol: str, op_id: str, state: dict, skip_new_buys: bool = False):
-    """Beheer grid voor één coin."""
-    if state.get("paused", False):
-        return
+    """Beheer grid voor één coin.
 
+    LET OP: de paused-check die hier stond is verwijderd. Deze functie moet
+    ook draaien tijdens een pauze, anders staan open posities onbeheerd.
+    Het blokkeren van nieuwe aankopen gebeurt via skip_new_buys."""
     grid = state["grids"].get(symbol)
 
     # Huidige prijs ophalen
@@ -397,7 +404,11 @@ def main():
             stake, _ = get_stake_and_max(total_inleg, state)
 
             if state.get("paused", False):
-                LOG.info("Bot gepauzeerd: %s", state.get("pause_reason", ""))
+                LOG.info("Bot gepauzeerd: %s | bestaande posities blijven bewaakt",
+                         state.get("pause_reason", ""))
+                for symbol in GRID_COINS:
+                    manage_coin(exchange, symbol, op_id, state, skip_new_buys=True)
+                    time.sleep(1)
                 time.sleep(LOOP_SLEEP)
                 continue
 
