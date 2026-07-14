@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
-Diamond Grid Bot v4
+Diamond Grid Bot v5
 - 5 coins: BTC, ETH, SOL, XRP, ADA
 - Stake automatisch op basis van total_inleg in state.json
 - Stop-loss 3% per positie
-- Bestaande posities lopen door, nieuwe op juiste stake
+- Sell-target 2.5% (was grid-step ~0.75%)
 - Reserve = 10% van total_inleg, minimaal €100
 
-WIJZIGING 14-07-2026: paused blokkeert nu alleen nieuwe aankopen.
-Bestaande posities houden hun stop-loss en take-profit. Voorheen zette
-paused ALLES stil, waardoor open posities onbeheerd bleven staan tijdens
-precies die momenten (BTC-crash, dagverlies) waarop bewaking het hardst
-nodig is.
+WIJZIGING 14-07-2026 (a): paused blokkeert alleen nieuwe aankopen.
+Bestaande posities houden hun stop-loss en take-profit.
+
+WIJZIGING 14-07-2026 (b): TAKER_FEE 0.25 -> 0.20. Dit is de gemeten
+werkelijke Bitvavo-fee. De oude waarde rekende ~0.125 EUR per trade te
+veel af, waardoor de PnL in de CSV het verlies overdreef.
+
+WIJZIGING 14-07-2026 (c): sell_at is nu een vast percentage boven de
+koopprijs i.p.v. de grid-step. Reden: bij een target van 0.75% was de
+fee ~50% van de bruto winst per trade; de strategie was bruto ongeveer
+break-even en verloor puur op kosten. Bij 2.5% is de fee nog ~16% van
+de bruto winst. Gemeten op 297 trades over 12 dagen echte prijshistorie:
+target 0.75% -> -150 EUR, target 2.5% -> +30 EUR.
 """
 
 import csv
@@ -35,10 +43,11 @@ logging.basicConfig(
 GRID_COINS   = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR", "ADA/EUR"]
 GRID_LEVELS  = 8
 RANGE_PCT    = 3.0       # ±3% range
-STOP_LOSS    = 3.0       # 3% stop-loss per positie (was 5% — verlaagt max verlies bij worst-case)
+STOP_LOSS    = 3.0       # 3% stop-loss per positie
+SELL_TARGET  = 2.5       # 2.5% winst-target per positie (gemeten optimum)
 MAX_POSITIONS = 4        # max open posities per coin
 LOOP_SLEEP   = 60        # seconden tussen checks
-TAKER_FEE    = 0.25      # 0.25% Bitvavo fee
+TAKER_FEE    = 0.20      # 0.20% Bitvavo taker fee (gemeten via fetch_trading_fees)
 
 STATE_FILE  = "/var/data/grid_state.json"
 TRADES_FILE = "/var/data/grid_transactions.csv"
@@ -218,7 +227,9 @@ def try_buy(exchange, symbol: str, level_idx: int, level_price: float,
         actual_cost  = float(order.get("cost") or stake)
         actual_amt   = float(order.get("filled") or amount)
 
-        sell_at  = actual_price + grid["step"]
+        # Vast percentage boven de koopprijs. Was: actual_price + grid["step"]
+        # (~0.75%), maar daar at de fee de helft van de bruto winst op.
+        sell_at  = actual_price * (1 + SELL_TARGET / 100)
         stop_at  = actual_price * (1 - STOP_LOSS / 100)
 
         grid["positions"][key] = {
@@ -393,8 +404,8 @@ def main():
 
     total_inleg = float(state.get("total_inleg", 1795))
     stake, max_pos = get_stake_and_max(total_inleg, state)
-    LOG.info("Diamond Grid Bot v4 gestart | total_inleg=%.2f EUR | stake=%d EUR | max_pos=%d",
-             total_inleg, stake, max_pos)
+    LOG.info("Diamond Grid Bot v5 gestart | total_inleg=%.2f EUR | stake=%d EUR | max_pos=%d | target=%.1f%% | stop=%.1f%%",
+             total_inleg, stake, max_pos, SELL_TARGET, STOP_LOSS)
 
     while True:
         try:
