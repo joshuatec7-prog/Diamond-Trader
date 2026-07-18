@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Diamond Diagnose
+Diamond Diagnose v2
 
 Dit programma:
 - leest dezelfde config.yaml als diamond_bot.py;
-- controleert per munt de trend, RSI, ATR en spread;
-- schrijft in de Render-logs waarom een munt wel of niet door de filters komt;
-- plaatst geen orders;
-- verandert geen posities of bestanden van de bot.
+- controleert per munt trend, RSI, ATR en spread;
+- toont een duidelijke koopscore;
+- legt uit waarom niet wordt gekocht;
+- plaatst nooit orders;
+- wijzigt geen posities of botbestanden.
 """
 
 import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import ccxt
 import pandas as pd
@@ -36,7 +37,6 @@ CFG_FILE = os.getenv(
     "/opt/render/project/src/config.yaml",
 ).strip()
 
-# Elke 15 minuten een diagnose
 LOOP_SLEEP_SECONDS = 15 * 60
 
 
@@ -58,10 +58,24 @@ def to_bool(value: Any, default: bool = False) -> bool:
 
     normalized = str(value).strip().lower()
 
-    if normalized in {"1", "true", "yes", "ja", "aan", "on"}:
+    if normalized in {
+        "1",
+        "true",
+        "yes",
+        "ja",
+        "aan",
+        "on",
+    }:
         return True
 
-    if normalized in {"0", "false", "no", "nee", "uit", "off"}:
+    if normalized in {
+        "0",
+        "false",
+        "no",
+        "nee",
+        "uit",
+        "off",
+    }:
         return False
 
     return default
@@ -281,6 +295,44 @@ def get_symbols(
     ]
 
 
+def result_label(
+    passed_checks: int,
+    total_checks: int,
+) -> str:
+    if total_checks <= 0:
+        return "ONBEKEND"
+
+    percentage = (
+        passed_checks
+        / total_checks
+        * 100.0
+    )
+
+    if percentage >= 100:
+        return "TECHNISCH KOOPSIGNAAL"
+
+    if percentage >= 75:
+        return "BIJNA KOOPSIGNAAL"
+
+    if percentage >= 50:
+        return "MATIG"
+
+    return "GEEN KOOP"
+
+
+def check_result(
+    name: str,
+    passed: bool,
+    detail: str,
+) -> Tuple[str, bool]:
+    status = "OK" if passed else "NIET_OK"
+
+    return (
+        f"{name}={detail}:{status}",
+        passed,
+    )
+
+
 def diagnose_symbol(
     exchange: ccxt.Exchange,
     config: Dict[str, Any],
@@ -482,14 +534,13 @@ def diagnose_symbol(
         0.0,
     )
 
-    if close_price > 0:
-        atr_pct = (
-            atr_value
-            / close_price
-            * 100.0
-        )
-    else:
-        atr_pct = 0.0
+    atr_pct = (
+        atr_value
+        / close_price
+        * 100.0
+        if close_price > 0
+        else 0.0
+    )
 
     spread_pct = calculate_spread_pct(
         ticker
@@ -498,34 +549,42 @@ def diagnose_symbol(
     checks: List[str] = []
     reasons: List[str] = []
 
+    passed_checks = 0
+    total_checks = 0
+
     if use_sma:
+        total_checks += 1
+
         trend_ok = (
             close_price > sma_fast
             and sma_fast > sma_slow
         )
 
         if trend_ok:
-            checks.append(
-                "trend=OK"
-            )
+            passed_checks += 1
         else:
-            checks.append(
-                "trend=NIET_OK"
-            )
-
             reasons.append(
                 "trend niet stijgend "
                 f"(koers={close_price:.8f}, "
                 f"SMA{sma_fast_length}={sma_fast:.8f}, "
                 f"SMA{sma_slow_length}={sma_slow:.8f})"
             )
-    else:
-        trend_ok = True
-        checks.append(
-            "trend=UIT"
+
+        check_text, _ = check_result(
+            "trend",
+            trend_ok,
+            (
+                "stijgend"
+                if trend_ok
+                else "dalend"
+            ),
         )
 
+        checks.append(check_text)
+
     if use_rsi:
+        total_checks += 1
+
         rsi_ok = (
             rsi_min
             <= rsi_value
@@ -533,95 +592,105 @@ def diagnose_symbol(
         )
 
         if rsi_ok:
-            checks.append(
-                f"RSI={rsi_value:.2f}:OK"
+            passed_checks += 1
+        elif rsi_value < rsi_min:
+            reasons.append(
+                f"RSI te laag "
+                f"({rsi_value:.2f} < {rsi_min:.2f})"
             )
         else:
-            checks.append(
-                f"RSI={rsi_value:.2f}:NIET_OK"
+            reasons.append(
+                f"RSI te hoog "
+                f"({rsi_value:.2f} > {rsi_max:.2f})"
             )
 
-            if rsi_value < rsi_min:
-                reasons.append(
-                    f"RSI te laag "
-                    f"({rsi_value:.2f} < {rsi_min:.2f})"
-                )
-            else:
-                reasons.append(
-                    f"RSI te hoog "
-                    f"({rsi_value:.2f} > {rsi_max:.2f})"
-                )
-    else:
-        rsi_ok = True
-        checks.append(
-            "RSI=UIT"
+        check_text, _ = check_result(
+            "RSI",
+            rsi_ok,
+            f"{rsi_value:.2f}",
         )
 
+        checks.append(check_text)
+
     if use_atr:
+        total_checks += 1
+
         atr_ok = (
             atr_pct >= min_atr_pct
         )
 
         if atr_ok:
-            checks.append(
-                f"ATR={atr_pct:.3f}%:OK"
-            )
+            passed_checks += 1
         else:
-            checks.append(
-                f"ATR={atr_pct:.3f}%:NIET_OK"
-            )
-
             reasons.append(
                 "beweging te klein "
                 f"({atr_pct:.3f}% < {min_atr_pct:.3f}%)"
             )
-    else:
-        atr_ok = True
-        checks.append(
-            "ATR=UIT"
+
+        check_text, _ = check_result(
+            "ATR",
+            atr_ok,
+            f"{atr_pct:.3f}%",
         )
+
+        checks.append(check_text)
+
+    total_checks += 1
 
     spread_ok = (
         spread_pct <= max_spread_pct
     )
 
     if spread_ok:
-        checks.append(
-            f"spread={spread_pct:.3f}%:OK"
-        )
+        passed_checks += 1
     else:
-        checks.append(
-            f"spread={spread_pct:.3f}%:NIET_OK"
-        )
-
         reasons.append(
             "spread te groot "
             f"({spread_pct:.3f}% > {max_spread_pct:.3f}%)"
         )
 
-    technical_buy_signal = (
-        trend_ok
-        and rsi_ok
-        and atr_ok
-        and spread_ok
+    check_text, _ = check_result(
+        "spread",
+        spread_ok,
+        f"{spread_pct:.3f}%",
+    )
+
+    checks.append(check_text)
+
+    score_pct = (
+        passed_checks
+        / total_checks
+        * 100.0
+        if total_checks > 0
+        else 0.0
+    )
+
+    decision = result_label(
+        passed_checks,
+        total_checks,
     )
 
     LOG.info(
-        "DIAGNOSE %s | %s | BESLISSING=%s",
+        "DIAGNOSE %s | score=%d/%d %.0f%% | %s | BESLISSING=%s",
         symbol,
+        passed_checks,
+        total_checks,
+        score_pct,
         " | ".join(checks),
-        (
-            "TECHNISCH KOOPSIGNAAL"
-            if technical_buy_signal
-            else "GEEN KOOP"
-        ),
+        decision,
     )
 
     if reasons:
         LOG.info(
-            "DIAGNOSE %s | REDENEN: %s",
+            "DIAGNOSE %s | BLOKKADES: %s",
             symbol,
             " ; ".join(reasons),
+        )
+
+    if decision == "BIJNA KOOPSIGNAAL":
+        LOG.info(
+            "DIAGNOSE %s | LET OP: slechts één voorwaarde blokkeert de koop",
+            symbol,
         )
 
 
@@ -675,7 +744,7 @@ def main() -> None:
     exchange = create_exchange()
 
     LOG.info(
-        "Diamond Diagnose gestart"
+        "Diamond Diagnose v2 gestart"
     )
 
     LOG.info(
