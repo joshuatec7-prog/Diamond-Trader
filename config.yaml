@@ -117,6 +117,7 @@ short:
 files:
   state_file: /var/data/diamond_state.json
   trades_file: /var/data/diamond_transactions.csv
+  control_file: /var/data/diamond_control.json
 
 logging:
   level: INFO
