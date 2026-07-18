@@ -968,18 +968,66 @@ class Bot:
             return "short_trend_break"
         return None
 
-    def order_fee_quote(self, order: Dict[str, Any], fallback_quote_amount: float) -> float:
+    def order_fee_quote(
+        self,
+        order: Dict[str, Any],
+        fallback_quote_amount: float,
+        symbol: str,
+        execution_price: float,
+    ) -> float:
+        """
+        Zet orderkosten veilig om naar de quotevaluta (EUR).
+
+        Bitvavo/CCXT kan kosten in EUR of in de basismunt teruggeven.
+        Bij ontbrekende kosten wordt de ingestelde taker fee gebruikt.
+        """
+        base_asset, quote_asset = symbol.split("/")
+        base_asset = base_asset.upper()
+        quote_asset = quote_asset.upper()
+
+        fee_items: List[Dict[str, Any]] = []
+
         fee = order.get("fee")
-        if isinstance(fee, dict) and fee.get("cost") is not None:
-            return to_float(fee.get("cost"), 0.0)
-        fees = order.get("fees") or []
+        if isinstance(fee, dict):
+            fee_items.append(fee)
+
+        fees = order.get("fees")
         if isinstance(fees, list):
-            total = 0.0
-            for item in fees:
-                total += to_float((item or {}).get("cost"), 0.0)
-            if total > 0:
-                return total
-        taker_fee_pct = to_float(get_cfg(self.cfg, "taker_fee_pct", 0.25), 0.25)
+            fee_items.extend(
+                item for item in fees
+                if isinstance(item, dict)
+            )
+
+        total_quote_fee = 0.0
+        found_valid_fee = False
+
+        for item in fee_items:
+            cost = to_float(item.get("cost"), 0.0)
+            if cost <= 0:
+                continue
+
+            currency = str(item.get("currency") or quote_asset).upper()
+
+            if currency == quote_asset:
+                total_quote_fee += cost
+                found_valid_fee = True
+            elif currency == base_asset and execution_price > 0:
+                total_quote_fee += cost * execution_price
+                found_valid_fee = True
+            else:
+                LOG.warning(
+                    "Onbekende feevaluta voor %s: %s; fallback fee wordt gebruikt",
+                    symbol,
+                    currency,
+                )
+
+        if found_valid_fee:
+            return total_quote_fee
+
+        taker_fee_pct = to_float(
+            get_cfg(self.cfg, "taker_fee_pct", 0.25),
+            0.25,
+        )
         return fallback_quote_amount * (taker_fee_pct / 100.0)
 
     def estimated_exit_pnl_quote(self, symbol: str, position: Dict[str, Any], bid_price: Optional[float] = None) -> float:
@@ -1064,50 +1112,86 @@ class Bot:
         fallback_amount: float,
     ) -> Dict[str, Any]:
         """
-        Controleert bij live orders de uiteindelijke uitvoering.
-        Bij dry-run wordt het gesimuleerde orderresultaat direct gebruikt.
+        Controleert de werkelijk uitgevoerde hoeveelheid.
+
+        In live-modus wordt nooit aangenomen dat een order gevuld is wanneer
+        Bitvavo geen positieve 'filled'-waarde heeft teruggegeven.
         """
         resolved = dict(order or {})
 
-        if not self.dry_run:
-            order_id = resolved.get("id")
-            if order_id:
-                for attempt in range(5):
-                    filled = to_float(resolved.get("filled"), 0.0)
-                    status = str(resolved.get("status") or "").lower()
-                    if filled > 0 and status in {"closed", "filled"}:
-                        break
-                    try:
-                        time.sleep(1.0 + attempt)
-                        fetched = self.exchange.fetch_order(order_id, symbol)
-                        if isinstance(fetched, dict):
-                            resolved.update(fetched)
-                    except Exception as exc:
-                        LOG.warning(
-                            "Ordercontrole poging %s mislukt voor %s: %s",
-                            attempt + 1,
-                            symbol,
-                            exc,
-                        )
+        if self.dry_run:
+            price = to_float(
+                resolved.get("average") or resolved.get("price"),
+                fallback_price,
+            )
+            amount = to_float(
+                resolved.get("filled") or resolved.get("amount"),
+                fallback_amount,
+            )
+            cost = to_float(resolved.get("cost"), amount * price)
+
+            if price <= 0 or amount <= 0 or cost <= 0:
+                raise RuntimeError(
+                    f"Dry-run order voor {symbol} is ongeldig: "
+                    f"price={price}, amount={amount}, cost={cost}"
+                )
+
+            resolved["average"] = price
+            resolved["filled"] = amount
+            resolved["cost"] = cost
+            return resolved
+
+        order_id = resolved.get("id")
+
+        for attempt in range(6):
+            filled = to_float(resolved.get("filled"), 0.0)
+            status = str(resolved.get("status") or "").lower()
+
+            if filled > 0 and status in {"closed", "filled"}:
+                break
+
+            if status in {"canceled", "cancelled", "rejected", "expired"}:
+                break
+
+            if not order_id:
+                break
+
+            try:
+                time.sleep(1.0 + attempt)
+                fetched = self.exchange.fetch_order(order_id, symbol)
+                if isinstance(fetched, dict):
+                    resolved.update(fetched)
+            except Exception as exc:
+                LOG.warning(
+                    "Ordercontrole poging %s mislukt voor %s: %s",
+                    attempt + 1,
+                    symbol,
+                    exc,
+                )
+
+        filled = to_float(resolved.get("filled"), 0.0)
+        status = str(resolved.get("status") or "").lower()
+
+        if filled <= 0:
+            raise RuntimeError(
+                f"Live order voor {symbol} niet als uitgevoerd bevestigd "
+                f"(status={status or 'onbekend'}, id={order_id or 'onbekend'})"
+            )
 
         price = to_float(
             resolved.get("average") or resolved.get("price"),
             fallback_price,
         )
-        amount = to_float(
-            resolved.get("filled") or resolved.get("amount"),
-            fallback_amount,
-        )
-        cost = to_float(resolved.get("cost"), amount * price)
+        cost = to_float(resolved.get("cost"), filled * price)
 
-        if price <= 0 or amount <= 0 or cost <= 0:
+        if price <= 0 or cost <= 0:
             raise RuntimeError(
-                f"Order voor {symbol} heeft geen geldige uitvoering: "
-                f"price={price}, amount={amount}, cost={cost}"
+                f"Live order voor {symbol} heeft ongeldige uitvoering: "
+                f"price={price}, filled={filled}, cost={cost}"
             )
 
         resolved["average"] = price
-        resolved["filled"] = amount
+        resolved["filled"] = filled
         resolved["cost"] = cost
         return resolved
 
@@ -1221,7 +1305,7 @@ class Bot:
             price = to_float(order.get("average"), fallback_price)
             amount = to_float(order.get("filled"), fallback_amount)
             quote_amount = to_float(order.get("cost"), amount * price)
-            fee_quote = self.order_fee_quote(order, quote_amount)
+            fee_quote = self.order_fee_quote(order, quote_amount, symbol, price)
 
             if self.dry_run:
                 current_simulated = to_float(
@@ -1330,7 +1414,7 @@ class Bot:
             price = to_float(order.get("average"), fallback_price)
             filled_amount = to_float(order.get("filled"), sell_amount)
             quote_amount = to_float(order.get("cost"), filled_amount * price)
-            fee_sell_quote = self.order_fee_quote(order, quote_amount)
+            fee_sell_quote = self.order_fee_quote(order, quote_amount, symbol, price)
 
             entry_quote_total = to_float(position.get("quote_amount"), 0.0)
             fee_buy_total = to_float(position.get("fees_buy_quote"), 0.0)
@@ -1617,7 +1701,7 @@ def main() -> None:
     cfg = load_yaml(cfg_path)
     setup_logging(str(get_cfg(cfg, "log_level", "INFO")))
     bot = Bot(cfg)
-    LOG.info("Diamond Bot gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
+    LOG.info("Diamond Bot v6 gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
     bot.run_forever()
 
 
