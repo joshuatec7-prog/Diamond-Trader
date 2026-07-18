@@ -1,1 +1,63 @@
+quote: EUR
+timeframe: 15m
 
+symbols:
+  - BTC/EUR
+  - ETH/EUR
+  - SOL/EUR
+  - XRP/EUR
+  - ADA/EUR
+
+trading:
+  enable_spot: true
+  enable_short_signals: false
+  allow_long_and_short_same_symbol: false
+
+risk:
+  dry_run: true
+  fixed_stake_quote: 100
+  max_open_positions: 5
+  eur_reserve: 1000
+  max_spread_pct: 0.25
+  min_profit_eur: 1.00
+  cooldown_minutes: 240
+  skip_log_every_seconds: 600
+  avoid_symbols_with_existing_balance: false
+  simulated_quote_balance: 3000
+
+fees:
+  taker_fee_pct: 0.25
+
+signals:
+  use_sma: true
+  sma_fast: 20
+  sma_slow: 60
+  require_crossover: false
+
+  use_rsi: true
+  rsi_len: 14
+  rsi_buy_min: 55
+  rsi_buy_max: 70
+
+  use_atr_filter: true
+  atr_len: 14
+  min_atr_pct: 0.30
+  atr_tp_mult: 2.6
+  atr_sl_mult: 1.2
+
+  hard_stop_loss_pct: 3.0
+  trailing_enabled: true
+  trailing_atr_mult: 1.2
+  exit_on_trend_break: true
+
+news:
+  enabled: false
+
+files:
+  state_file: /var/data/diamond_state.json
+  trades_file: /var/data/diamond_transactions.csv
+
+logging:
+  level: INFO
+  loop_sleep_seconds: 300
+  candles_limit: 400
