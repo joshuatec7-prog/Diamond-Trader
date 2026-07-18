@@ -1,3 +1,6 @@
+# Diamond Bot configuratie
+# Eerste test altijd met dry_run: true
+
 quote: EUR
 timeframe: 15m
 
@@ -12,6 +15,7 @@ trading:
   enable_spot: true
   enable_short_signals: false
   allow_long_and_short_same_symbol: false
+  max_total_positions: 5
 
 risk:
   dry_run: true
@@ -22,7 +26,13 @@ risk:
   min_profit_eur: 1.00
   cooldown_minutes: 240
   skip_log_every_seconds: 600
+
+  # De bot mag een munt kopen die je zelf al bezit,
+  # maar verkoopt uitsluitend de hoeveelheid die hij zelf heeft gekocht.
   avoid_symbols_with_existing_balance: false
+  existing_balance_dust: 0.00000001
+
+  # Alleen gebruikt voor dry-run simulatie.
   simulated_quote_balance: 3000
 
 fees:
@@ -42,16 +52,67 @@ signals:
   use_atr_filter: true
   atr_len: 14
   min_atr_pct: 0.30
+
   atr_tp_mult: 2.6
   atr_sl_mult: 1.2
-
   hard_stop_loss_pct: 3.0
+
   trailing_enabled: true
   trailing_atr_mult: 1.2
+
+  profit_trailing_trigger_pct: 1.0
+  profit_trailing_pullback_pct: 0.5
+
   exit_on_trend_break: true
 
+scanner:
+  auto_scan: false
+  top_n_markets: 5
+  min_quote_volume: 250000
+  exclude_bases:
+    - EUR
+    - USDT
+    - USDC
+    - DAI
+
 news:
+  # Nieuwsfilter voorlopig uit tijdens de eerste technische test.
   enabled: false
+
+  timespan_hours: 24
+  top_n_for_news_check: 3
+  min_news_score_to_buy: 0.0
+  bad_news_score_to_exit: -1.5
+
+  allow_buy_without_news: true
+  fail_open: true
+  block_on_severe_negative: true
+  force_exit_on_severe_negative: false
+
+  use_fear_greed: false
+  fear_greed_buy_max: 75
+  max_records: 100
+
+short:
+  # Alleen papieren shortsignalen; nooit live short.
+  enabled: false
+  leverage: 1
+  margin_per_trade: 50
+  cooldown_minutes: 240
+
+  use_sma: true
+  sma_fast: 20
+  sma_slow: 60
+
+  use_rsi: true
+  rsi_len: 14
+  rsi_sell_max: 45
+
+  use_atr_filter: true
+  atr_len: 14
+  min_atr_pct: 0.30
+  atr_tp_mult: 2.4
+  atr_sl_mult: 1.2
 
 files:
   state_file: /var/data/diamond_state.json
