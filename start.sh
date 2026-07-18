@@ -1,4 +1,5 @@
 #!/bin/bash
-# Start grid bot en agent
+set -e
+
 python3 agent.py &
-python3 grid_bot.py
+exec python3 diamond_bot.py
