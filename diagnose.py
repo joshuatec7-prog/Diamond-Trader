@@ -1,46 +1,75 @@
 #!/usr/bin/env python3
 """
-Diamond Diagnose v2
+Diamond Supervisor v1
 
-Dit programma:
-- leest dezelfde config.yaml als diamond_bot.py;
-- controleert per munt trend, RSI, ATR en spread;
-- toont een duidelijke koopscore;
-- legt uit waarom niet wordt gekocht;
+De supervisor:
+- leest de verzamelde diagnosestatistieken;
+- controleert of diagnose en botbestanden actueel zijn;
+- maakt verbetervoorstellen;
+- past nooit zelfstandig instellingen aan;
 - plaatst nooit orders;
-- wijzigt geen posities of botbestanden.
+- schrijft alleen naar diamond_supervisor_state.json.
 """
 
+import json
 import logging
 import os
+import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
-
-import ccxt
-import pandas as pd
-import yaml
-from dotenv import load_dotenv
+from typing import Any, Dict, List, Optional
 
 
-load_dotenv()
-
-LOG = logging.getLogger("diamond_diagnose")
+LOG = logging.getLogger("diamond_supervisor")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-CFG_FILE = os.getenv(
-    "CFG_FILE",
-    "/opt/render/project/src/config.yaml",
+DIAG_STATS_FILE = os.getenv(
+    "DIAG_STATS_FILE",
+    "/var/data/diamond_diagnose_stats.json",
 ).strip()
 
-LOOP_SLEEP_SECONDS = 15 * 60
+BOT_STATE_FILE = os.getenv(
+    "STATE_FILE",
+    "/var/data/diamond_state.json",
+).strip()
+
+TRADES_FILE = os.getenv(
+    "TRADES_FILE",
+    "/var/data/diamond_transactions.csv",
+).strip()
+
+CONTROL_FILE = os.getenv(
+    "CONTROL_FILE",
+    "/var/data/diamond_control.json",
+).strip()
+
+SUPERVISOR_STATE_FILE = os.getenv(
+    "SUPERVISOR_STATE_FILE",
+    "/var/data/diamond_supervisor_state.json",
+).strip()
+
+CHECK_INTERVAL_SECONDS = 60 * 60
+MAX_DIAGNOSE_AGE_MINUTES = 35
+MIN_CHECKS_FOR_RECOMMENDATION = 48
 
 
-def to_float(value: Any, default: float = 0.0) -> float:
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_iso() -> str:
+    return now_utc().isoformat()
+
+
+def to_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
     try:
         if value is None or value == "":
             return default
@@ -49,732 +78,473 @@ def to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def to_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-
-    if value is None:
-        return default
-
-    normalized = str(value).strip().lower()
-
-    if normalized in {
-        "1",
-        "true",
-        "yes",
-        "ja",
-        "aan",
-        "on",
-    }:
-        return True
-
-    if normalized in {
-        "0",
-        "false",
-        "no",
-        "nee",
-        "uit",
-        "off",
-    }:
-        return False
-
-    return default
-
-
-def get_cfg(
-    config: Dict[str, Any],
-    path: str,
-    default: Any = None,
-) -> Any:
-    current: Any = config
-
-    for part in path.split("."):
-        if not isinstance(current, dict):
-            return default
-
-        if part not in current:
-            return default
-
-        current = current[part]
-
-    return current
-
-
-def load_config(path_str: str) -> Dict[str, Any]:
+def load_json(
+    path_str: str,
+    default: Dict[str, Any],
+) -> Dict[str, Any]:
     path = Path(path_str)
 
     if not path.exists():
-        raise FileNotFoundError(
-            f"Configuratiebestand ontbreekt: {path_str}"
-        )
+        return default.copy()
 
-    with path.open("r", encoding="utf-8") as file:
-        config = yaml.safe_load(file) or {}
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
 
-    if not isinstance(config, dict):
-        raise ValueError(
-            "config.yaml bevat geen geldige YAML-structuur"
-        )
+        if isinstance(data, dict):
+            return data
 
-    return config
-
-
-def create_exchange() -> ccxt.Exchange:
-    exchange = ccxt.bitvavo({
-        "apiKey": os.getenv(
-            "BITVAVO_API_KEY",
-            "",
-        ).strip(),
-        "secret": os.getenv(
-            "BITVAVO_API_SECRET",
-            "",
-        ).strip(),
-        "enableRateLimit": True,
-        "options": {
-            "fetchMarkets": {
-                "types": ["spot"],
-            },
-        },
-    })
-
-    exchange.load_markets()
-
-    return exchange
-
-
-def calculate_rsi(
-    series: pd.Series,
-    length: int,
-) -> pd.Series:
-    difference = series.diff()
-
-    gains = difference.clip(lower=0)
-    losses = -difference.clip(upper=0)
-
-    average_gain = gains.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length,
-    ).mean()
-
-    average_loss = losses.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length,
-    ).mean()
-
-    relative_strength = (
-        average_gain
-        / average_loss.replace(0, pd.NA)
-    )
-
-    return 100 - (
-        100 / (1 + relative_strength)
-    )
-
-
-def calculate_atr(
-    dataframe: pd.DataFrame,
-    length: int,
-) -> pd.Series:
-    previous_close = dataframe["close"].shift(1)
-
-    true_range = pd.concat(
-        [
-            dataframe["high"] - dataframe["low"],
-            (
-                dataframe["high"]
-                - previous_close
-            ).abs(),
-            (
-                dataframe["low"]
-                - previous_close
-            ).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    return true_range.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length,
-    ).mean()
-
-
-def fetch_dataframe(
-    exchange: ccxt.Exchange,
-    symbol: str,
-    timeframe: str,
-    limit: int,
-) -> pd.DataFrame:
-    candles = exchange.fetch_ohlcv(
-        symbol,
-        timeframe=timeframe,
-        limit=limit,
-    )
-
-    if not candles:
-        raise RuntimeError(
-            "geen candles ontvangen"
-        )
-
-    dataframe = pd.DataFrame(
-        candles,
-        columns=[
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-        ],
-    )
-
-    for column in (
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ):
-        dataframe[column] = pd.to_numeric(
-            dataframe[column],
-            errors="coerce",
-        )
-
-    dataframe.dropna(inplace=True)
-
-    if dataframe.empty:
-        raise RuntimeError(
-            "geen bruikbare candledata ontvangen"
-        )
-
-    return dataframe
-
-
-def calculate_spread_pct(
-    ticker: Dict[str, Any],
-) -> float:
-    bid = to_float(
-        ticker.get("bid"),
-        0.0,
-    )
-
-    ask = to_float(
-        ticker.get("ask"),
-        0.0,
-    )
-
-    if bid <= 0 or ask <= 0:
-        return 999.0
-
-    middle = (bid + ask) / 2.0
-
-    if middle <= 0:
-        return 999.0
-
-    return (
-        (ask - bid)
-        / middle
-        * 100.0
-    )
-
-
-def get_symbols(
-    config: Dict[str, Any],
-) -> List[str]:
-    symbols = config.get("symbols") or []
-
-    if not isinstance(symbols, list):
-        return []
-
-    return [
-        str(symbol).strip().upper()
-        for symbol in symbols
-        if str(symbol).strip()
-    ]
-
-
-def result_label(
-    passed_checks: int,
-    total_checks: int,
-) -> str:
-    if total_checks <= 0:
-        return "ONBEKEND"
-
-    percentage = (
-        passed_checks
-        / total_checks
-        * 100.0
-    )
-
-    if percentage >= 100:
-        return "TECHNISCH KOOPSIGNAAL"
-
-    if percentage >= 75:
-        return "BIJNA KOOPSIGNAAL"
-
-    if percentage >= 50:
-        return "MATIG"
-
-    return "GEEN KOOP"
-
-
-def check_result(
-    name: str,
-    passed: bool,
-    detail: str,
-) -> Tuple[str, bool]:
-    status = "OK" if passed else "NIET_OK"
-
-    return (
-        f"{name}={detail}:{status}",
-        passed,
-    )
-
-
-def diagnose_symbol(
-    exchange: ccxt.Exchange,
-    config: Dict[str, Any],
-    symbol: str,
-) -> None:
-    timeframe = str(
-        config.get(
-            "timeframe",
-            "15m",
-        )
-    )
-
-    candles_limit = int(
-        to_float(
-            get_cfg(
-                config,
-                "logging.candles_limit",
-                400,
-            ),
-            400,
-        )
-    )
-
-    sma_fast_length = int(
-        to_float(
-            get_cfg(
-                config,
-                "signals.sma_fast",
-                20,
-            ),
-            20,
-        )
-    )
-
-    sma_slow_length = int(
-        to_float(
-            get_cfg(
-                config,
-                "signals.sma_slow",
-                60,
-            ),
-            60,
-        )
-    )
-
-    rsi_length = int(
-        to_float(
-            get_cfg(
-                config,
-                "signals.rsi_len",
-                14,
-            ),
-            14,
-        )
-    )
-
-    rsi_min = to_float(
-        get_cfg(
-            config,
-            "signals.rsi_buy_min",
-            55,
-        ),
-        55,
-    )
-
-    rsi_max = to_float(
-        get_cfg(
-            config,
-            "signals.rsi_buy_max",
-            70,
-        ),
-        70,
-    )
-
-    atr_length = int(
-        to_float(
-            get_cfg(
-                config,
-                "signals.atr_len",
-                14,
-            ),
-            14,
-        )
-    )
-
-    min_atr_pct = to_float(
-        get_cfg(
-            config,
-            "signals.min_atr_pct",
-            0.30,
-        ),
-        0.30,
-    )
-
-    max_spread_pct = to_float(
-        get_cfg(
-            config,
-            "risk.max_spread_pct",
-            0.25,
-        ),
-        0.25,
-    )
-
-    use_sma = to_bool(
-        get_cfg(
-            config,
-            "signals.use_sma",
-            True,
-        ),
-        True,
-    )
-
-    use_rsi = to_bool(
-        get_cfg(
-            config,
-            "signals.use_rsi",
-            True,
-        ),
-        True,
-    )
-
-    use_atr = to_bool(
-        get_cfg(
-            config,
-            "signals.use_atr_filter",
-            True,
-        ),
-        True,
-    )
-
-    dataframe = fetch_dataframe(
-        exchange,
-        symbol,
-        timeframe,
-        candles_limit,
-    )
-
-    required_candles = max(
-        sma_slow_length + 2,
-        rsi_length + 2,
-        atr_length + 2,
-    )
-
-    if len(dataframe) < required_candles:
-        raise RuntimeError(
-            f"te weinig candles: {len(dataframe)}"
-        )
-
-    dataframe["sma_fast"] = (
-        dataframe["close"]
-        .rolling(sma_fast_length)
-        .mean()
-    )
-
-    dataframe["sma_slow"] = (
-        dataframe["close"]
-        .rolling(sma_slow_length)
-        .mean()
-    )
-
-    dataframe["rsi"] = calculate_rsi(
-        dataframe["close"],
-        rsi_length,
-    )
-
-    dataframe["atr"] = calculate_atr(
-        dataframe,
-        atr_length,
-    )
-
-    latest = dataframe.iloc[-1]
-
-    ticker = exchange.fetch_ticker(
-        symbol
-    )
-
-    close_price = to_float(
-        latest["close"],
-        0.0,
-    )
-
-    sma_fast = to_float(
-        latest["sma_fast"],
-        0.0,
-    )
-
-    sma_slow = to_float(
-        latest["sma_slow"],
-        0.0,
-    )
-
-    rsi_value = to_float(
-        latest["rsi"],
-        0.0,
-    )
-
-    atr_value = to_float(
-        latest["atr"],
-        0.0,
-    )
-
-    atr_pct = (
-        atr_value
-        / close_price
-        * 100.0
-        if close_price > 0
-        else 0.0
-    )
-
-    spread_pct = calculate_spread_pct(
-        ticker
-    )
-
-    checks: List[str] = []
-    reasons: List[str] = []
-
-    passed_checks = 0
-    total_checks = 0
-
-    if use_sma:
-        total_checks += 1
-
-        trend_ok = (
-            close_price > sma_fast
-            and sma_fast > sma_slow
-        )
-
-        if trend_ok:
-            passed_checks += 1
-        else:
-            reasons.append(
-                "trend niet stijgend "
-                f"(koers={close_price:.8f}, "
-                f"SMA{sma_fast_length}={sma_fast:.8f}, "
-                f"SMA{sma_slow_length}={sma_slow:.8f})"
-            )
-
-        check_text, _ = check_result(
-            "trend",
-            trend_ok,
-            (
-                "stijgend"
-                if trend_ok
-                else "dalend"
-            ),
-        )
-
-        checks.append(check_text)
-
-    if use_rsi:
-        total_checks += 1
-
-        rsi_ok = (
-            rsi_min
-            <= rsi_value
-            <= rsi_max
-        )
-
-        if rsi_ok:
-            passed_checks += 1
-        elif rsi_value < rsi_min:
-            reasons.append(
-                f"RSI te laag "
-                f"({rsi_value:.2f} < {rsi_min:.2f})"
-            )
-        else:
-            reasons.append(
-                f"RSI te hoog "
-                f"({rsi_value:.2f} > {rsi_max:.2f})"
-            )
-
-        check_text, _ = check_result(
-            "RSI",
-            rsi_ok,
-            f"{rsi_value:.2f}",
-        )
-
-        checks.append(check_text)
-
-    if use_atr:
-        total_checks += 1
-
-        atr_ok = (
-            atr_pct >= min_atr_pct
-        )
-
-        if atr_ok:
-            passed_checks += 1
-        else:
-            reasons.append(
-                "beweging te klein "
-                f"({atr_pct:.3f}% < {min_atr_pct:.3f}%)"
-            )
-
-        check_text, _ = check_result(
-            "ATR",
-            atr_ok,
-            f"{atr_pct:.3f}%",
-        )
-
-        checks.append(check_text)
-
-    total_checks += 1
-
-    spread_ok = (
-        spread_pct <= max_spread_pct
-    )
-
-    if spread_ok:
-        passed_checks += 1
-    else:
-        reasons.append(
-            "spread te groot "
-            f"({spread_pct:.3f}% > {max_spread_pct:.3f}%)"
-        )
-
-    check_text, _ = check_result(
-        "spread",
-        spread_ok,
-        f"{spread_pct:.3f}%",
-    )
-
-    checks.append(check_text)
-
-    score_pct = (
-        passed_checks
-        / total_checks
-        * 100.0
-        if total_checks > 0
-        else 0.0
-    )
-
-    decision = result_label(
-        passed_checks,
-        total_checks,
-    )
-
-    LOG.info(
-        "DIAGNOSE %s | score=%d/%d %.0f%% | %s | BESLISSING=%s",
-        symbol,
-        passed_checks,
-        total_checks,
-        score_pct,
-        " | ".join(checks),
-        decision,
-    )
-
-    if reasons:
-        LOG.info(
-            "DIAGNOSE %s | BLOKKADES: %s",
-            symbol,
-            " ; ".join(reasons),
-        )
-
-    if decision == "BIJNA KOOPSIGNAAL":
-        LOG.info(
-            "DIAGNOSE %s | LET OP: slechts één voorwaarde blokkeert de koop",
-            symbol,
-        )
-
-
-def run_diagnosis(
-    exchange: ccxt.Exchange,
-    config: Dict[str, Any],
-) -> None:
-    symbols = get_symbols(
-        config
-    )
-
-    if not symbols:
+    except Exception as exc:
         LOG.warning(
-            "Geen symbolen gevonden in config.yaml"
+            "Bestand lezen mislukt %s: %s",
+            path_str,
+            exc,
         )
-        return
 
-    LOG.info(
-        "Diagnoseronde gestart | timeframe=%s | symbolen=%s",
-        config.get(
-            "timeframe",
-            "15m",
+    return default.copy()
+
+
+def save_json_atomic(
+    path_str: str,
+    data: Dict[str, Any],
+) -> None:
+    target = Path(path_str)
+
+    target.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=str(target.parent),
+        delete=False,
+    ) as temporary:
+        json.dump(
+            data,
+            temporary,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+        temporary_name = temporary.name
+
+    os.replace(
+        temporary_name,
+        target,
+    )
+
+
+def parse_iso(
+    value: Any,
+) -> Optional[datetime]:
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(
+            str(value).replace(
+                "Z",
+                "+00:00",
+            )
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(
+                tzinfo=timezone.utc,
+            )
+
+        return parsed.astimezone(
+            timezone.utc
+        )
+
+    except ValueError:
+        return None
+
+
+def age_minutes(
+    timestamp: Any,
+) -> Optional[float]:
+    parsed = parse_iso(
+        timestamp
+    )
+
+    if parsed is None:
+        return None
+
+    return (
+        now_utc()
+        - parsed
+    ).total_seconds() / 60.0
+
+
+def percentage(
+    value: int,
+    total: int,
+) -> float:
+    if total <= 0:
+        return 0.0
+
+    return (
+        value
+        / total
+        * 100.0
+    )
+
+
+def make_symbol_recommendations(
+    symbol: str,
+    stats: Dict[str, Any],
+) -> List[str]:
+    recommendations: List[str] = []
+
+    checks = int(
+        stats.get(
+            "checks",
+            0,
+        )
+    )
+
+    if checks < MIN_CHECKS_FOR_RECOMMENDATION:
+        return [
+            (
+                f"{symbol}: nog onvoldoende gegevens "
+                f"({checks}/{MIN_CHECKS_FOR_RECOMMENDATION} controles)"
+            )
+        ]
+
+    trend_blocked = int(
+        stats.get(
+            "trend_blocked",
+            0,
+        )
+    )
+
+    rsi_blocked = int(
+        stats.get(
+            "rsi_blocked",
+            0,
+        )
+    )
+
+    atr_blocked = int(
+        stats.get(
+            "atr_blocked",
+            0,
+        )
+    )
+
+    spread_blocked = int(
+        stats.get(
+            "spread_blocked",
+            0,
+        )
+    )
+
+    near_signals = int(
+        stats.get(
+            "near_signals",
+            0,
+        )
+    )
+
+    technical_signals = int(
+        stats.get(
+            "technical_signals",
+            0,
+        )
+    )
+
+    atr_block_pct = percentage(
+        atr_blocked,
+        checks,
+    )
+
+    trend_block_pct = percentage(
+        trend_blocked,
+        checks,
+    )
+
+    rsi_block_pct = percentage(
+        rsi_blocked,
+        checks,
+    )
+
+    spread_block_pct = percentage(
+        spread_blocked,
+        checks,
+    )
+
+    near_signal_pct = percentage(
+        near_signals,
+        checks,
+    )
+
+    if (
+        atr_block_pct >= 75.0
+        and near_signal_pct >= 15.0
+    ):
+        recommendations.append(
+            (
+                f"{symbol}: ATR blokkeert {atr_block_pct:.1f}% "
+                f"van de controles en {near_signal_pct:.1f}% is bijna-signaal. "
+                "Voorstel: min_atr_pct later voorzichtig testen op 0.20."
+            )
+        )
+
+    if rsi_block_pct >= 85.0:
+        recommendations.append(
+            (
+                f"{symbol}: RSI blokkeert {rsi_block_pct:.1f}% "
+                "van de controles. Eerst markttrend blijven volgen; "
+                "nog geen automatische wijziging."
+            )
+        )
+
+    if trend_block_pct >= 85.0:
+        recommendations.append(
+            (
+                f"{symbol}: trendfilter blokkeert {trend_block_pct:.1f}%. "
+                "Dit wijst waarschijnlijk op een zwakke markt; "
+                "trendfilter niet versoepelen."
+            )
+        )
+
+    if spread_block_pct >= 10.0:
+        recommendations.append(
+            (
+                f"{symbol}: spread blokkeert {spread_block_pct:.1f}%. "
+                "Controleer liquiditeit voordat deze munt live wordt gebruikt."
+            )
+        )
+
+    if technical_signals == 0 and near_signals == 0:
+        recommendations.append(
+            (
+                f"{symbol}: nog geen technisch of bijna-koopsignaal "
+                f"na {checks} controles."
+            )
+        )
+
+    if not recommendations:
+        recommendations.append(
+            (
+                f"{symbol}: geen duidelijke afwijking gevonden. "
+                "Instellingen voorlopig behouden."
+            )
+        )
+
+    return recommendations
+
+
+def build_supervisor_report() -> Dict[str, Any]:
+    diagnose_stats = load_json(
+        DIAG_STATS_FILE,
+        {},
+    )
+
+    bot_state = load_json(
+        BOT_STATE_FILE,
+        {},
+    )
+
+    control = load_json(
+        CONTROL_FILE,
+        {},
+    )
+
+    last_round_at = diagnose_stats.get(
+        "last_round_at"
+    )
+
+    diagnose_age = age_minutes(
+        last_round_at
+    )
+
+    health: List[str] = []
+
+    if diagnose_age is None:
+        health.append(
+            "Diagnosestatistieken ontbreken"
+        )
+    elif diagnose_age > MAX_DIAGNOSE_AGE_MINUTES:
+        health.append(
+            (
+                "Diagnose mogelijk gestopt: laatste ronde "
+                f"{diagnose_age:.1f} minuten geleden"
+            )
+        )
+    else:
+        health.append(
+            (
+                "Diagnose actief: laatste ronde "
+                f"{diagnose_age:.1f} minuten geleden"
+            )
+        )
+
+    if Path(BOT_STATE_FILE).exists():
+        health.append(
+            "Bot-statebestand aanwezig"
+        )
+    else:
+        health.append(
+            "WAARSCHUWING: bot-statebestand ontbreekt"
+        )
+
+    if Path(CONTROL_FILE).exists():
+        health.append(
+            "Controlebestand aanwezig"
+        )
+    else:
+        health.append(
+            "WAARSCHUWING: controlebestand ontbreekt"
+        )
+
+    if Path(TRADES_FILE).exists():
+        health.append(
+            "Transactiebestand aanwezig"
+        )
+    else:
+        health.append(
+            "Nog geen transactiebestand; er zijn waarschijnlijk nog geen trades"
+        )
+
+    symbols = diagnose_stats.get(
+        "symbols",
+        {},
+    )
+
+    recommendations: List[str] = []
+
+    if isinstance(symbols, dict):
+        for symbol, stats in sorted(
+            symbols.items()
+        ):
+            if not isinstance(stats, dict):
+                continue
+
+            recommendations.extend(
+                make_symbol_recommendations(
+                    symbol,
+                    stats,
+                )
+            )
+
+    report = {
+        "version": 1,
+        "generated_at": now_iso(),
+        "mode": "suggest",
+        "total_diagnose_rounds": int(
+            diagnose_stats.get(
+                "total_rounds",
+                0,
+            )
         ),
-        len(symbols),
-    )
-
-    for symbol in symbols:
-        try:
-            diagnose_symbol(
-                exchange,
-                config,
-                symbol,
+        "open_positions": len(
+            bot_state.get(
+                "positions",
+                {},
             )
-        except Exception as exc:
-            LOG.warning(
-                "DIAGNOSE %s mislukt: %s",
-                symbol,
-                exc,
+            if isinstance(
+                bot_state.get(
+                    "positions",
+                    {},
+                ),
+                dict,
             )
+            else {}
+        ),
+        "paused": bool(
+            control.get(
+                "paused",
+                False,
+            )
+        ),
+        "pause_reason": control.get(
+            "pause_reason",
+            "",
+        ),
+        "health": health,
+        "recommendations": recommendations,
+    }
 
+    return report
+
+
+def log_report(
+    report: Dict[str, Any],
+) -> None:
     LOG.info(
-        "Diagnoseronde afgerond"
+        "SUPERVISOR | rondes=%s | open_posities=%s | paused=%s",
+        report.get(
+            "total_diagnose_rounds",
+            0,
+        ),
+        report.get(
+            "open_positions",
+            0,
+        ),
+        report.get(
+            "paused",
+            False,
+        ),
     )
+
+    for item in report.get(
+        "health",
+        [],
+    ):
+        LOG.info(
+            "SUPERVISOR GEZONDHEID | %s",
+            item,
+        )
+
+    for item in report.get(
+        "recommendations",
+        [],
+    ):
+        LOG.info(
+            "SUPERVISOR ADVIES | %s",
+            item,
+        )
 
 
 def main() -> None:
-    config = load_config(
-        CFG_FILE
-    )
-
-    exchange = create_exchange()
-
     LOG.info(
-        "Diamond Diagnose v2 gestart"
+        "Diamond Supervisor v1 gestart"
     )
 
     LOG.info(
-        "Configuratiebestand: %s",
-        CFG_FILE,
+        "Modus=suggest | supervisor past niets automatisch aan"
     )
 
     LOG.info(
-        "Diagnose plaatst geen orders en wijzigt geen posities"
+        "Supervisorbestand: %s",
+        SUPERVISOR_STATE_FILE,
     )
 
     while True:
         try:
-            config = load_config(
-                CFG_FILE
+            report = build_supervisor_report()
+
+            save_json_atomic(
+                SUPERVISOR_STATE_FILE,
+                report,
             )
 
-            run_diagnosis(
-                exchange,
-                config,
+            log_report(
+                report
             )
 
         except Exception as exc:
             LOG.exception(
-                "Diagnose-hoofdloop fout: %s",
+                "Supervisor-fout: %s",
                 exc,
             )
 
         time.sleep(
-            LOOP_SLEEP_SECONDS
+            CHECK_INTERVAL_SECONDS
         )
 
 
