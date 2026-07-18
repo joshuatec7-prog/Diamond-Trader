@@ -3,6 +3,7 @@ import csv
 import json
 import logging
 import os
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -107,9 +108,22 @@ def ensure_parent(path_str: str) -> None:
 
 def default_state() -> Dict[str, Any]:
     return {
-        "positions": {}, "cooldown": {}, "short_positions": {}, "short_cooldown": {},
-        "pnl_quote": 0.0, "short_pnl_quote": 0.0,
-        "trades": 0, "wins": 0, "short_trades": 0, "short_wins": 0,
+        "positions": {},
+        "cooldown": {},
+        "short_positions": {},
+        "short_cooldown": {},
+        "pnl_quote": 0.0,
+        "short_pnl_quote": 0.0,
+        "trades": 0,
+        "wins": 0,
+        "short_trades": 0,
+        "short_wins": 0,
+        "paused": False,
+        "pause_reason": "",
+        "paused_at": None,
+        "pause_date": None,
+        "pause_btc_price": None,
+        "total_capital": 3000.0,
     }
 
 def load_state(path_str: str) -> Dict[str, Any]:
@@ -131,9 +145,47 @@ def load_state(path_str: str) -> Dict[str, Any]:
     return base
 
 def save_state(path_str: str, state: Dict[str, Any]) -> None:
+    """
+    Schrijft state atomair en bewaart altijd de meest recente pauzestatus
+    die agent.py in hetzelfde bestand heeft gezet.
+
+    Hierdoor kan diamond_bot.py een veiligheidsstop van agent.py niet per
+    ongeluk overschrijven met een oudere kopie van de state.
+    """
     ensure_parent(path_str)
-    with open(path_str, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+
+    current_on_disk: Dict[str, Any] = {}
+    path = Path(path_str)
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                current_on_disk = loaded
+        except Exception:
+            current_on_disk = {}
+
+    pause_keys = (
+        "paused",
+        "pause_reason",
+        "paused_at",
+        "pause_date",
+        "pause_btc_price",
+    )
+    for key in pause_keys:
+        if key in current_on_disk:
+            state[key] = current_on_disk[key]
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=str(path.parent),
+        delete=False,
+    ) as tmp:
+        json.dump(state, tmp, indent=2, ensure_ascii=False)
+        tmp_name = tmp.name
+
+    os.replace(tmp_name, path)
 
 def append_trade_csv(path_str: str, row: Dict[str, Any]) -> None:
     ensure_parent(path_str)
@@ -1299,12 +1351,31 @@ class Bot:
         )
 
     def run_once(self) -> None:
+        # Agent en bot delen hetzelfde state-bestand. Daarom bij iedere ronde
+        # opnieuw laden, zodat een veiligheidsstop direct wordt gezien.
+        self.state = load_state(self.state_file)
+
         self.refresh_balance_cache()
+
+        # Open posities blijven altijd bewaakt, ook wanneer agent.py de bot
+        # heeft gepauzeerd. Stop-loss, trailing-stop en take-profit blijven dus
+        # gewoon actief.
         self.manage_open_positions()
         self.manage_open_short_positions()
 
         symbols = self.scanned_symbols()
         self.print_status(symbols)
+
+        # Een pauze blokkeert uitsluitend nieuwe aankopen en nieuwe paper-shorts.
+        if to_bool(self.state.get("paused"), False):
+            self.rate_limited_info(
+                self.last_skip_log_ts,
+                "agent_pause",
+                600,
+                "BOT GEPAUZEERD | reden=%s | open posities blijven bewaakt",
+                self.state.get("pause_reason") or "onbekend",
+            )
+            return
 
         max_open = int(to_float(get_cfg(self.cfg, "max_open_positions", 5), 5))
         if self.open_positions_count() >= max_open:
@@ -1315,9 +1386,11 @@ class Bot:
             top_n_news = int(to_float(get_cfg(self.cfg, "news.top_n_for_news_check", 3), 3))
             if top_n_news <= 0:
                 top_n_news = 1
+
             for item in candidates[:top_n_news]:
                 if self.open_positions_count() >= max_open:
                     break
+
                 symbol = item["symbol"]
                 news_gate = self.news.buy_gate(symbol)
                 self.try_buy_symbol(
@@ -1347,7 +1420,7 @@ def main() -> None:
     cfg = load_yaml(cfg_path)
     setup_logging(str(get_cfg(cfg, "log_level", "INFO")))
     bot = Bot(cfg)
-    LOG.info("Bitvavo nieuwsbot gestart | dry_run=%s", bot.dry_run)
+    LOG.info("Diamond Bot gestart | dry_run=%s | state=%s | trades=%s", bot.dry_run, bot.state_file, bot.trades_file)
     bot.run_forever()
 
 
