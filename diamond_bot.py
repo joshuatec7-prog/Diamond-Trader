@@ -16,7 +16,7 @@ import pandas as pd
 import yaml
 from dotenv import load_dotenv
 
-LOG = logging.getLogger("diamond_news")
+LOG = logging.getLogger("diamond_trader")
 
 TRADE_CSV_COLUMNS = [
     "ts", "market", "side", "price", "base_amount", "quote_amount",
