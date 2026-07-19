@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Diagnose v4
+Diamond Diagnose v4.1
 
 Functies:
 - controleert trend, RSI, ATR en spread per munt;
@@ -392,6 +392,12 @@ def fetch_dataframe(
     timeframe: str,
     limit: int,
 ) -> pd.DataFrame:
+    """
+    Haalt candles op en verwijdert een eventueel nog open candle.
+
+    Bitvavo levert de lopende candle mee. Diagnose gebruikt daarom
+    uitsluitend volledig afgesloten candles, net als diamond_bot.py.
+    """
     candles = exchange_call_with_retry(
         f"Candles ophalen voor {symbol}",
         lambda: exchange.fetch_ohlcv(
@@ -419,6 +425,7 @@ def fetch_dataframe(
     )
 
     for column in (
+        "timestamp",
         "open",
         "high",
         "low",
@@ -433,11 +440,63 @@ def fetch_dataframe(
     dataframe.dropna(
         inplace=True
     )
+    dataframe.sort_values(
+        "timestamp",
+        inplace=True,
+    )
+    dataframe.drop_duplicates(
+        subset=["timestamp"],
+        keep="last",
+        inplace=True,
+    )
+    dataframe.reset_index(
+        drop=True,
+        inplace=True,
+    )
 
     if dataframe.empty:
         raise RuntimeError(
             "geen bruikbare candledata ontvangen"
         )
+
+    timeframe_ms = int(
+        exchange.parse_timeframe(timeframe)
+        * 1000
+    )
+    now_ms = int(
+        exchange.milliseconds()
+    )
+    last_start_ms = int(
+        dataframe.iloc[-1]["timestamp"]
+    )
+    last_close_ms = (
+        last_start_ms
+        + timeframe_ms
+    )
+
+    if last_close_ms > now_ms:
+        open_candle_start = datetime.fromtimestamp(
+            last_start_ms / 1000,
+            timezone.utc,
+        )
+        dataframe = dataframe.iloc[:-1].copy()
+
+        LOG.debug(
+            "Open candle verwijderd voor %s | start=%s | timeframe=%s",
+            symbol,
+            open_candle_start.isoformat(),
+            timeframe,
+        )
+
+    if dataframe.empty:
+        raise RuntimeError(
+            "geen afgesloten candles beschikbaar"
+        )
+
+    dataframe.reset_index(
+        drop=True,
+        inplace=True,
+    )
 
     return dataframe
 
@@ -1085,7 +1144,7 @@ def main() -> None:
     exchange = create_exchange()
 
     LOG.info(
-        "Diamond Diagnose v4 gestart"
+        "Diamond Diagnose v4.1 gestart"
     )
 
     LOG.info(
