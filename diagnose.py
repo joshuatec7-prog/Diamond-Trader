@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Diamond Diagnose v3
+Diamond Diagnose v4
 
 Functies:
 - controleert trend, RSI, ATR en spread per munt;
 - plaatst nooit orders;
 - wijzigt geen botposities;
-- bewaart statistieken in:
-  /var/data/diamond_diagnose_stats.json
+- bewaart statistieken in /var/data/diamond_diagnose_stats.json;
+- probeert tijdelijke Bitvavo/CCXT-fouten automatisch opnieuw.
 """
 
 import json
 import logging
 import os
+import random
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, TypeVar
 
 import ccxt
 import pandas as pd
@@ -28,7 +29,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 LOG = logging.getLogger("diamond_diagnose")
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -45,16 +45,25 @@ DIAG_STATS_FILE = os.getenv(
 ).strip()
 
 LOOP_SLEEP_SECONDS = 15 * 60
+API_MAX_ATTEMPTS = 3
+API_RETRY_DELAYS_SECONDS = (2.0, 5.0)
+
+T = TypeVar("T")
+
+TRANSIENT_CCXT_ERRORS = (
+    ccxt.NetworkError,
+    ccxt.RequestTimeout,
+    ccxt.ExchangeNotAvailable,
+    ccxt.DDoSProtection,
+    ccxt.RateLimitExceeded,
+)
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def to_float(
-    value: Any,
-    default: float = 0.0,
-) -> float:
+def to_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
             return default
@@ -71,20 +80,14 @@ def get_cfg(
     current: Any = config
 
     for part in path.split("."):
-        if not isinstance(current, dict):
+        if not isinstance(current, dict) or part not in current:
             return default
-
-        if part not in current:
-            return default
-
         current = current[part]
 
     return current
 
 
-def load_config(
-    path_str: str,
-) -> Dict[str, Any]:
+def load_config(path_str: str) -> Dict[str, Any]:
     path = Path(path_str)
 
     if not path.exists():
@@ -92,10 +95,7 @@ def load_config(
             f"Configuratiebestand ontbreekt: {path_str}"
         )
 
-    with path.open(
-        "r",
-        encoding="utf-8",
-    ) as file:
+    with path.open("r", encoding="utf-8") as file:
         config = yaml.safe_load(file) or {}
 
     if not isinstance(config, dict):
@@ -116,10 +116,7 @@ def load_json(
         return default.copy()
 
     try:
-        with path.open(
-            "r",
-            encoding="utf-8",
-        ) as file:
+        with path.open("r", encoding="utf-8") as file:
             data = json.load(file)
 
         if isinstance(data, dict):
@@ -139,11 +136,7 @@ def save_json_atomic(
     data: Dict[str, Any],
 ) -> None:
     target = Path(path_str)
-
-    target.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    target.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -157,18 +150,14 @@ def save_json_atomic(
             indent=2,
             ensure_ascii=False,
         )
-
         temporary_name = temporary.name
 
-    os.replace(
-        temporary_name,
-        target,
-    )
+    os.replace(temporary_name, target)
 
 
 def default_stats() -> Dict[str, Any]:
     return {
-        "version": 3,
+        "version": 4,
         "started_at": now_iso(),
         "last_round_at": None,
         "total_rounds": 0,
@@ -189,11 +178,14 @@ def default_symbol_stats() -> Dict[str, Any]:
         "rsi_blocked": 0,
         "atr_blocked": 0,
         "spread_blocked": 0,
+        "api_failures": 0,
+        "api_retries": 0,
         "last_score_pct": 0.0,
         "last_rsi": 0.0,
         "last_atr_pct": 0.0,
         "last_spread_pct": 0.0,
         "last_decision": "",
+        "last_error": "",
         "last_checked_at": None,
     }
 
@@ -209,6 +201,7 @@ def create_exchange() -> ccxt.Exchange:
             "",
         ).strip(),
         "enableRateLimit": True,
+        "timeout": 30000,
         "options": {
             "fetchMarkets": {
                 "types": ["spot"],
@@ -220,12 +213,62 @@ def create_exchange() -> ccxt.Exchange:
     return exchange
 
 
+def exchange_call_with_retry(
+    description: str,
+    call: Callable[[], T],
+) -> T:
+    """
+    Probeert tijdelijke netwerk- en Bitvavo-fouten maximaal drie keer.
+
+    Permanente fouten, zoals een ongeldige markt of verkeerde parameters,
+    worden niet herhaald.
+    """
+    last_error: Exception | None = None
+
+    for attempt in range(1, API_MAX_ATTEMPTS + 1):
+        try:
+            return call()
+
+        except TRANSIENT_CCXT_ERRORS as exc:
+            last_error = exc
+
+            if attempt >= API_MAX_ATTEMPTS:
+                break
+
+            base_delay = API_RETRY_DELAYS_SECONDS[
+                min(attempt - 1, len(API_RETRY_DELAYS_SECONDS) - 1)
+            ]
+            delay = base_delay + random.uniform(0.0, 0.5)
+
+            LOG.warning(
+                "%s tijdelijk mislukt | poging=%d/%d | fout=%s: %s | "
+                "opnieuw over %.1f sec",
+                description,
+                attempt,
+                API_MAX_ATTEMPTS,
+                type(exc).__name__,
+                exc,
+                delay,
+            )
+
+            time.sleep(delay)
+
+        except ccxt.ExchangeError:
+            raise
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError(
+        f"{description} mislukt zonder bekende fout"
+    )
+
+
 def calculate_rsi(
     series: pd.Series,
     length: int,
 ) -> pd.Series:
     difference = series.diff()
-
     gains = difference.clip(lower=0)
     losses = -difference.clip(upper=0)
 
@@ -285,10 +328,13 @@ def fetch_dataframe(
     timeframe: str,
     limit: int,
 ) -> pd.DataFrame:
-    candles = exchange.fetch_ohlcv(
-        symbol,
-        timeframe=timeframe,
-        limit=limit,
+    candles = exchange_call_with_retry(
+        f"Candles ophalen voor {symbol}",
+        lambda: exchange.fetch_ohlcv(
+            symbol,
+            timeframe=timeframe,
+            limit=limit,
+        ),
     )
 
     if not candles:
@@ -330,18 +376,28 @@ def fetch_dataframe(
     return dataframe
 
 
+def fetch_ticker_with_retry(
+    exchange: ccxt.Exchange,
+    symbol: str,
+) -> Dict[str, Any]:
+    ticker = exchange_call_with_retry(
+        f"Ticker ophalen voor {symbol}",
+        lambda: exchange.fetch_ticker(symbol),
+    )
+
+    if not isinstance(ticker, dict):
+        raise RuntimeError(
+            "ongeldige ticker ontvangen"
+        )
+
+    return ticker
+
+
 def calculate_spread_pct(
     ticker: Dict[str, Any],
 ) -> float:
-    bid = to_float(
-        ticker.get("bid"),
-        0.0,
-    )
-
-    ask = to_float(
-        ticker.get("ask"),
-        0.0,
-    )
+    bid = to_float(ticker.get("bid"), 0.0)
+    ask = to_float(ticker.get("ask"), 0.0)
 
     if bid <= 0 or ask <= 0:
         return 999.0
@@ -379,10 +435,7 @@ def diagnose_symbol(
     symbol: str,
 ) -> Dict[str, Any]:
     timeframe = str(
-        config.get(
-            "timeframe",
-            "15m",
-        )
+        config.get("timeframe", "15m")
     )
 
     candles_limit = int(
@@ -518,8 +571,9 @@ def diagnose_symbol(
 
     latest = dataframe.iloc[-1]
 
-    ticker = exchange.fetch_ticker(
-        symbol
+    ticker = fetch_ticker_with_retry(
+        exchange,
+        symbol,
     )
 
     close_price = to_float(
@@ -593,13 +647,10 @@ def diagnose_symbol(
 
     if passed_checks == 4:
         decision = "TECHNISCH KOOPSIGNAAL"
-
     elif passed_checks == 3:
         decision = "BIJNA KOOPSIGNAAL"
-
     elif passed_checks == 2:
         decision = "MATIG"
-
     else:
         decision = "GEEN KOOP"
 
@@ -673,16 +724,17 @@ def update_statistics(
     result: Dict[str, Any],
 ) -> None:
     symbol = result["symbol"]
-
-    symbols = stats.setdefault(
-        "symbols",
-        {},
-    )
+    symbols = stats.setdefault("symbols", {})
 
     current = symbols.get(
         symbol,
         default_symbol_stats(),
     )
+
+    # Oude v3-statistieken aanvullen zonder ze te wissen.
+    defaults = default_symbol_stats()
+    for key, value in defaults.items():
+        current.setdefault(key, value)
 
     current["checks"] = int(
         current.get("checks", 0)
@@ -722,6 +774,34 @@ def update_statistics(
     current["last_atr_pct"] = result["atr_pct"]
     current["last_spread_pct"] = result["spread_pct"]
     current["last_decision"] = result["decision"]
+    current["last_error"] = ""
+    current["last_checked_at"] = now_iso()
+
+    symbols[symbol] = current
+
+
+def record_symbol_failure(
+    stats: Dict[str, Any],
+    symbol: str,
+    exc: Exception,
+) -> None:
+    symbols = stats.setdefault("symbols", {})
+
+    current = symbols.get(
+        symbol,
+        default_symbol_stats(),
+    )
+
+    defaults = default_symbol_stats()
+    for key, value in defaults.items():
+        current.setdefault(key, value)
+
+    current["api_failures"] = int(
+        current.get("api_failures", 0)
+    ) + 1
+    current["last_error"] = (
+        f"{type(exc).__name__}: {exc}"
+    )
     current["last_checked_at"] = now_iso()
 
     symbols[symbol] = current
@@ -732,9 +812,7 @@ def run_diagnosis(
     config: Dict[str, Any],
     stats: Dict[str, Any],
 ) -> None:
-    symbols = get_symbols(
-        config
-    )
+    symbols = get_symbols(config)
 
     if not symbols:
         LOG.warning(
@@ -744,10 +822,7 @@ def run_diagnosis(
 
     LOG.info(
         "Diagnoseronde gestart | timeframe=%s | symbolen=%s",
-        config.get(
-            "timeframe",
-            "15m",
-        ),
+        config.get("timeframe", "15m"),
         len(symbols),
     )
 
@@ -765,19 +840,23 @@ def run_diagnosis(
             )
 
         except Exception as exc:
-            LOG.warning(
-                "DIAGNOSE %s mislukt: %s",
+            record_symbol_failure(
+                stats,
                 symbol,
                 exc,
             )
 
-    stats["total_rounds"] = int(
-        stats.get(
-            "total_rounds",
-            0,
-        )
-    ) + 1
+            LOG.warning(
+                "DIAGNOSE %s definitief mislukt | fout=%s: %s",
+                symbol,
+                type(exc).__name__,
+                exc,
+            )
 
+    stats["version"] = 4
+    stats["total_rounds"] = int(
+        stats.get("total_rounds", 0)
+    ) + 1
     stats["last_round_at"] = now_iso()
 
     save_json_atomic(
@@ -792,40 +871,43 @@ def run_diagnosis(
 
 
 def main() -> None:
-    config = load_config(
-        CFG_FILE
-    )
-
+    config = load_config(CFG_FILE)
     stats = load_json(
         DIAG_STATS_FILE,
         default_stats(),
     )
 
+    # Bestaande v3-statistieken blijven behouden.
+    stats.setdefault("symbols", {})
+    stats.setdefault("started_at", now_iso())
+    stats.setdefault("total_rounds", 0)
+    stats["version"] = 4
+
     exchange = create_exchange()
 
     LOG.info(
-        "Diamond Diagnose v3 gestart"
+        "Diamond Diagnose v4 gestart"
     )
-
     LOG.info(
         "Configuratiebestand: %s",
         CFG_FILE,
     )
-
     LOG.info(
         "Statistiekbestand: %s",
         DIAG_STATS_FILE,
     )
-
+    LOG.info(
+        "API-retry actief | pogingen=%d | wachttijden=%s",
+        API_MAX_ATTEMPTS,
+        API_RETRY_DELAYS_SECONDS,
+    )
     LOG.info(
         "Diagnose plaatst geen orders en wijzigt geen posities"
     )
 
     while True:
         try:
-            config = load_config(
-                CFG_FILE
-            )
+            config = load_config(CFG_FILE)
 
             run_diagnosis(
                 exchange,
@@ -839,9 +921,7 @@ def main() -> None:
                 exc,
             )
 
-        time.sleep(
-            LOOP_SLEEP_SECONDS
-        )
+        time.sleep(LOOP_SLEEP_SECONDS)
 
 
 if __name__ == "__main__":
