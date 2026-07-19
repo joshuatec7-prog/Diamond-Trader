@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 LOG = logging.getLogger("diamond_diagnose")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -63,11 +64,16 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def to_float(value: Any, default: float = 0.0) -> float:
+def to_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
     try:
         if value is None or value == "":
             return default
+
         return float(value)
+
     except (TypeError, ValueError):
         return default
 
@@ -80,14 +86,20 @@ def get_cfg(
     current: Any = config
 
     for part in path.split("."):
-        if not isinstance(current, dict) or part not in current:
+        if not isinstance(current, dict):
             return default
+
+        if part not in current:
+            return default
+
         current = current[part]
 
     return current
 
 
-def load_config(path_str: str) -> Dict[str, Any]:
+def load_config(
+    path_str: str,
+) -> Dict[str, Any]:
     path = Path(path_str)
 
     if not path.exists():
@@ -95,7 +107,10 @@ def load_config(path_str: str) -> Dict[str, Any]:
             f"Configuratiebestand ontbreekt: {path_str}"
         )
 
-    with path.open("r", encoding="utf-8") as file:
+    with path.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
         config = yaml.safe_load(file) or {}
 
     if not isinstance(config, dict):
@@ -116,7 +131,10 @@ def load_json(
         return default.copy()
 
     try:
-        with path.open("r", encoding="utf-8") as file:
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
             data = json.load(file)
 
         if isinstance(data, dict):
@@ -136,7 +154,11 @@ def save_json_atomic(
     data: Dict[str, Any],
 ) -> None:
     target = Path(path_str)
-    target.parent.mkdir(parents=True, exist_ok=True)
+
+    target.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -150,9 +172,13 @@ def save_json_atomic(
             indent=2,
             ensure_ascii=False,
         )
+
         temporary_name = temporary.name
 
-    os.replace(temporary_name, target)
+    os.replace(
+        temporary_name,
+        target,
+    )
 
 
 def default_stats() -> Dict[str, Any]:
@@ -179,7 +205,6 @@ def default_symbol_stats() -> Dict[str, Any]:
         "atr_blocked": 0,
         "spread_blocked": 0,
         "api_failures": 0,
-        "api_retries": 0,
         "last_score_pct": 0.0,
         "last_rsi": 0.0,
         "last_atr_pct": 0.0,
@@ -210,6 +235,7 @@ def create_exchange() -> ccxt.Exchange:
     })
 
     exchange.load_markets()
+
     return exchange
 
 
@@ -221,11 +247,15 @@ def exchange_call_with_retry(
     Probeert tijdelijke netwerk- en Bitvavo-fouten maximaal drie keer.
 
     Permanente fouten, zoals een ongeldige markt of verkeerde parameters,
-    worden niet herhaald.
+    worden niet opnieuw geprobeerd.
     """
+
     last_error: Exception | None = None
 
-    for attempt in range(1, API_MAX_ATTEMPTS + 1):
+    for attempt in range(
+        1,
+        API_MAX_ATTEMPTS + 1,
+    ):
         try:
             return call()
 
@@ -235,14 +265,26 @@ def exchange_call_with_retry(
             if attempt >= API_MAX_ATTEMPTS:
                 break
 
+            delay_index = min(
+                attempt - 1,
+                len(API_RETRY_DELAYS_SECONDS) - 1,
+            )
+
             base_delay = API_RETRY_DELAYS_SECONDS[
-                min(attempt - 1, len(API_RETRY_DELAYS_SECONDS) - 1)
+                delay_index
             ]
-            delay = base_delay + random.uniform(0.0, 0.5)
+
+            delay = (
+                base_delay
+                + random.uniform(
+                    0.0,
+                    0.5,
+                )
+            )
 
             LOG.warning(
-                "%s tijdelijk mislukt | poging=%d/%d | fout=%s: %s | "
-                "opnieuw over %.1f sec",
+                "%s tijdelijk mislukt | poging=%d/%d | "
+                "fout=%s: %s | opnieuw over %.1f sec",
                 description,
                 attempt,
                 API_MAX_ATTEMPTS,
@@ -251,7 +293,9 @@ def exchange_call_with_retry(
                 delay,
             )
 
-            time.sleep(delay)
+            time.sleep(
+                delay
+            )
 
         except ccxt.ExchangeError:
             raise
@@ -269,8 +313,14 @@ def calculate_rsi(
     length: int,
 ) -> pd.Series:
     difference = series.diff()
-    gains = difference.clip(lower=0)
-    losses = -difference.clip(upper=0)
+
+    gains = difference.clip(
+        lower=0
+    )
+
+    losses = -difference.clip(
+        upper=0
+    )
 
     average_gain = gains.ewm(
         alpha=1 / length,
@@ -286,11 +336,18 @@ def calculate_rsi(
 
     relative_strength = (
         average_gain
-        / average_loss.replace(0, pd.NA)
+        / average_loss.replace(
+            0,
+            pd.NA,
+        )
     )
 
     return 100 - (
-        100 / (1 + relative_strength)
+        100
+        / (
+            1
+            + relative_strength
+        )
     )
 
 
@@ -298,11 +355,16 @@ def calculate_atr(
     dataframe: pd.DataFrame,
     length: int,
 ) -> pd.Series:
-    previous_close = dataframe["close"].shift(1)
+    previous_close = dataframe[
+        "close"
+    ].shift(1)
 
     true_range = pd.concat(
         [
-            dataframe["high"] - dataframe["low"],
+            (
+                dataframe["high"]
+                - dataframe["low"]
+            ),
             (
                 dataframe["high"]
                 - previous_close
@@ -313,7 +375,9 @@ def calculate_atr(
             ).abs(),
         ],
         axis=1,
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     return true_range.ewm(
         alpha=1 / length,
@@ -366,7 +430,9 @@ def fetch_dataframe(
             errors="coerce",
         )
 
-    dataframe.dropna(inplace=True)
+    dataframe.dropna(
+        inplace=True
+    )
 
     if dataframe.empty:
         raise RuntimeError(
@@ -382,10 +448,15 @@ def fetch_ticker_with_retry(
 ) -> Dict[str, Any]:
     ticker = exchange_call_with_retry(
         f"Ticker ophalen voor {symbol}",
-        lambda: exchange.fetch_ticker(symbol),
+        lambda: exchange.fetch_ticker(
+            symbol
+        ),
     )
 
-    if not isinstance(ticker, dict):
+    if not isinstance(
+        ticker,
+        dict,
+    ):
         raise RuntimeError(
             "ongeldige ticker ontvangen"
         )
@@ -396,19 +467,32 @@ def fetch_ticker_with_retry(
 def calculate_spread_pct(
     ticker: Dict[str, Any],
 ) -> float:
-    bid = to_float(ticker.get("bid"), 0.0)
-    ask = to_float(ticker.get("ask"), 0.0)
+    bid = to_float(
+        ticker.get("bid"),
+        0.0,
+    )
+
+    ask = to_float(
+        ticker.get("ask"),
+        0.0,
+    )
 
     if bid <= 0 or ask <= 0:
         return 999.0
 
-    middle = (bid + ask) / 2.0
+    middle = (
+        bid
+        + ask
+    ) / 2.0
 
     if middle <= 0:
         return 999.0
 
     return (
-        (ask - bid)
+        (
+            ask
+            - bid
+        )
         / middle
         * 100.0
     )
@@ -417,9 +501,14 @@ def calculate_spread_pct(
 def get_symbols(
     config: Dict[str, Any],
 ) -> List[str]:
-    symbols = config.get("symbols") or []
+    symbols = config.get(
+        "symbols"
+    ) or []
 
-    if not isinstance(symbols, list):
+    if not isinstance(
+        symbols,
+        list,
+    ):
         return []
 
     return [
@@ -435,7 +524,10 @@ def diagnose_symbol(
     symbol: str,
 ) -> Dict[str, Any]:
     timeframe = str(
-        config.get("timeframe", "15m")
+        config.get(
+            "timeframe",
+            "15m",
+        )
     )
 
     candles_limit = int(
@@ -549,13 +641,17 @@ def diagnose_symbol(
 
     dataframe["sma_fast"] = (
         dataframe["close"]
-        .rolling(sma_fast_length)
+        .rolling(
+            sma_fast_length
+        )
         .mean()
     )
 
     dataframe["sma_slow"] = (
         dataframe["close"]
-        .rolling(sma_slow_length)
+        .rolling(
+            sma_slow_length
+        )
         .mean()
     )
 
@@ -625,11 +721,13 @@ def diagnose_symbol(
     )
 
     atr_ok = (
-        atr_pct >= min_atr_pct
+        atr_pct
+        >= min_atr_pct
     )
 
     spread_ok = (
-        spread_pct <= max_spread_pct
+        spread_pct
+        <= max_spread_pct
     )
 
     passed_checks = sum([
@@ -646,11 +744,18 @@ def diagnose_symbol(
     )
 
     if passed_checks == 4:
-        decision = "TECHNISCH KOOPSIGNAAL"
+        decision = (
+            "TECHNISCH KOOPSIGNAAL"
+        )
+
     elif passed_checks == 3:
-        decision = "BIJNA KOOPSIGNAAL"
+        decision = (
+            "BIJNA KOOPSIGNAAL"
+        )
+
     elif passed_checks == 2:
         decision = "MATIG"
+
     else:
         decision = "GEEN KOOP"
 
@@ -666,6 +771,7 @@ def diagnose_symbol(
             reasons.append(
                 f"RSI te laag ({rsi_value:.2f})"
             )
+
         else:
             reasons.append(
                 f"RSI te hoog ({rsi_value:.2f})"
@@ -702,7 +808,9 @@ def diagnose_symbol(
         LOG.info(
             "DIAGNOSE %s | BLOKKADES: %s",
             symbol,
-            " ; ".join(reasons),
+            " ; ".join(
+                reasons
+            ),
         )
 
     return {
@@ -724,30 +832,52 @@ def update_statistics(
     result: Dict[str, Any],
 ) -> None:
     symbol = result["symbol"]
-    symbols = stats.setdefault("symbols", {})
+
+    symbols = stats.setdefault(
+        "symbols",
+        {},
+    )
 
     current = symbols.get(
         symbol,
         default_symbol_stats(),
     )
 
-    # Oude v3-statistieken aanvullen zonder ze te wissen.
     defaults = default_symbol_stats()
+
     for key, value in defaults.items():
-        current.setdefault(key, value)
+        current.setdefault(
+            key,
+            value,
+        )
 
     current["checks"] = int(
-        current.get("checks", 0)
+        current.get(
+            "checks",
+            0,
+        )
     ) + 1
 
-    if result["decision"] == "TECHNISCH KOOPSIGNAAL":
+    if (
+        result["decision"]
+        == "TECHNISCH KOOPSIGNAAL"
+    ):
         current["technical_signals"] = int(
-            current.get("technical_signals", 0)
+            current.get(
+                "technical_signals",
+                0,
+            )
         ) + 1
 
-    if result["decision"] == "BIJNA KOOPSIGNAAL":
+    if (
+        result["decision"]
+        == "BIJNA KOOPSIGNAAL"
+    ):
         current["near_signals"] = int(
-            current.get("near_signals", 0)
+            current.get(
+                "near_signals",
+                0,
+            )
         ) + 1
 
     for filter_name in (
@@ -756,26 +886,54 @@ def update_statistics(
         "atr",
         "spread",
     ):
-        result_key = f"{filter_name}_ok"
+        result_key = (
+            f"{filter_name}_ok"
+        )
 
         if result[result_key]:
             current[result_key] = int(
-                current.get(result_key, 0)
+                current.get(
+                    result_key,
+                    0,
+                )
             ) + 1
+
         else:
-            blocked_key = f"{filter_name}_blocked"
+            blocked_key = (
+                f"{filter_name}_blocked"
+            )
 
             current[blocked_key] = int(
-                current.get(blocked_key, 0)
+                current.get(
+                    blocked_key,
+                    0,
+                )
             ) + 1
 
-    current["last_score_pct"] = result["score_pct"]
-    current["last_rsi"] = result["rsi"]
-    current["last_atr_pct"] = result["atr_pct"]
-    current["last_spread_pct"] = result["spread_pct"]
-    current["last_decision"] = result["decision"]
+    current["last_score_pct"] = (
+        result["score_pct"]
+    )
+
+    current["last_rsi"] = (
+        result["rsi"]
+    )
+
+    current["last_atr_pct"] = (
+        result["atr_pct"]
+    )
+
+    current["last_spread_pct"] = (
+        result["spread_pct"]
+    )
+
+    current["last_decision"] = (
+        result["decision"]
+    )
+
     current["last_error"] = ""
-    current["last_checked_at"] = now_iso()
+    current["last_checked_at"] = (
+        now_iso()
+    )
 
     symbols[symbol] = current
 
@@ -785,7 +943,10 @@ def record_symbol_failure(
     symbol: str,
     exc: Exception,
 ) -> None:
-    symbols = stats.setdefault("symbols", {})
+    symbols = stats.setdefault(
+        "symbols",
+        {},
+    )
 
     current = symbols.get(
         symbol,
@@ -793,16 +954,27 @@ def record_symbol_failure(
     )
 
     defaults = default_symbol_stats()
+
     for key, value in defaults.items():
-        current.setdefault(key, value)
+        current.setdefault(
+            key,
+            value,
+        )
 
     current["api_failures"] = int(
-        current.get("api_failures", 0)
+        current.get(
+            "api_failures",
+            0,
+        )
     ) + 1
+
     current["last_error"] = (
         f"{type(exc).__name__}: {exc}"
     )
-    current["last_checked_at"] = now_iso()
+
+    current["last_checked_at"] = (
+        now_iso()
+    )
 
     symbols[symbol] = current
 
@@ -812,17 +984,23 @@ def run_diagnosis(
     config: Dict[str, Any],
     stats: Dict[str, Any],
 ) -> None:
-    symbols = get_symbols(config)
+    symbols = get_symbols(
+        config
+    )
 
     if not symbols:
         LOG.warning(
             "Geen symbolen gevonden in config.yaml"
         )
+
         return
 
     LOG.info(
         "Diagnoseronde gestart | timeframe=%s | symbolen=%s",
-        config.get("timeframe", "15m"),
+        config.get(
+            "timeframe",
+            "15m",
+        ),
         len(symbols),
     )
 
@@ -854,10 +1032,17 @@ def run_diagnosis(
             )
 
     stats["version"] = 4
+
     stats["total_rounds"] = int(
-        stats.get("total_rounds", 0)
+        stats.get(
+            "total_rounds",
+            0,
+        )
     ) + 1
-    stats["last_round_at"] = now_iso()
+
+    stats["last_round_at"] = (
+        now_iso()
+    )
 
     save_json_atomic(
         DIAG_STATS_FILE,
@@ -871,16 +1056,30 @@ def run_diagnosis(
 
 
 def main() -> None:
-    config = load_config(CFG_FILE)
+    config = load_config(
+        CFG_FILE
+    )
+
     stats = load_json(
         DIAG_STATS_FILE,
         default_stats(),
     )
 
-    # Bestaande v3-statistieken blijven behouden.
-    stats.setdefault("symbols", {})
-    stats.setdefault("started_at", now_iso())
-    stats.setdefault("total_rounds", 0)
+    stats.setdefault(
+        "symbols",
+        {},
+    )
+
+    stats.setdefault(
+        "started_at",
+        now_iso(),
+    )
+
+    stats.setdefault(
+        "total_rounds",
+        0,
+    )
+
     stats["version"] = 4
 
     exchange = create_exchange()
@@ -888,26 +1087,32 @@ def main() -> None:
     LOG.info(
         "Diamond Diagnose v4 gestart"
     )
+
     LOG.info(
         "Configuratiebestand: %s",
         CFG_FILE,
     )
+
     LOG.info(
         "Statistiekbestand: %s",
         DIAG_STATS_FILE,
     )
+
     LOG.info(
         "API-retry actief | pogingen=%d | wachttijden=%s",
         API_MAX_ATTEMPTS,
         API_RETRY_DELAYS_SECONDS,
     )
+
     LOG.info(
         "Diagnose plaatst geen orders en wijzigt geen posities"
     )
 
     while True:
         try:
-            config = load_config(CFG_FILE)
+            config = load_config(
+                CFG_FILE
+            )
 
             run_diagnosis(
                 exchange,
@@ -921,7 +1126,9 @@ def main() -> None:
                 exc,
             )
 
-        time.sleep(LOOP_SLEEP_SECONDS)
+        time.sleep(
+            LOOP_SLEEP_SECONDS
+        )
 
 
 if __name__ == "__main__":
