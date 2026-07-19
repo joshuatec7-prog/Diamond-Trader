@@ -25,19 +25,17 @@ trap 'exit 143' TERM
 python3 agent.py &
 PIDS+=("$!")
 
-python3 diagnose.py &
+python3 closed_candle_runner.py diagnose &
 PIDS+=("$!")
 
 python3 supervisor_agent.py &
 PIDS+=("$!")
 
-python3 diamond_bot.py &
+python3 closed_candle_runner.py bot &
 PIDS+=("$!")
 
 echo "Diamond Trader gestart | processen: ${PIDS[*]}"
 
-# Zodra één proces stopt, stopt de volledige service.
-# Render kan daarna alles schoon opnieuw starten.
 set +e
 wait -n "${PIDS[@]}"
 STATUS=$?
