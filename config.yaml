@@ -51,7 +51,7 @@ signals:
 
   use_atr_filter: true
   atr_len: 14
-  min_atr_pct: 0.30
+  min_atr_pct: 0.20
 
   atr_tp_mult: 2.6
   atr_sl_mult: 1.2
