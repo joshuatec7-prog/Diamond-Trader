@@ -857,50 +857,127 @@ class Bot:
         highest = max(to_float(position.get("highest_price", 0.0), 0.0), price)
         position["highest_price"] = highest
 
-        # Winst% berekenen vanaf entry
-        profit_pct = ((price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
-        profit_eur = price * to_float(position.get("amount"), 0.0) - to_float(position.get("quote_amount"), 0.0)
+        profit_pct = (
+            ((price - entry_price) / entry_price) * 100.0
+            if entry_price > 0
+            else 0.0
+        )
+        min_profit_eur = max(
+            0.0,
+            to_float(get_cfg(self.cfg, "min_profit_eur", 0.50), 0.50),
+        )
+        min_profitable_exit_price = self.minimum_profitable_exit_price(
+            position,
+            min_profit_eur,
+        )
+        estimated_net_profit = self.estimated_exit_pnl_quote(
+            symbol,
+            position,
+            price,
+        )
 
-        # Bij 20%+ winst én meer dan €0,50: strakke 5% trailing stop vanaf hoogste punt
-        profit_trailing_pct = to_float(get_cfg(self.cfg, "signals.profit_trailing_trigger_pct", 20.0), 20.0)
-        profit_trailing_pullback = to_float(get_cfg(self.cfg, "signals.profit_trailing_pullback_pct", 5.0), 5.0)
-        min_profit_eur = to_float(get_cfg(self.cfg, "min_profit_eur", 0.50), 0.50)
+        # Een trailing stop mag pas worden verhoogd naar winstgebied wanneer
+        # de stopprijs na koop- en verkoopkosten minimaal min_profit_eur overlaat.
+        profit_trailing_pct = to_float(
+            get_cfg(self.cfg, "signals.profit_trailing_trigger_pct", 20.0),
+            20.0,
+        )
+        profit_trailing_pullback = to_float(
+            get_cfg(self.cfg, "signals.profit_trailing_pullback_pct", 5.0),
+            5.0,
+        )
 
-        if profit_pct >= profit_trailing_pct and profit_eur >= min_profit_eur and highest > 0:
-            tight_trailing_stop = highest * (1.0 - profit_trailing_pullback / 100.0)
-            if tight_trailing_stop > stop_loss:
+        if profit_pct >= profit_trailing_pct and highest > 0:
+            tight_trailing_stop = highest * (
+                1.0 - profit_trailing_pullback / 100.0
+            )
+            if (
+                tight_trailing_stop >= min_profitable_exit_price
+                and tight_trailing_stop > stop_loss
+            ):
                 position["stop_loss"] = tight_trailing_stop
                 stop_loss = tight_trailing_stop
+                locked_net_profit = self.estimated_exit_pnl_quote(
+                    symbol,
+                    position,
+                    tight_trailing_stop,
+                )
                 LOG.info(
-                    "WINST-TRAILING actief voor %s | winst=%.1f%% (%.2f EUR) | tight_stop=%.8f",
-                    symbol, profit_pct, profit_eur, tight_trailing_stop,
+                    "WINST-TRAILING actief voor %s | koerswinst=%.2f%% | "
+                    "netto_winst_nu=%.4f %s | stop=%.8f | "
+                    "min_netto_bij_stop=%.4f %s",
+                    symbol,
+                    profit_pct,
+                    estimated_net_profit,
+                    self.quote,
+                    tight_trailing_stop,
+                    locked_net_profit,
+                    self.quote,
                 )
 
-        # Normale ATR trailing stop updaten
-        trailing_enabled = to_bool(get_cfg(self.cfg, "signals.trailing_enabled", True), True)
-        trailing_atr_mult = to_float(get_cfg(self.cfg, "signals.trailing_atr_mult", 1.2), 1.2)
+        # Normale ATR-trailing wordt alleen actief wanneer de berekende
+        # stopprijs minimaal de ingestelde nettowinst veiligstelt.
+        trailing_enabled = to_bool(
+            get_cfg(self.cfg, "signals.trailing_enabled", True),
+            True,
+        )
+        trailing_atr_mult = to_float(
+            get_cfg(self.cfg, "signals.trailing_atr_mult", 1.2),
+            1.2,
+        )
         if trailing_enabled and atr > 0 and highest > 0:
             trailing_stop = highest - atr * trailing_atr_mult
-            if trailing_stop > stop_loss:
+            if (
+                trailing_stop >= min_profitable_exit_price
+                and trailing_stop > stop_loss
+            ):
                 position["stop_loss"] = trailing_stop
                 stop_loss = trailing_stop
 
-        # Harde 7% stop-loss check (ook tijdens positiebeheer)
-        hard_sl_pct = to_float(get_cfg(self.cfg, "signals.hard_stop_loss_pct", 7.0), 7.0)
+        # Harde stop-loss blijft altijd actief als veiligheidsgrens.
+        hard_sl_pct = to_float(
+            get_cfg(self.cfg, "signals.hard_stop_loss_pct", 7.0),
+            7.0,
+        )
         if entry_price > 0:
             hard_stop = entry_price * (1.0 - hard_sl_pct / 100.0)
             if price <= hard_stop:
-                LOG.warning("HARDE STOP-LOSS geraakt voor %s | prijs=%.8f | hard_stop=%.8f (-7%%)", symbol, price, hard_stop)
+                LOG.warning(
+                    "HARDE STOP-LOSS geraakt voor %s | prijs=%.8f | "
+                    "hard_stop=%.8f (-%.2f%%)",
+                    symbol,
+                    price,
+                    hard_stop,
+                    hard_sl_pct,
+                )
                 return "hard_stop_loss"
 
         if stop_loss > 0 and price <= stop_loss:
-            if stop_loss > entry_price and highest > entry_price:
+            if (
+                stop_loss >= min_profitable_exit_price
+                and highest > entry_price
+            ):
                 return "trailing_stop"
             return "stop_loss"
-        # Take_profit alleen gebruiken als winst-trailing NIET actief is
-        if take_profit > 0 and price >= take_profit and profit_pct < profit_trailing_pct:
+
+        profit_trailing_active = (
+            stop_loss >= min_profitable_exit_price
+            and min_profitable_exit_price < float("inf")
+        )
+        if (
+            take_profit > 0
+            and price >= take_profit
+            and not profit_trailing_active
+        ):
             return "take_profit"
-        if to_bool(get_cfg(self.cfg, "signals.exit_on_trend_break", False), False) and fast < slow:
+
+        if (
+            to_bool(
+                get_cfg(self.cfg, "signals.exit_on_trend_break", False),
+                False,
+            )
+            and fast < slow
+        ):
             return "trend_break"
         return None
 
@@ -1030,17 +1107,56 @@ class Bot:
         )
         return fallback_quote_amount * (taker_fee_pct / 100.0)
 
-    def estimated_exit_pnl_quote(self, symbol: str, position: Dict[str, Any], bid_price: Optional[float] = None) -> float:
+    def estimated_exit_pnl_quote(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+        bid_price: Optional[float] = None,
+    ) -> float:
         if bid_price is None:
             ticker = self.get_ticker(symbol)
             bid_price = to_float(ticker.get("bid"), 0.0)
+
         amount = to_float(position.get("amount"), 0.0)
         gross_quote = amount * max(bid_price or 0.0, 0.0)
-        taker_fee_pct = to_float(get_cfg(self.cfg, "taker_fee_pct", 0.25), 0.25)
+        taker_fee_pct = to_float(
+            get_cfg(self.cfg, "taker_fee_pct", 0.25),
+            0.25,
+        )
         est_sell_fee = gross_quote * (taker_fee_pct / 100.0)
         entry_quote = to_float(position.get("quote_amount"), 0.0)
         fee_buy_quote = to_float(position.get("fees_buy_quote"), 0.0)
         return gross_quote - est_sell_fee - entry_quote - fee_buy_quote
+
+    def minimum_profitable_exit_price(
+        self,
+        position: Dict[str, Any],
+        min_profit_quote: float,
+    ) -> float:
+        """
+        Berekent de minimale verkoopprijs waarbij na beide handelskosten
+        minimaal min_profit_quote in de quotevaluta overblijft.
+        """
+        amount = to_float(position.get("amount"), 0.0)
+        if amount <= 0:
+            return float("inf")
+
+        entry_quote = to_float(position.get("quote_amount"), 0.0)
+        fee_buy_quote = to_float(position.get("fees_buy_quote"), 0.0)
+        taker_fee_pct = max(
+            0.0,
+            to_float(get_cfg(self.cfg, "taker_fee_pct", 0.25), 0.25),
+        )
+        sell_multiplier = 1.0 - taker_fee_pct / 100.0
+        if sell_multiplier <= 0:
+            return float("inf")
+
+        required_net_quote = (
+            entry_quote
+            + fee_buy_quote
+            + max(0.0, min_profit_quote)
+        )
+        return required_net_quote / (amount * sell_multiplier)
 
     def estimated_short_exit_pnl_quote(self, symbol: str, position: Dict[str, Any], ask_price: Optional[float] = None) -> float:
         if ask_price is None:
@@ -1061,26 +1177,41 @@ class Bot:
             LOG.info(message, *args)
             self.last_hold_log_ts[key] = now_ts
 
-    def sell_allowed_by_profit(self, symbol: str, position: Dict[str, Any], reason: str) -> bool:
+    def sell_allowed_by_profit(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+        reason: str,
+    ) -> bool:
         ticker = self.get_ticker(symbol)
         bid = to_float(ticker.get("bid"), 0.0)
         if bid <= 0:
             return False
+
         est_pnl = self.estimated_exit_pnl_quote(symbol, position, bid)
-        # Stop-loss en hard stop altijd uitvoeren
+
+        # Veiligheidsverkopen mogen altijd doorgaan.
         if reason in {"stop_loss", "bad_news", "hard_stop_loss"}:
             return True
-        if reason == "trailing_stop" and est_pnl <= 0:
-            return True
-        min_profit_eur = to_float(get_cfg(self.cfg, "min_profit_eur", 0.50), 0.50)
-        if min_profit_eur <= 0:
-            return True
+
+        # Take-profit, trendbreuk en trailing-stop mogen pas verkopen wanneer
+        # de geschatte nettowinst na beide handelskosten voldoende is.
+        min_profit_eur = max(
+            0.0,
+            to_float(get_cfg(self.cfg, "min_profit_eur", 0.50), 0.50),
+        )
         if est_pnl >= min_profit_eur:
             return True
+
         self.rate_limited_hold_log(
             f"{symbol}:{reason}",
             "HOLD %s | reason=%s | est_pnl=%.4f %s < min_profit=%.4f %s",
-            symbol, reason, est_pnl, self.quote, min_profit_eur, self.quote,
+            symbol,
+            reason,
+            est_pnl,
+            self.quote,
+            min_profit_eur,
+            self.quote,
         )
         return False
 
@@ -1701,7 +1832,7 @@ def main() -> None:
     cfg = load_yaml(cfg_path)
     setup_logging(str(get_cfg(cfg, "log_level", "INFO")))
     bot = Bot(cfg)
-    LOG.info("Diamond Bot v6 gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
+    LOG.info("Diamond Bot v6.1 gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
     bot.run_forever()
 
 
