@@ -1,5 +1,5 @@
 # Diamond Trader configuratie
-# Eerste test altijd met dry_run: true
+# Dry-run blijft actief totdat alle technische en strategische tests zijn geslaagd.
 
 quote: EUR
 timeframe: 15m
@@ -19,7 +19,7 @@ trading:
 
 risk:
   dry_run: true
-  fixed_stake_quote: 100
+  fixed_stake_quote: 120
   max_open_positions: 5
   eur_reserve: 1000
   max_spread_pct: 0.25
@@ -32,7 +32,7 @@ risk:
   avoid_symbols_with_existing_balance: false
   existing_balance_dust: 0.00000001
 
-  # Alleen gebruikt voor dry-run simulatie.
+  # Alleen gebruikt voor de dry-run simulatie.
   simulated_quote_balance: 3000
 
 fees:
@@ -42,7 +42,10 @@ signals:
   use_sma: true
   sma_fast: 20
   sma_slow: 60
-  require_crossover: false
+
+  # Alleen kopen bij een nieuwe kruising van de snelle SMA
+  # boven de langzame SMA.
+  require_crossover: true
 
   use_rsi: true
   rsi_len: 14
@@ -69,6 +72,7 @@ scanner:
   auto_scan: false
   top_n_markets: 5
   min_quote_volume: 250000
+
   exclude_bases:
     - EUR
     - USDT
@@ -76,7 +80,7 @@ scanner:
     - DAI
 
 news:
-  # Nieuwsfilter voorlopig uit tijdens de eerste technische test.
+  # Nieuwsfilter blijft voorlopig uit tijdens de technische dry-run.
   enabled: false
 
   timespan_hours: 24
@@ -94,7 +98,7 @@ news:
   max_records: 100
 
 short:
-  # Alleen papieren shortsignalen; nooit live short.
+  # Alleen papieren shortsignalen; nooit automatisch live short.
   enabled: false
   leverage: 1
   margin_per_trade: 50
