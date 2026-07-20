@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Diamond Diagnose v4.1
+Diamond Diagnose v4.2
 
 Functies:
-- controleert trend, RSI, ATR en spread per munt;
+- controleert trend, crossover, RSI, ATR en spread per munt;
+- gebruikt uitsluitend afgesloten candles;
+- gebruikt dezelfde crossoverregel als Diamond Trader;
 - plaatst nooit orders;
 - wijzigt geen botposities;
 - bewaart statistieken in /var/data/diamond_diagnose_stats.json;
@@ -76,6 +78,39 @@ def to_float(
 
     except (TypeError, ValueError):
         return default
+
+
+def to_bool(
+    value: Any,
+    default: bool = False,
+) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return default
+
+    normalized = str(value).strip().lower()
+
+    if normalized in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "ja",
+    }:
+        return True
+
+    if normalized in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "nee",
+    }:
+        return False
+
+    return default
 
 
 def get_cfg(
@@ -204,11 +239,18 @@ def default_symbol_stats() -> Dict[str, Any]:
         "rsi_blocked": 0,
         "atr_blocked": 0,
         "spread_blocked": 0,
+        "crossover_checks": 0,
+        "crossover_ok": 0,
+        "crossover_blocked": 0,
         "api_failures": 0,
         "last_score_pct": 0.0,
         "last_rsi": 0.0,
         "last_atr_pct": 0.0,
         "last_spread_pct": 0.0,
+        "last_cross_up": False,
+        "last_require_crossover": False,
+        "last_trend_structure_ok": False,
+        "last_entry_filter_ok": False,
         "last_decision": "",
         "last_error": "",
         "last_checked_at": None,
@@ -396,8 +438,9 @@ def fetch_dataframe(
     Haalt candles op en verwijdert een eventueel nog open candle.
 
     Bitvavo levert de lopende candle mee. Diagnose gebruikt daarom
-    uitsluitend volledig afgesloten candles, net als diamond_bot.py.
+    uitsluitend volledig afgesloten candles, net als Diamond Trader.
     """
+
     candles = exchange_call_with_retry(
         f"Candles ophalen voor {symbol}",
         lambda: exchange.fetch_ohlcv(
@@ -440,15 +483,18 @@ def fetch_dataframe(
     dataframe.dropna(
         inplace=True
     )
+
     dataframe.sort_values(
         "timestamp",
         inplace=True,
     )
+
     dataframe.drop_duplicates(
         subset=["timestamp"],
         keep="last",
         inplace=True,
     )
+
     dataframe.reset_index(
         drop=True,
         inplace=True,
@@ -460,15 +506,20 @@ def fetch_dataframe(
         )
 
     timeframe_ms = int(
-        exchange.parse_timeframe(timeframe)
+        exchange.parse_timeframe(
+            timeframe
+        )
         * 1000
     )
+
     now_ms = int(
         exchange.milliseconds()
     )
+
     last_start_ms = int(
         dataframe.iloc[-1]["timestamp"]
     )
+
     last_close_ms = (
         last_start_ms
         + timeframe_ms
@@ -479,10 +530,12 @@ def fetch_dataframe(
             last_start_ms / 1000,
             timezone.utc,
         )
+
         dataframe = dataframe.iloc[:-1].copy()
 
         LOG.debug(
-            "Open candle verwijderd voor %s | start=%s | timeframe=%s",
+            "Open candle verwijderd voor %s | "
+            "start=%s | timeframe=%s",
             symbol,
             open_candle_start.isoformat(),
             timeframe,
@@ -680,6 +733,42 @@ def diagnose_symbol(
         0.25,
     )
 
+    use_sma = to_bool(
+        get_cfg(
+            config,
+            "signals.use_sma",
+            True,
+        ),
+        True,
+    )
+
+    use_rsi = to_bool(
+        get_cfg(
+            config,
+            "signals.use_rsi",
+            True,
+        ),
+        True,
+    )
+
+    use_atr_filter = to_bool(
+        get_cfg(
+            config,
+            "signals.use_atr_filter",
+            True,
+        ),
+        True,
+    )
+
+    require_crossover = to_bool(
+        get_cfg(
+            config,
+            "signals.require_crossover",
+            False,
+        ),
+        False,
+    )
+
     dataframe = fetch_dataframe(
         exchange,
         symbol,
@@ -725,6 +814,7 @@ def diagnose_symbol(
     )
 
     latest = dataframe.iloc[-1]
+    previous = dataframe.iloc[-2]
 
     ticker = fetch_ticker_with_retry(
         exchange,
@@ -743,6 +833,16 @@ def diagnose_symbol(
 
     sma_slow = to_float(
         latest["sma_slow"],
+        0.0,
+    )
+
+    previous_sma_fast = to_float(
+        previous["sma_fast"],
+        0.0,
+    )
+
+    previous_sma_slow = to_float(
+        previous["sma_slow"],
         0.0,
     )
 
@@ -768,20 +868,47 @@ def diagnose_symbol(
         ticker
     )
 
-    trend_ok = (
+    trend_structure_ok = (
         close_price > sma_fast
         and sma_fast > sma_slow
     )
 
+    cross_up = (
+        previous_sma_fast <= previous_sma_slow
+        and sma_fast > sma_slow
+    )
+
+    if not use_sma:
+        entry_filter_ok = True
+
+    elif require_crossover:
+        entry_filter_ok = (
+            cross_up
+            and trend_structure_ok
+        )
+
+    else:
+        entry_filter_ok = (
+            trend_structure_ok
+        )
+
     rsi_ok = (
-        rsi_min
-        <= rsi_value
-        <= rsi_max
+        (
+            rsi_min
+            <= rsi_value
+            <= rsi_max
+        )
+        if use_rsi
+        else True
     )
 
     atr_ok = (
-        atr_pct
-        >= min_atr_pct
+        (
+            atr_pct
+            >= min_atr_pct
+        )
+        if use_atr_filter
+        else True
     )
 
     spread_ok = (
@@ -790,7 +917,7 @@ def diagnose_symbol(
     )
 
     passed_checks = sum([
-        trend_ok,
+        entry_filter_ok,
         rsi_ok,
         atr_ok,
         spread_ok,
@@ -820,10 +947,16 @@ def diagnose_symbol(
 
     reasons: List[str] = []
 
-    if not trend_ok:
-        reasons.append(
-            "trend niet stijgend"
-        )
+    if use_sma and not entry_filter_ok:
+        if not trend_structure_ok:
+            reasons.append(
+                "trend niet stijgend"
+            )
+
+        elif require_crossover and not cross_up:
+            reasons.append(
+                "geen nieuwe SMA-kruising"
+            )
 
     if not rsi_ok:
         if rsi_value < rsi_min:
@@ -846,14 +979,30 @@ def diagnose_symbol(
             f"spread te hoog ({spread_pct:.3f}%)"
         )
 
+    if not use_sma:
+        crossover_status = "SMA_UIT"
+
+    elif not require_crossover:
+        crossover_status = "NIET_VEREIST"
+
+    else:
+        crossover_status = (
+            "OK"
+            if cross_up
+            else "NIET_OK"
+        )
+
     LOG.info(
         "DIAGNOSE %s | score=%d/4 %.0f%% | "
-        "trend=%s | RSI=%.2f:%s | ATR=%.3f%%:%s | "
+        "entry=%s | trend=%s | crossover=%s | "
+        "RSI=%.2f:%s | ATR=%.3f%%:%s | "
         "spread=%.3f%%:%s | BESLISSING=%s",
         symbol,
         passed_checks,
         score_pct,
-        "OK" if trend_ok else "NIET_OK",
+        "OK" if entry_filter_ok else "NIET_OK",
+        "OK" if trend_structure_ok else "NIET_OK",
+        crossover_status,
         rsi_value,
         "OK" if rsi_ok else "NIET_OK",
         atr_pct,
@@ -874,7 +1023,10 @@ def diagnose_symbol(
 
     return {
         "symbol": symbol,
-        "trend_ok": trend_ok,
+        "trend_ok": trend_structure_ok,
+        "entry_filter_ok": entry_filter_ok,
+        "cross_up": cross_up,
+        "require_crossover": require_crossover,
         "rsi_ok": rsi_ok,
         "atr_ok": atr_ok,
         "spread_ok": spread_ok,
@@ -969,6 +1121,36 @@ def update_statistics(
                 )
             ) + 1
 
+    if result.get(
+        "require_crossover",
+        False,
+    ):
+        current["crossover_checks"] = int(
+            current.get(
+                "crossover_checks",
+                0,
+            )
+        ) + 1
+
+        if result.get(
+            "entry_filter_ok",
+            False,
+        ):
+            current["crossover_ok"] = int(
+                current.get(
+                    "crossover_ok",
+                    0,
+                )
+            ) + 1
+
+        else:
+            current["crossover_blocked"] = int(
+                current.get(
+                    "crossover_blocked",
+                    0,
+                )
+            ) + 1
+
     current["last_score_pct"] = (
         result["score_pct"]
     )
@@ -983,6 +1165,34 @@ def update_statistics(
 
     current["last_spread_pct"] = (
         result["spread_pct"]
+    )
+
+    current["last_cross_up"] = bool(
+        result.get(
+            "cross_up",
+            False,
+        )
+    )
+
+    current["last_require_crossover"] = bool(
+        result.get(
+            "require_crossover",
+            False,
+        )
+    )
+
+    current["last_trend_structure_ok"] = bool(
+        result.get(
+            "trend_ok",
+            False,
+        )
+    )
+
+    current["last_entry_filter_ok"] = bool(
+        result.get(
+            "entry_filter_ok",
+            False,
+        )
     )
 
     current["last_decision"] = (
@@ -1055,12 +1265,22 @@ def run_diagnosis(
         return
 
     LOG.info(
-        "Diagnoseronde gestart | timeframe=%s | symbolen=%s",
+        "Diagnoseronde gestart | versie=4.2 | "
+        "timeframe=%s | symbolen=%s | "
+        "require_crossover=%s",
         config.get(
             "timeframe",
             "15m",
         ),
         len(symbols),
+        to_bool(
+            get_cfg(
+                config,
+                "signals.require_crossover",
+                False,
+            ),
+            False,
+        ),
     )
 
     for symbol in symbols:
@@ -1084,7 +1304,8 @@ def run_diagnosis(
             )
 
             LOG.warning(
-                "DIAGNOSE %s definitief mislukt | fout=%s: %s",
+                "DIAGNOSE %s definitief mislukt | "
+                "fout=%s: %s",
                 symbol,
                 type(exc).__name__,
                 exc,
@@ -1144,7 +1365,7 @@ def main() -> None:
     exchange = create_exchange()
 
     LOG.info(
-        "Diamond Diagnose v4.1 gestart"
+        "Diamond Diagnose v4.2 gestart"
     )
 
     LOG.info(
@@ -1158,13 +1379,15 @@ def main() -> None:
     )
 
     LOG.info(
-        "API-retry actief | pogingen=%d | wachttijden=%s",
+        "API-retry actief | pogingen=%d | "
+        "wachttijden=%s",
         API_MAX_ATTEMPTS,
         API_RETRY_DELAYS_SECONDS,
     )
 
     LOG.info(
-        "Diagnose plaatst geen orders en wijzigt geen posities"
+        "Diagnose plaatst geen orders "
+        "en wijzigt geen posities"
     )
 
     while True:
