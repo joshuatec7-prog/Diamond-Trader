@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v6.2
+Diamond Agent v6.3
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -11,6 +11,7 @@ Functies:
 - Pauzeert alleen nieuwe aankopen.
 - Open posities blijven door diamond_bot.py bewaakt.
 - Pauzeert automatisch wanneer het ingestelde dry-run testdoel is bereikt.
+- Maakt automatisch een eindrapport van uitsluitend de nieuwe testtrades.
 """
 
 import csv
@@ -84,6 +85,11 @@ CFG_FILE = os.getenv(
 TEST_BASELINE_FILE = os.getenv(
     "TEST_BASELINE_FILE",
     "/var/data/diamond_test_baseline.json",
+).strip()
+
+TEST_REPORT_FILE = os.getenv(
+    "TEST_REPORT_FILE",
+    "/var/data/diamond_test_report.json",
 ).strip()
 
 GMAIL_USER = os.getenv(
@@ -688,6 +694,752 @@ def get_week_trades(
 
 
 # ============================================================
+# Automatisch testrapport
+# ============================================================
+
+def trade_market(
+    row: Dict[str, str],
+) -> str:
+    return str(
+        row.get("market")
+        or row.get("symbol")
+        or "ONBEKEND"
+    ).strip().upper()
+
+
+def trade_reason(
+    row: Dict[str, str],
+) -> str:
+    return str(
+        row.get("reason")
+        or "onbekend"
+    ).strip() or "onbekend"
+
+
+def build_spot_round_trips(
+    rows: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """
+    Koppelt iedere spotverkoop aan de bijbehorende koopkosten.
+
+    De bot heeft normaal maximaal één positie per markt. De berekening kan
+    ook een gedeeltelijke verkoop verwerken door de koopkosten evenredig
+    over het verkochte aantal te verdelen.
+    """
+    open_buys: Dict[str, List[Dict[str, Any]]] = {}
+    round_trips: List[Dict[str, Any]] = []
+
+    for transaction_index, row in enumerate(rows):
+        side = str(
+            row.get("side", "")
+        ).strip().upper()
+
+        market = trade_market(row)
+
+        if side == "BUY":
+            base_amount = max(
+                0.0,
+                to_float(
+                    row.get("base_amount"),
+                    0.0,
+                ),
+            )
+
+            buy_fee = max(
+                0.0,
+                to_float(
+                    row.get("fees_quote"),
+                    0.0,
+                ),
+            )
+
+            open_buys.setdefault(
+                market,
+                [],
+            ).append({
+                "remaining_base": base_amount,
+                "remaining_fee": buy_fee,
+                "row": row,
+            })
+
+            continue
+
+        if side != "SELL":
+            continue
+
+        sell_base = max(
+            0.0,
+            to_float(
+                row.get("base_amount"),
+                0.0,
+            ),
+        )
+
+        sell_fee = max(
+            0.0,
+            to_float(
+                row.get("fees_quote"),
+                0.0,
+            ),
+        )
+
+        remaining_sell = sell_base
+        allocated_buy_fee = 0.0
+        matched_buy_rows: List[Dict[str, str]] = []
+        queue = open_buys.setdefault(
+            market,
+            [],
+        )
+
+        while (
+            remaining_sell > 1e-12
+            and queue
+        ):
+            lot = queue[0]
+            lot_base = max(
+                0.0,
+                to_float(
+                    lot.get("remaining_base"),
+                    0.0,
+                ),
+            )
+            lot_fee = max(
+                0.0,
+                to_float(
+                    lot.get("remaining_fee"),
+                    0.0,
+                ),
+            )
+
+            if lot_base <= 1e-12:
+                queue.pop(0)
+                continue
+
+            matched_base = min(
+                remaining_sell,
+                lot_base,
+            )
+
+            fraction = matched_base / lot_base
+            fee_part = lot_fee * fraction
+
+            allocated_buy_fee += fee_part
+            matched_buy_rows.append(
+                lot["row"]
+            )
+
+            lot["remaining_base"] = max(
+                0.0,
+                lot_base - matched_base,
+            )
+            lot["remaining_fee"] = max(
+                0.0,
+                lot_fee - fee_part,
+            )
+
+            remaining_sell = max(
+                0.0,
+                remaining_sell - matched_base,
+            )
+
+            if lot["remaining_base"] <= 1e-12:
+                queue.pop(0)
+
+        round_trips.append({
+            "transaction_index": transaction_index,
+            "sell_row": row,
+            "matched_buy_rows": matched_buy_rows,
+            "buy_fees_quote": allocated_buy_fee,
+            "sell_fees_quote": sell_fee,
+            "total_fees_quote": (
+                allocated_buy_fee
+                + sell_fee
+            ),
+            "unmatched_sell_base": remaining_sell,
+        })
+
+    return round_trips
+
+
+def summarize_test_group(
+    trades: List[Dict[str, Any]],
+    key_name: str,
+) -> Dict[str, Dict[str, Any]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+
+    for trade in trades:
+        key = str(
+            trade.get(key_name)
+            or "onbekend"
+        )
+
+        groups.setdefault(
+            key,
+            [],
+        ).append(trade)
+
+    result: Dict[str, Dict[str, Any]] = {}
+
+    for key, items in groups.items():
+        pnl_values = [
+            to_float(
+                item.get("net_pnl_quote"),
+                0.0,
+            )
+            for item in items
+        ]
+
+        wins = sum(
+            1
+            for value in pnl_values
+            if value > 0
+        )
+
+        losses = sum(
+            1
+            for value in pnl_values
+            if value < 0
+        )
+
+        total_pnl = sum(pnl_values)
+        total_fees = sum(
+            to_float(
+                item.get("total_fees_quote"),
+                0.0,
+            )
+            for item in items
+        )
+
+        result[key] = {
+            "trades": len(items),
+            "wins": wins,
+            "losses": losses,
+            "winrate_pct": round(
+                100.0 * wins / len(items),
+                2,
+            ) if items else 0.0,
+            "net_pnl_quote": round(
+                total_pnl,
+                8,
+            ),
+            "average_pnl_quote": round(
+                total_pnl / len(items),
+                8,
+            ) if items else 0.0,
+            "total_fees_quote": round(
+                total_fees,
+                8,
+            ),
+        }
+
+    return result
+
+
+def maximum_loss_streak(
+    trades: List[Dict[str, Any]],
+) -> int:
+    current = 0
+    maximum = 0
+
+    for trade in trades:
+        pnl = to_float(
+            trade.get("net_pnl_quote"),
+            0.0,
+        )
+
+        if pnl < 0:
+            current += 1
+            maximum = max(
+                maximum,
+                current,
+            )
+        else:
+            current = 0
+
+    return maximum
+
+
+def build_test_report(
+    require_complete: bool = True,
+) -> Dict[str, Any]:
+    """
+    Bouwt het rapport van exact de nieuwe trades uit de nulmeting.
+
+    require_complete=True wordt gebruikt bij de automatische teststop.
+    Met False kan veilig een tussentijds voorbeeld worden gemaakt.
+    """
+    baseline = load_test_baseline()
+
+    if baseline is None:
+        raise RuntimeError(
+            "Geen geldige testbaseline beschikbaar"
+        )
+
+    start_trades = int(
+        to_float(
+            baseline.get("start_spot_trades"),
+            0,
+        )
+    )
+
+    target_total = int(
+        to_float(
+            baseline.get("target_total_trades"),
+            0,
+        )
+    )
+
+    target_new = int(
+        to_float(
+            baseline.get("target_new_trades"),
+            target_total - start_trades,
+        )
+    )
+
+    if (
+        start_trades < 0
+        or target_new <= 0
+        or target_total != start_trades + target_new
+    ):
+        raise RuntimeError(
+            "Testbaseline bevat ongeldige tradegrenzen"
+        )
+
+    transaction_rows = load_trades()
+    round_trips = build_spot_round_trips(
+        transaction_rows
+    )
+
+    available_new = max(
+        0,
+        len(round_trips) - start_trades,
+    )
+
+    selected_round_trips = round_trips[
+        start_trades:target_total
+    ]
+
+    if (
+        require_complete
+        and len(selected_round_trips) < target_new
+    ):
+        raise RuntimeError(
+            "Transactiebestand bevat nog maar "
+            f"{len(selected_round_trips)} van "
+            f"{target_new} nieuwe gesloten trades"
+        )
+
+    selected_trades: List[Dict[str, Any]] = []
+
+    for test_number, round_trip in enumerate(
+        selected_round_trips,
+        start=1,
+    ):
+        row = round_trip["sell_row"]
+        pnl = trade_pnl(row)
+        market = trade_market(row)
+        reason = trade_reason(row)
+
+        selected_trades.append({
+            "test_trade_number": test_number,
+            "absolute_trade_number": (
+                start_trades
+                + test_number
+            ),
+            "timestamp": str(
+                row.get("ts")
+                or ""
+            ),
+            "market": market,
+            "reason": reason,
+            "price": round(
+                to_float(
+                    row.get("price"),
+                    0.0,
+                ),
+                12,
+            ),
+            "base_amount": round(
+                to_float(
+                    row.get("base_amount"),
+                    0.0,
+                ),
+                12,
+            ),
+            "quote_amount": round(
+                to_float(
+                    row.get("quote_amount"),
+                    0.0,
+                ),
+                8,
+            ),
+            "net_pnl_quote": round(
+                pnl,
+                8,
+            ),
+            "holding_time_min": round(
+                to_float(
+                    row.get("holding_time_min"),
+                    0.0,
+                ),
+                2,
+            ),
+            "buy_fees_quote": round(
+                to_float(
+                    round_trip.get("buy_fees_quote"),
+                    0.0,
+                ),
+                8,
+            ),
+            "sell_fees_quote": round(
+                to_float(
+                    round_trip.get("sell_fees_quote"),
+                    0.0,
+                ),
+                8,
+            ),
+            "total_fees_quote": round(
+                to_float(
+                    round_trip.get("total_fees_quote"),
+                    0.0,
+                ),
+                8,
+            ),
+            "buy_match_complete": (
+                to_float(
+                    round_trip.get("unmatched_sell_base"),
+                    0.0,
+                )
+                <= 1e-10
+            ),
+            "dry_run": to_bool(
+                row.get("dry_run"),
+                True,
+            ),
+        })
+
+    pnl_values = [
+        to_float(
+            trade.get("net_pnl_quote"),
+            0.0,
+        )
+        for trade in selected_trades
+    ]
+
+    winning_values = [
+        value
+        for value in pnl_values
+        if value > 0
+    ]
+
+    losing_values = [
+        value
+        for value in pnl_values
+        if value < 0
+    ]
+
+    neutral_count = sum(
+        1
+        for value in pnl_values
+        if value == 0
+    )
+
+    trade_count = len(selected_trades)
+    wins = len(winning_values)
+    losses = len(losing_values)
+    total_pnl = sum(pnl_values)
+    gross_profit = sum(winning_values)
+    gross_loss = sum(losing_values)
+    total_fees = sum(
+        to_float(
+            trade.get("total_fees_quote"),
+            0.0,
+        )
+        for trade in selected_trades
+    )
+
+    holding_values = [
+        to_float(
+            trade.get("holding_time_min"),
+            0.0,
+        )
+        for trade in selected_trades
+    ]
+
+    best_trade = max(
+        selected_trades,
+        key=lambda item: to_float(
+            item.get("net_pnl_quote"),
+            0.0,
+        ),
+        default=None,
+    )
+
+    worst_trade = min(
+        selected_trades,
+        key=lambda item: to_float(
+            item.get("net_pnl_quote"),
+            0.0,
+        ),
+        default=None,
+    )
+
+    fixed_stake = to_float(
+        (baseline.get("settings") or {}).get(
+            "fixed_stake_quote"
+        ),
+        0.0,
+    )
+
+    traded_stake_volume = (
+        fixed_stake * trade_count
+    )
+
+    report = {
+        "report_version": 1,
+        "generated_at": now_utc().isoformat(),
+        "test_started_at": baseline.get(
+            "started_at"
+        ),
+        "test_complete": (
+            trade_count >= target_new
+        ),
+        "start_spot_trades": start_trades,
+        "target_new_trades": target_new,
+        "target_total_trades": target_total,
+        "available_new_closed_trades": available_new,
+        "included_new_trades": trade_count,
+        "remaining_new_trades": max(
+            0,
+            target_new - trade_count,
+        ),
+        "settings": baseline.get(
+            "settings"
+        ) or {},
+        "summary": {
+            "trades": trade_count,
+            "wins": wins,
+            "losses": losses,
+            "neutral": neutral_count,
+            "winrate_pct": round(
+                100.0 * wins / trade_count,
+                2,
+            ) if trade_count else 0.0,
+            "net_pnl_quote": round(
+                total_pnl,
+                8,
+            ),
+            "gross_profit_quote": round(
+                gross_profit,
+                8,
+            ),
+            "gross_loss_quote": round(
+                gross_loss,
+                8,
+            ),
+            "profit_factor": round(
+                gross_profit / abs(gross_loss),
+                4,
+            ) if gross_loss < 0 else None,
+            "average_pnl_quote": round(
+                total_pnl / trade_count,
+                8,
+            ) if trade_count else 0.0,
+            "average_win_quote": round(
+                gross_profit / wins,
+                8,
+            ) if wins else 0.0,
+            "average_loss_quote": round(
+                gross_loss / losses,
+                8,
+            ) if losses else 0.0,
+            "total_fees_quote": round(
+                total_fees,
+                8,
+            ),
+            "average_holding_time_min": round(
+                sum(holding_values) / trade_count,
+                2,
+            ) if trade_count else 0.0,
+            "maximum_loss_streak": maximum_loss_streak(
+                selected_trades
+            ),
+            "stake_volume_quote": round(
+                traded_stake_volume,
+                2,
+            ),
+            "return_on_stake_volume_pct": round(
+                100.0 * total_pnl / traded_stake_volume,
+                4,
+            ) if traded_stake_volume > 0 else None,
+            "buy_fee_matches_complete": all(
+                to_bool(
+                    trade.get("buy_match_complete"),
+                    False,
+                )
+                for trade in selected_trades
+            ) if selected_trades else True,
+        },
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "by_market": summarize_test_group(
+            selected_trades,
+            "market",
+        ),
+        "by_reason": summarize_test_group(
+            selected_trades,
+            "reason",
+        ),
+        "trades": selected_trades,
+        "email_sent_at": None,
+        "last_email_attempt_at": None,
+    }
+
+    return report
+
+
+def save_test_report(
+    report: Dict[str, Any],
+) -> None:
+    save_json_atomic(
+        TEST_REPORT_FILE,
+        report,
+    )
+
+
+def format_test_report(
+    report: Dict[str, Any],
+) -> str:
+    summary = report.get("summary") or {}
+    settings = report.get("settings") or {}
+
+    best = report.get("best_trade") or {}
+    worst = report.get("worst_trade") or {}
+
+    lines = [
+        "=" * 60,
+        "DIAMOND TRADER TESTRAPPORT",
+        "=" * 60,
+        f"Gegenereerd             : {report.get('generated_at')}",
+        f"Test gestart            : {report.get('test_started_at')}",
+        f"Trades opgenomen        : {summary.get('trades', 0)}",
+        f"Test compleet           : {'JA' if report.get('test_complete') else 'NEE'}",
+        "",
+        "RESULTATEN",
+        f"Winsttrades             : {summary.get('wins', 0)}",
+        f"Verliestrades           : {summary.get('losses', 0)}",
+        f"Neutrale trades         : {summary.get('neutral', 0)}",
+        f"Winrate                 : {to_float(summary.get('winrate_pct'), 0.0):.1f}%",
+        f"Nettoresultaat          : €{to_float(summary.get('net_pnl_quote'), 0.0):+.2f}",
+        f"Gemiddelde per trade    : €{to_float(summary.get('average_pnl_quote'), 0.0):+.2f}",
+        f"Gemiddelde winst        : €{to_float(summary.get('average_win_quote'), 0.0):+.2f}",
+        f"Gemiddeld verlies       : €{to_float(summary.get('average_loss_quote'), 0.0):+.2f}",
+        f"Totale handelskosten    : €{to_float(summary.get('total_fees_quote'), 0.0):.2f}",
+        f"Max. verliesreeks       : {int(to_float(summary.get('maximum_loss_streak'), 0.0))}",
+        f"Gem. looptijd           : {to_float(summary.get('average_holding_time_min'), 0.0):.1f} minuten",
+        "",
+        "BESTE EN SLECHTSTE TRADE",
+        (
+            f"Beste                   : {best.get('market', '-')} "
+            f"€{to_float(best.get('net_pnl_quote'), 0.0):+.2f} "
+            f"({best.get('reason', '-')})"
+        ),
+        (
+            f"Slechtste               : {worst.get('market', '-')} "
+            f"€{to_float(worst.get('net_pnl_quote'), 0.0):+.2f} "
+            f"({worst.get('reason', '-')})"
+        ),
+        "",
+        "RESULTAAT PER MUNT",
+    ]
+
+    by_market = report.get("by_market") or {}
+
+    for market in sorted(by_market):
+        item = by_market[market]
+        lines.append(
+            f"{market:<10} trades={item.get('trades', 0):>2} | "
+            f"winrate={to_float(item.get('winrate_pct'), 0.0):>5.1f}% | "
+            f"pnl=€{to_float(item.get('net_pnl_quote'), 0.0):+7.2f}"
+        )
+
+    lines.extend([
+        "",
+        "RESULTAAT PER VERKOOPREDEN",
+    ])
+
+    by_reason = report.get("by_reason") or {}
+
+    for reason in sorted(by_reason):
+        item = by_reason[reason]
+        lines.append(
+            f"{reason:<22} trades={item.get('trades', 0):>2} | "
+            f"pnl=€{to_float(item.get('net_pnl_quote'), 0.0):+7.2f}"
+        )
+
+    lines.extend([
+        "",
+        "TESTINSTELLINGEN",
+        f"Dry-run                 : {settings.get('dry_run')}",
+        f"Inzet per trade         : €{to_float(settings.get('fixed_stake_quote'), 0.0):.2f}",
+        f"Minimum ATR             : {to_float(settings.get('min_atr_pct'), 0.0):.2f}%",
+        f"Timeframe               : {settings.get('timeframe')}",
+        "",
+        f"JSON-rapport            : {TEST_REPORT_FILE}",
+        "=" * 60,
+    ])
+
+    return "\n".join(lines)
+
+
+def load_existing_test_report() -> Dict[str, Any]:
+    report = load_json(
+        TEST_REPORT_FILE,
+        {},
+    )
+
+    if not isinstance(report, dict):
+        return {}
+
+    return report
+
+
+def email_retry_allowed(
+    report: Dict[str, Any],
+) -> bool:
+    if report.get("email_sent_at"):
+        return False
+
+    raw_attempt = str(
+        report.get("last_email_attempt_at")
+        or ""
+    ).strip()
+
+    if not raw_attempt:
+        return True
+
+    try:
+        attempted_at = datetime.fromisoformat(
+            raw_attempt.replace(
+                "Z",
+                "+00:00",
+            )
+        )
+
+        if attempted_at.tzinfo is None:
+            attempted_at = attempted_at.replace(
+                tzinfo=timezone.utc,
+            )
+
+        return (
+            now_utc() - attempted_at
+        ).total_seconds() >= 15 * 60
+
+    except ValueError:
+        return True
+
+
+# ============================================================
 # Bitvavo
 # ============================================================
 
@@ -1113,10 +1865,10 @@ def check_test_target(
     exchange: ccxt.Exchange,
 ) -> bool:
     """
-    Pauzeert nieuwe aankopen zodra het testdoel is bereikt.
+    Pauzeert nieuwe aankopen en maakt het automatische eindrapport.
 
-    De controle draait iedere minuut. Open posities blijven door de bot
-    bewaakt en kunnen normaal worden gesloten.
+    Als de bot-state al op het doel staat maar de laatste CSV-regel nog wordt
+    geschreven, blijft de agent het rapport iedere minuut opnieuw proberen.
     """
     status = get_test_target_status()
 
@@ -1128,14 +1880,6 @@ def check_test_target(
         return False
 
     if not status.get("target_reached", False):
-        return False
-
-    control = load_control()
-
-    if to_bool(
-        control.get("paused"),
-        False,
-    ):
         return False
 
     target_total = int(
@@ -1154,58 +1898,168 @@ def check_test_target(
         status["new_trades"]
     )
 
-    state = load_bot_state()
+    reached_at = now_utc().isoformat()
+    pause_reason = (
+        f"testdoel_{target_total}_trades_bereikt"
+    )
 
+    control = load_control()
+
+    if not to_bool(
+        control.get("paused"),
+        False,
+    ):
+        save_control(
+            paused=True,
+            reason=pause_reason,
+            extra_values={
+                "pause_date": None,
+                "pause_btc_price": None,
+                "test_target_total_trades": target_total,
+                "test_target_reached_at": reached_at,
+            },
+        )
+
+        LOG.warning(
+            "TESTDOEL BEREIKT | start=%d | huidig=%d | "
+            "nieuwe_trades=%d | nieuwe aankopen gepauzeerd",
+            start_trades,
+            current_trades,
+            new_trades,
+        )
+
+    else:
+        # Bestaande veiligheidsreden behouden, maar het bereikte testdoel
+        # wel vastleggen in hetzelfde controlebestand.
+        changed = False
+
+        if not control.get(
+            "test_target_reached_at"
+        ):
+            control["test_target_reached_at"] = reached_at
+            changed = True
+
+        if control.get(
+            "test_target_total_trades"
+        ) != target_total:
+            control["test_target_total_trades"] = target_total
+            changed = True
+
+        if changed:
+            save_json_atomic(
+                CONTROL_FILE,
+                control,
+            )
+
+    existing_report = load_existing_test_report()
+    same_test = (
+        existing_report.get("test_started_at")
+        == (
+            load_test_baseline()
+            or {}
+        ).get("started_at")
+    )
+
+    if (
+        same_test
+        and existing_report.get("test_complete")
+        and existing_report.get("email_sent_at")
+    ):
+        return True
+
+    try:
+        report = build_test_report(
+            require_complete=True,
+        )
+
+    except Exception as exc:
+        LOG.warning(
+            "Testrapport nog niet compleet; volgende minuut opnieuw: %s",
+            exc,
+        )
+
+        return True
+
+    if same_test:
+        report["email_sent_at"] = (
+            existing_report.get(
+                "email_sent_at"
+            )
+        )
+        report["last_email_attempt_at"] = (
+            existing_report.get(
+                "last_email_attempt_at"
+            )
+        )
+
+    save_test_report(
+        report
+    )
+
+    LOG.info(
+        "Testrapport opgeslagen | bestand=%s | trades=%d | pnl=%+.2f EUR",
+        TEST_REPORT_FILE,
+        int(
+            to_float(
+                (report.get("summary") or {}).get(
+                    "trades"
+                ),
+                0.0,
+            )
+        ),
+        to_float(
+            (report.get("summary") or {}).get(
+                "net_pnl_quote"
+            ),
+            0.0,
+        ),
+    )
+
+    if not email_retry_allowed(
+        report
+    ):
+        return True
+
+    report["last_email_attempt_at"] = (
+        now_utc().isoformat()
+    )
+
+    save_test_report(
+        report
+    )
+
+    state = load_bot_state()
     open_spot = len(
         state.get("positions")
         or {}
     )
-
     open_shorts = len(
         state.get("short_positions")
         or {}
     )
 
-    pause_reason = (
-        f"testdoel_{target_total}_trades_bereikt"
+    email_text = (
+        f"{format_test_report(report)}\n\n"
+        "TESTSTOP\n"
+        f"Open spotposities       : {open_spot}\n"
+        f"Open paper-shorts       : {open_shorts}\n\n"
+        "Nieuwe aankopen en nieuwe paper-shorts zijn gepauzeerd.\n"
+        "Eventuele open posities blijven bewaakt en kunnen normaal sluiten."
     )
 
-    reached_at = now_utc().isoformat()
-
-    save_control(
-        paused=True,
-        reason=pause_reason,
-        extra_values={
-            "pause_date": None,
-            "pause_btc_price": None,
-            "test_target_total_trades": target_total,
-            "test_target_reached_at": reached_at,
-        },
+    sent = send_email(
+        "Diamond Trader TESTRAPPORT KLAAR",
+        email_text,
     )
 
-    LOG.warning(
-        "TESTDOEL BEREIKT | start=%d | huidig=%d | "
-        "nieuwe_trades=%d | nieuwe aankopen gepauzeerd",
-        start_trades,
-        current_trades,
-        new_trades,
-    )
+    if sent:
+        report["email_sent_at"] = (
+            now_utc().isoformat()
+        )
 
-    send_email(
-        "Diamond Trader TESTDOEL BEREIKT",
-        (
-            "De ingestelde dry-run test is klaar.\n\n"
-            f"Startstand trades: {start_trades}\n"
-            f"Huidige trades: {current_trades}\n"
-            f"Nieuwe testtrades: {new_trades}\n"
-            f"Doel: {target_total} totale trades\n"
-            f"Open spotposities: {open_spot}\n"
-            f"Open paper-shorts: {open_shorts}\n\n"
-            "Nieuwe aankopen en nieuwe paper-shorts zijn gepauzeerd.\n"
-            "Eventuele open posities blijven bewaakt en kunnen normaal sluiten.\n\n"
-            f"{build_report(exchange)}"
-        ),
-    )
+        save_test_report(
+            report
+        )
 
     return True
 
@@ -1588,6 +2442,8 @@ def main() -> None:
         TRADES_FILE,
         AGENT_STATE_FILE,
         CONTROL_FILE,
+        TEST_BASELINE_FILE,
+        TEST_REPORT_FILE,
     ):
         ensure_parent(path)
 
@@ -1603,7 +2459,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v6.2 gestart"
+        "Diamond Agent v6.3 gestart"
     )
 
     LOG.info(
@@ -1624,6 +2480,11 @@ def main() -> None:
     LOG.info(
         "Testbaseline: %s",
         TEST_BASELINE_FILE,
+    )
+
+    LOG.info(
+        "Testrapport: %s",
+        TEST_REPORT_FILE,
     )
 
     LOG.info(
