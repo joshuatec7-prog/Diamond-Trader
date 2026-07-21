@@ -39,7 +39,7 @@ def fetch_closed_bot_dataframe(
         diamond_bot.to_float(
             diamond_bot.get_cfg(
                 self.cfg,
-                "candles_limit",
+                "logging.candles_limit",
                 400,
             ),
             400,
@@ -305,7 +305,7 @@ def run_bot() -> None:
         str(
             diamond_bot.get_cfg(
                 config,
-                "log_level",
+                "logging.level",
                 "INFO",
             )
         )
@@ -366,7 +366,7 @@ def run_diagnose() -> None:
     exchange = diagnose.create_exchange()
 
     diagnose.LOG.info(
-        "Diamond Diagnose v4.1 gestart | "
+        "Diamond Diagnose v4.2 gestart | "
         "closed_candles=True"
     )
 
