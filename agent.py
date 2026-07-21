@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import ccxt
+import yaml
 from dotenv import load_dotenv
 
 
@@ -72,6 +73,11 @@ AGENT_STATE_FILE = os.getenv(
 CONTROL_FILE = os.getenv(
     "CONTROL_FILE",
     "/var/data/diamond_control.json",
+).strip()
+
+CFG_FILE = os.getenv(
+    "CFG_FILE",
+    "/opt/render/project/src/config.yaml",
 ).strip()
 
 GMAIL_USER = os.getenv(
@@ -187,6 +193,43 @@ def ensure_parent(path_str: str) -> None:
         parents=True,
         exist_ok=True,
     )
+
+
+def config_dry_run() -> bool:
+    """
+    Leest de actuele dry-runinstelling uit config.yaml.
+
+    Bij een lees- of YAML-fout wordt veilig aangenomen dat dry-run actief is.
+    """
+    try:
+        with Path(CFG_FILE).open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            config = yaml.safe_load(file) or {}
+
+        if not isinstance(config, dict):
+            raise ValueError(
+                "config.yaml bevat geen geldige dictionary"
+            )
+
+        risk = config.get("risk") or {}
+
+        if not isinstance(risk, dict):
+            risk = {}
+
+        return to_bool(
+            risk.get("dry_run"),
+            True,
+        )
+
+    except Exception as exc:
+        LOG.warning(
+            "Dry-runstatus lezen mislukt; veilige standaard true gebruikt: %s",
+            exc,
+        )
+
+        return True
 
 
 def load_json(
@@ -790,6 +833,8 @@ def build_report(
         False,
     )
 
+    dry_run = config_dry_run()
+
     pause_reason = str(
         control.get("pause_reason")
         or "-"
@@ -806,7 +851,7 @@ def build_report(
         "BOTSTATUS",
         f"Status                  : {'GEPAUZEERD' if paused else 'ACTIEF'}",
         f"Reden pauze             : {pause_reason}",
-        f"Testmodus                : JA",
+        f"Testmodus                : {'JA' if dry_run else 'NEE'}",
         "",
         "SALDO",
         f"Vrij EUR bij Bitvavo    : €{free_eur:.2f}",
@@ -865,7 +910,11 @@ def build_report(
     lines.extend([
         "",
         "=" * 60,
-        "De bot draait nog in dry-run en plaatst geen echte orders.",
+        (
+            "De bot draait in dry-run en plaatst geen echte orders."
+            if dry_run
+            else "WAARSCHUWING: de bot draait LIVE en kan echte orders plaatsen."
+        ),
         "=" * 60,
     ])
 
@@ -921,6 +970,8 @@ def build_weekly_report(
         exchange
     )
 
+    dry_run = config_dry_run()
+
     lines = [
         "=" * 60,
         "DIAMOND BOT WEEKRAPPORT",
@@ -937,6 +988,7 @@ def build_weekly_report(
         f"Weekresultaat           : €{week_pnl:+.2f}",
         "",
         "HUIDIGE STAND",
+        f"Modus                   : {'DRY-RUN' if dry_run else 'LIVE'}",
         f"Vrij EUR bij Bitvavo    : €{free_eur:.2f}",
         f"Bot geïnvesteerd        : €{invested:.2f}",
         f"Open posities           : {len(positions)}",
