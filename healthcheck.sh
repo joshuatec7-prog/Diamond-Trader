@@ -81,7 +81,7 @@ show_json_summary() {
         return
     fi
 
-    python3 - "$file_path" "$summary_type" <<'PY'
+    if ! python3 - "$file_path" "$summary_type" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -95,7 +95,7 @@ try:
         data = json.load(file)
 except Exception as exc:
     print(f"        [FOUT] JSON lezen mislukt: {exc}")
-    raise SystemExit(0)
+    raise SystemExit(1)
 
 
 def format_timestamp(value):
@@ -165,13 +165,18 @@ elif summary_type == "diagnose":
         )
 
 elif summary_type == "supervisor":
+    spot_open = int(data.get("open_spot_positions", 0) or 0)
+    short_open = int(data.get("open_short_positions", 0) or 0)
+
     print(f"        Gegenereerd op    : {data.get('generated_at') or '-'}")
     print(f"        Modus             : {data.get('mode') or '-'}")
     print(
         f"        Diagnoserondes    : "
         f"{data.get('total_diagnose_rounds', 0)}"
     )
-    print(f"        Open posities     : {data.get('open_positions', 0)}")
+    print(f"        Open spotposities : {spot_open}")
+    print(f"        Open shorts       : {short_open}")
+    print(f"        Open totaal       : {spot_open + short_open}")
     print(f"        Gepauzeerd        : {bool(data.get('paused', False))}")
 
     health = data.get("health") or []
@@ -207,6 +212,9 @@ elif summary_type == "agent":
     print(f"        Statusmails       : {len(sent_reports)}")
     print(f"        Weekrapporten     : {len(weekly_reports)}")
 PY
+    then
+        ERRORS=$((ERRORS + 1))
+    fi
 }
 
 echo "1. PROCESSEN"
