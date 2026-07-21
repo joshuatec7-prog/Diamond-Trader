@@ -1,6 +1,3 @@
-cd /opt/render/project/src
-
-cat > healthcheck.sh <<'EOF'
 #!/usr/bin/env bash
 
 # Diamond Trader Healthcheck
@@ -205,10 +202,10 @@ elif summary_type == "agent":
         or data.get("sent_daily_reports")
         or []
     )
-    weekly = data.get("sent_weekly_reports") or []
+    weekly_reports = data.get("sent_weekly_reports") or []
 
     print(f"        Statusmails       : {len(sent_reports)}")
-    print(f"        Weekrapporten     : {len(weekly)}")
+    print(f"        Weekrapporten     : {len(weekly_reports)}")
 PY
 }
 
@@ -216,19 +213,19 @@ echo "1. PROCESSEN"
 echo "------------------------------------------------------------"
 
 check_process \
-    'python3([[:space:]]+[^[:space:]]+)*[[:space:]]+agent\.py([[:space:]]|$)' \
+    'python3[[:space:]]+agent\.py([[:space:]]|$)' \
     "Diamond Agent"
 
 check_process \
-    'python3([[:space:]]+[^[:space:]]+)*[[:space:]]+closed_candle_runner\.py[[:space:]]+diagnose([[:space:]]|$)' \
+    'python3[[:space:]]+closed_candle_runner\.py[[:space:]]+diagnose([[:space:]]|$)' \
     "Diamond Diagnose"
 
 check_process \
-    'python3([[:space:]]+[^[:space:]]+)*[[:space:]]+supervisor_agent\.py([[:space:]]|$)' \
+    'python3[[:space:]]+supervisor_agent\.py([[:space:]]|$)' \
     "Diamond Supervisor"
 
 check_process \
-    'python3([[:space:]]+[^[:space:]]+)*[[:space:]]+closed_candle_runner\.py[[:space:]]+bot([[:space:]]|$)' \
+    'python3[[:space:]]+closed_candle_runner\.py[[:space:]]+bot([[:space:]]|$)' \
     "Diamond Bot"
 
 echo
@@ -317,8 +314,10 @@ echo "------------------------------------------------------------"
 
 if [ "$ERRORS" -eq 0 ]; then
     echo "[OK]    Alle belangrijke onderdelen zijn actief."
+    EXIT_CODE=0
 else
     echo "[FOUT]  Er zijn $ERRORS belangrijke problemen gevonden."
+    EXIT_CODE=1
 fi
 
 echo
@@ -326,7 +325,5 @@ echo "============================================================"
 echo " CONTROLE AFGEROND"
 echo "============================================================"
 echo
-EOF
 
-chmod +x healthcheck.sh
-bash healthcheck.sh
+exit "$EXIT_CODE"
