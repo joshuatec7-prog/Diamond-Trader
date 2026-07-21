@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Supervisor v2.1
+Diamond Supervisor v2.2
 
 De supervisor:
 - controleert of diagnose, bot-state en veiligheidscontrole actief zijn;
@@ -9,7 +9,8 @@ De supervisor:
 - schrijft alleen naar diamond_supervisor_state.json;
 - wijzigt config.yaml niet;
 - plaatst geen orders;
-- kan bestaande munten niet verkopen.
+- kan bestaande munten niet verkopen;
+- ververst het supervisorrapport iedere minuut.
 """
 
 import json
@@ -68,8 +69,9 @@ SUPERVISOR_STATE_FILE = os.getenv(
     "/var/data/diamond_supervisor_state.json",
 ).strip()
 
-# Iedere 30 minuten controleren
-CHECK_INTERVAL_SECONDS = 30 * 60
+# Iedere minuut controleren.
+# Dit leest alleen lokale JSON-bestanden en gebruikt geen Bitvavo-API.
+CHECK_INTERVAL_SECONDS = 60
 
 # Diagnose hoort iedere 15 minuten te draaien.
 # Na 40 minuten zonder update volgt een waarschuwing.
@@ -262,9 +264,12 @@ def age_minutes(
     if parsed is None:
         return None
 
-    return (
-        now_utc() - parsed
-    ).total_seconds() / 60.0
+    return max(
+        0.0,
+        (
+            now_utc() - parsed
+        ).total_seconds() / 60.0,
+    )
 
 
 def file_age_minutes(
@@ -281,9 +286,12 @@ def file_age_minutes(
             tz=timezone.utc,
         )
 
-        return (
-            now_utc() - modified
-        ).total_seconds() / 60.0
+        return max(
+            0.0,
+            (
+                now_utc() - modified
+            ).total_seconds() / 60.0,
+        )
 
     except OSError:
         return None
@@ -603,7 +611,7 @@ def build_supervisor_report() -> Dict[str, Any]:
         short_positions = {}
 
     report = {
-        "version": 2,
+        "version": "2.2",
         "generated_at": now_iso(),
         "mode": "suggest",
         "automatic_changes_enabled": False,
@@ -616,6 +624,12 @@ def build_supervisor_report() -> Dict[str, Any]:
         "last_diagnose_round_at": diagnose_stats.get(
             "last_round_at"
         ),
+        "diagnose_age_minutes": age_minutes(
+            diagnose_stats.get(
+                "last_round_at"
+            )
+        ),
+        "supervisor_refresh_seconds": CHECK_INTERVAL_SECONDS,
         "open_spot_positions": len(
             positions
         ),
@@ -712,7 +726,7 @@ def log_report(
 
 def main() -> None:
     LOG.info(
-        "Diamond Supervisor v2.1 gestart"
+        "Diamond Supervisor v2.2 gestart"
     )
 
     LOG.info(
@@ -727,6 +741,11 @@ def main() -> None:
     LOG.info(
         "Supervisorrapport: %s",
         SUPERVISOR_STATE_FILE,
+    )
+
+    LOG.info(
+        "Verversingsinterval: %s seconden",
+        CHECK_INTERVAL_SECONDS,
     )
 
     while True:
