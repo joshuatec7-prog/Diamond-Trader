@@ -1,6 +1,9 @@
-#!/bin/bash
+cd /opt/render/project/src
 
-# Diamond Bot Healthcheck
+cat > healthcheck.sh <<'EOF'
+#!/usr/bin/env bash
+
+# Diamond Trader Healthcheck
 # Alleen lezen: dit script verandert niets aan de bot of instellingen.
 
 set -u
@@ -16,29 +19,35 @@ SUPERVISOR_FILE="$DATA_DIR/diamond_supervisor_state.json"
 TRADES_FILE="$DATA_DIR/diamond_transactions.csv"
 
 NOW_EPOCH=$(date +%s)
+ERRORS=0
 
 echo
 echo "============================================================"
-echo " DIAMOND BOT CONTROLE"
+echo " DIAMOND TRADER CONTROLE"
 echo " $(date)"
 echo "============================================================"
 echo
 
 check_process() {
-    local script_name="$1"
+    local pattern="$1"
     local display_name="$2"
+    local result
 
-    if pgrep -af "python3.*${script_name}" >/dev/null 2>&1; then
+    result=$(pgrep -af "$pattern" 2>/dev/null || true)
+
+    if [ -n "$result" ]; then
         echo "[OK]    $display_name draait"
-        pgrep -af "python3.*${script_name}" | sed 's/^/        /'
+        echo "$result" | sed 's/^/        /'
     else
         echo "[FOUT]  $display_name draait NIET"
+        ERRORS=$((ERRORS + 1))
     fi
 }
 
 check_file() {
     local file_path="$1"
     local display_name="$2"
+    local required="${3:-false}"
 
     if [ -f "$file_path" ]; then
         local modified_epoch
@@ -56,7 +65,13 @@ check_file() {
         echo "        Grootte: $size_bytes bytes"
         echo "        Laatst gewijzigd: $age_minutes minuten geleden"
     else
-        echo "[INFO]  $display_name nog niet aanwezig"
+        if [ "$required" = "true" ]; then
+            echo "[FOUT]  $display_name ontbreekt"
+            ERRORS=$((ERRORS + 1))
+        else
+            echo "[INFO]  $display_name nog niet aanwezig"
+        fi
+
         echo "        Bestand: $file_path"
     fi
 }
@@ -72,6 +87,7 @@ show_json_summary() {
     python3 - "$file_path" "$summary_type" <<'PY'
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 path = Path(sys.argv[1])
@@ -84,6 +100,20 @@ except Exception as exc:
     print(f"        [FOUT] JSON lezen mislukt: {exc}")
     raise SystemExit(0)
 
+
+def format_timestamp(value):
+    if value in (None, "", 0):
+        return "-"
+
+    try:
+        return datetime.fromtimestamp(
+            float(value),
+            tz=timezone.utc,
+        ).isoformat()
+    except (TypeError, ValueError, OSError):
+        return str(value)
+
+
 if summary_type == "bot":
     positions = data.get("positions") or {}
     shorts = data.get("short_positions") or {}
@@ -92,7 +122,10 @@ if summary_type == "bot":
     print(f"        Open shorts       : {len(shorts)}")
     print(f"        Spot trades       : {data.get('trades', 0)}")
     print(f"        Spot winsttrades  : {data.get('wins', 0)}")
-    print(f"        Spot PnL          : {float(data.get('pnl_quote', 0) or 0):+.2f} EUR")
+    print(
+        f"        Spot PnL          : "
+        f"{float(data.get('pnl_quote', 0) or 0):+.2f} EUR"
+    )
     print(
         f"        Dry-run saldo     : "
         f"{float(data.get('simulated_free_quote', 0) or 0):.2f} EUR"
@@ -100,6 +133,7 @@ if summary_type == "bot":
 
     if positions:
         print("        Posities:")
+
         for symbol, position in positions.items():
             amount = float(position.get("amount", 0) or 0)
             quote_amount = float(position.get("quote_amount", 0) or 0)
@@ -107,8 +141,7 @@ if summary_type == "bot":
 
             print(
                 f"          - {symbol}: {amount:.8f} "
-                f"(€{quote_amount:.2f}) | "
-                f"door bot={opened_by_bot}"
+                f"(€{quote_amount:.2f}) | door bot={opened_by_bot}"
             )
 
 elif summary_type == "control":
@@ -126,17 +159,21 @@ elif summary_type == "diagnose":
         checks = int(stats.get("checks", 0) or 0)
         near = int(stats.get("near_signals", 0) or 0)
         signals = int(stats.get("technical_signals", 0) or 0)
+        score = float(stats.get("last_score_pct", 0) or 0)
 
         print(
             f"          - {symbol}: controles={checks}, "
             f"bijna={near}, signalen={signals}, "
-            f"laatste score={float(stats.get('last_score_pct', 0) or 0):.0f}%"
+            f"laatste score={score:.0f}%"
         )
 
 elif summary_type == "supervisor":
     print(f"        Gegenereerd op    : {data.get('generated_at') or '-'}")
     print(f"        Modus             : {data.get('mode') or '-'}")
-    print(f"        Diagnoserondes    : {data.get('total_diagnose_rounds', 0)}")
+    print(
+        f"        Diagnoserondes    : "
+        f"{data.get('total_diagnose_rounds', 0)}"
+    )
     print(f"        Open posities     : {data.get('open_positions', 0)}")
     print(f"        Gepauzeerd        : {bool(data.get('paused', False))}")
 
@@ -145,18 +182,29 @@ elif summary_type == "supervisor":
 
     if health:
         print("        Gezondheid:")
+
         for item in health:
             print(f"          - {item}")
 
     if recommendations:
         print("        Adviezen:")
+
         for item in recommendations:
             print(f"          - {item}")
 
 elif summary_type == "agent":
-    print(f"        Laatste analyse   : {data.get('last_analysis_ts', 0)}")
+    last_analysis = data.get("last_analysis_ts", 0)
 
-    sent_reports = data.get("sent_reports") or data.get("sent_daily_reports") or []
+    print(
+        f"        Laatste analyse   : "
+        f"{format_timestamp(last_analysis)}"
+    )
+
+    sent_reports = (
+        data.get("sent_reports")
+        or data.get("sent_daily_reports")
+        or []
+    )
     weekly = data.get("sent_weekly_reports") or []
 
     print(f"        Statusmails       : {len(sent_reports)}")
@@ -167,10 +215,21 @@ PY
 echo "1. PROCESSEN"
 echo "------------------------------------------------------------"
 
-check_process "agent.py" "Diamond Agent"
-check_process "diagnose.py" "Diamond Diagnose"
-check_process "supervisor_agent.py" "Diamond Supervisor"
-check_process "diamond_bot.py" "Diamond Bot"
+check_process \
+    'python3([[:space:]]+[^[:space:]]+)*[[:space:]]+agent\.py([[:space:]]|$)' \
+    "Diamond Agent"
+
+check_process \
+    'python3([[:space:]]+[^[:space:]]+)*[[:space:]]+closed_candle_runner\.py[[:space:]]+diagnose([[:space:]]|$)' \
+    "Diamond Diagnose"
+
+check_process \
+    'python3([[:space:]]+[^[:space:]]+)*[[:space:]]+supervisor_agent\.py([[:space:]]|$)' \
+    "Diamond Supervisor"
+
+check_process \
+    'python3([[:space:]]+[^[:space:]]+)*[[:space:]]+closed_candle_runner\.py[[:space:]]+bot([[:space:]]|$)' \
+    "Diamond Bot"
 
 echo
 echo "2. PROJECTBESTANDEN"
@@ -179,6 +238,7 @@ echo "------------------------------------------------------------"
 for file_name in \
     agent.py \
     config.yaml \
+    closed_candle_runner.py \
     diagnose.py \
     supervisor_agent.py \
     diamond_bot.py \
@@ -189,6 +249,7 @@ do
         echo "[OK]    $file_name"
     else
         echo "[FOUT]  $file_name ontbreekt"
+        ERRORS=$((ERRORS + 1))
     fi
 done
 
@@ -196,14 +257,14 @@ echo
 echo "3. BOT-STATE"
 echo "------------------------------------------------------------"
 
-check_file "$STATE_FILE" "Bot-state"
+check_file "$STATE_FILE" "Bot-state" "true"
 show_json_summary "$STATE_FILE" "bot"
 
 echo
 echo "4. VEILIGHEIDSCONTROLE"
 echo "------------------------------------------------------------"
 
-check_file "$CONTROL_FILE" "Controlebestand"
+check_file "$CONTROL_FILE" "Controlebestand" "true"
 show_json_summary "$CONTROL_FILE" "control"
 
 echo
@@ -242,7 +303,6 @@ if [ -f "$TRADES_FILE" ]; then
     tail -n 5 "$TRADES_FILE" | sed 's/^/        /'
 else
     echo "[INFO]  Nog geen transactiebestand"
-    echo "        Dit is normaal zolang er nog geen dry-run trade is geweest."
 fi
 
 echo
@@ -255,31 +315,10 @@ echo
 echo "10. EINDCONTROLE"
 echo "------------------------------------------------------------"
 
-errors=0
-
-for process_script in \
-    agent.py \
-    diagnose.py \
-    supervisor_agent.py \
-    diamond_bot.py
-do
-    if ! pgrep -af "python3.*${process_script}" >/dev/null 2>&1; then
-        errors=$((errors + 1))
-    fi
-done
-
-if [ ! -f "$CONTROL_FILE" ]; then
-    errors=$((errors + 1))
-fi
-
-if [ ! -f "$STATE_FILE" ]; then
-    errors=$((errors + 1))
-fi
-
-if [ "$errors" -eq 0 ]; then
-    echo "[OK]    Alle belangrijke onderdelen lijken actief."
+if [ "$ERRORS" -eq 0 ]; then
+    echo "[OK]    Alle belangrijke onderdelen zijn actief."
 else
-    echo "[FOUT]  Er zijn $errors belangrijke problemen gevonden."
+    echo "[FOUT]  Er zijn $ERRORS belangrijke problemen gevonden."
 fi
 
 echo
@@ -287,3 +326,7 @@ echo "============================================================"
 echo " CONTROLE AFGEROND"
 echo "============================================================"
 echo
+EOF
+
+chmod +x healthcheck.sh
+bash healthcheck.sh
