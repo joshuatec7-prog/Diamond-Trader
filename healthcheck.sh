@@ -14,6 +14,8 @@ AGENT_STATE_FILE="$DATA_DIR/diamond_agent_state.json"
 DIAG_STATS_FILE="$DATA_DIR/diamond_diagnose_stats.json"
 SUPERVISOR_FILE="$DATA_DIR/diamond_supervisor_state.json"
 TRADES_FILE="$DATA_DIR/diamond_transactions.csv"
+TEST_BASELINE_FILE="$DATA_DIR/diamond_test_baseline.json"
+TEST_REPORT_FILE="$DATA_DIR/diamond_test_report.json"
 
 NOW_EPOCH=$(date +%s)
 ERRORS=0
@@ -217,6 +219,191 @@ PY
     fi
 }
 
+show_test_progress() {
+    if [ ! -f "$TEST_BASELINE_FILE" ]; then
+        echo "[FOUT]  Testbaseline ontbreekt"
+        echo "        Bestand: $TEST_BASELINE_FILE"
+        ERRORS=$((ERRORS + 1))
+        return
+    fi
+
+    if ! python3 - \
+        "$PROJECT_DIR" \
+        "$TEST_BASELINE_FILE" \
+        "$TEST_REPORT_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+project_dir = Path(sys.argv[1])
+baseline_file = Path(sys.argv[2])
+report_file = Path(sys.argv[3])
+
+sys.path.insert(
+    0,
+    str(project_dir),
+)
+
+try:
+    import agent
+except Exception as exc:
+    print(f"[FOUT]  agent.py importeren mislukt: {exc}")
+    raise SystemExit(1)
+
+required_functions = (
+    "get_test_target_status",
+    "check_test_target",
+    "build_test_report",
+)
+
+missing_functions = [
+    name
+    for name in required_functions
+    if not hasattr(agent, name)
+]
+
+if missing_functions:
+    print(
+        "[FOUT]  Automatische testfuncties ontbreken: "
+        + ", ".join(missing_functions)
+    )
+    raise SystemExit(1)
+
+try:
+    status = agent.get_test_target_status()
+except Exception as exc:
+    print(f"[FOUT]  Teststatus opvragen mislukt: {exc}")
+    raise SystemExit(1)
+
+if not status.get("enabled", False):
+    print("[FOUT]  Testbaseline is niet geldig of niet actief")
+    print(
+        f"        Reden             : "
+        f"{status.get('reason') or 'onbekend'}"
+    )
+    raise SystemExit(1)
+
+start_trades = int(
+    status.get("start_trades", 0)
+    or 0
+)
+
+target_total = int(
+    status.get("target_total_trades", 0)
+    or 0
+)
+
+current_trades = int(
+    status.get("current_trades", 0)
+    or 0
+)
+
+new_trades = int(
+    status.get("new_trades", 0)
+    or 0
+)
+
+remaining = int(
+    status.get("remaining_trades", 0)
+    or 0
+)
+
+target_new = max(
+    0,
+    target_total - start_trades,
+)
+
+dry_run = bool(
+    status.get("dry_run", False)
+)
+
+target_reached = bool(
+    status.get("target_reached", False)
+)
+
+teststop_active = (
+    dry_run
+    and target_total > start_trades
+)
+
+print("[OK]    Testbaseline actief")
+print(f"        Bestand           : {baseline_file}")
+print(f"        Start trades      : {start_trades}")
+print(f"        Huidige trades    : {current_trades}")
+print(
+    f"        Nieuwe testtrades : "
+    f"{new_trades}/{target_new}"
+)
+print(f"        Nog nodig         : {remaining}")
+print(f"        Doel totaal       : {target_total}")
+print(
+    f"        Dry-run           : "
+    f"{'JA' if dry_run else 'NEE'}"
+)
+print(
+    f"        Teststop actief   : "
+    f"{'JA' if teststop_active else 'NEE'}"
+)
+print(
+    f"        Doel bereikt      : "
+    f"{'JA' if target_reached else 'NEE'}"
+)
+
+if report_file.exists():
+    try:
+        with report_file.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            report = json.load(file)
+
+        print("[OK]    Testrapport aanwezig")
+        print(f"        Bestand           : {report_file}")
+        print(
+            f"        Test compleet     : "
+            f"{'JA' if report.get('test_complete') else 'NEE'}"
+        )
+        print(
+            f"        Trades in rapport : "
+            f"{report.get('included_new_trades', 0)}"
+        )
+        print(
+            f"        Gegenereerd op    : "
+            f"{report.get('generated_at') or '-'}"
+        )
+
+    except Exception as exc:
+        print(
+            f"[WAARSCHUWING] Testrapport lezen mislukt: {exc}"
+        )
+else:
+    if target_reached:
+        print(
+            "[WAARSCHUWING] Doel bereikt, maar eindrapport "
+            "nog niet aanwezig"
+        )
+        print(
+            "        De agent maakt dit normaal binnen één minuut."
+        )
+    else:
+        print(
+            "[INFO]  Eindrapport wordt gemaakt zodra "
+            f"trade {target_total} is bereikt"
+        )
+
+if not teststop_active:
+    print(
+        "[FOUT]  Automatische teststop is niet actief; "
+        "dry-run moet aanstaan"
+    )
+    raise SystemExit(1)
+PY
+    then
+        ERRORS=$((ERRORS + 1))
+    fi
+}
+
+
 echo "1. PROCESSEN"
 echo "------------------------------------------------------------"
 
@@ -248,7 +435,8 @@ for file_name in \
     supervisor_agent.py \
     diamond_bot.py \
     requirements.txt \
-    start.sh
+    start.sh \
+    healthcheck.sh
 do
     if [ -f "$PROJECT_DIR/$file_name" ]; then
         echo "[OK]    $file_name"
@@ -311,13 +499,19 @@ else
 fi
 
 echo
-echo "9. SCHIJFRUIMTE"
+echo "9. TESTVOORTGANG"
+echo "------------------------------------------------------------"
+
+show_test_progress
+
+echo
+echo "10. SCHIJFRUIMTE"
 echo "------------------------------------------------------------"
 
 df -h "$DATA_DIR" 2>/dev/null || df -h
 
 echo
-echo "10. EINDCONTROLE"
+echo "11. EINDCONTROLE"
 echo "------------------------------------------------------------"
 
 if [ "$ERRORS" -eq 0 ]; then
