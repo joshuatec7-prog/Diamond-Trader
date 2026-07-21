@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Supervisor v2
+Diamond Supervisor v2.1
 
 De supervisor:
 - controleert of diagnose, bot-state en veiligheidscontrole actief zijn;
@@ -492,19 +492,12 @@ def build_health_report(
             "WAARSCHUWING: bot-statebestand ontbreekt"
         )
 
-    elif bot_age > 30:
-        health.append(
-            (
-                "WAARSCHUWING: bot-state is mogelijk verouderd; "
-                f"laatste wijziging {bot_age:.1f} minuten geleden"
-            )
-        )
-
     else:
         health.append(
             (
-                "Bot-state actief; laatste wijziging "
-                f"{bot_age:.1f} minuten geleden"
+                "Bot-state aanwezig; laatste wijziging "
+                f"{bot_age:.1f} minuten geleden "
+                "(wijzigt alleen bij een statewijziging)"
             )
         )
 
@@ -719,7 +712,7 @@ def log_report(
 
 def main() -> None:
     LOG.info(
-        "Diamond Supervisor v2 gestart"
+        "Diamond Supervisor v2.1 gestart"
     )
 
     LOG.info(
