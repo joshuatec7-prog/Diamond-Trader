@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v6
+Diamond Agent v6.2
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -10,6 +10,7 @@ Functies:
 - Gebruikt diamond_control.json voor veiligheidsstops.
 - Pauzeert alleen nieuwe aankopen.
 - Open posities blijven door diamond_bot.py bewaakt.
+- Pauzeert automatisch wanneer het ingestelde dry-run testdoel is bereikt.
 """
 
 import csv
@@ -78,6 +79,11 @@ CONTROL_FILE = os.getenv(
 CFG_FILE = os.getenv(
     "CFG_FILE",
     "/opt/render/project/src/config.yaml",
+).strip()
+
+TEST_BASELINE_FILE = os.getenv(
+    "TEST_BASELINE_FILE",
+    "/var/data/diamond_test_baseline.json",
 ).strip()
 
 GMAIL_USER = os.getenv(
@@ -290,6 +296,101 @@ def save_json_atomic(
         temporary_name,
         target,
     )
+
+
+def load_test_baseline() -> Optional[Dict[str, Any]]:
+    """
+    Leest de nulmeting voor de actuele dry-run test.
+
+    Zonder geldig baselinebestand is de automatische teststop uitgeschakeld.
+    """
+    path = Path(TEST_BASELINE_FILE)
+
+    if not path.exists():
+        return None
+
+    try:
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            baseline = json.load(file)
+
+        if not isinstance(baseline, dict):
+            raise ValueError(
+                "baseline bevat geen JSON-object"
+            )
+
+        return baseline
+
+    except Exception as exc:
+        LOG.error(
+            "Testbaseline lezen mislukt voor %s: %s",
+            TEST_BASELINE_FILE,
+            exc,
+        )
+
+        return None
+
+
+def get_test_target_status() -> Dict[str, Any]:
+    """
+    Geeft de voortgang van de ingestelde dry-run test terug.
+    """
+    baseline = load_test_baseline()
+    state = load_bot_state()
+
+    if baseline is None:
+        return {
+            "enabled": False,
+            "reason": "geen_geldige_baseline",
+        }
+
+    start_trades = int(
+        to_float(
+            baseline.get("start_spot_trades"),
+            0,
+        )
+    )
+
+    target_total = int(
+        to_float(
+            baseline.get("target_total_trades"),
+            0,
+        )
+    )
+
+    current_trades = int(
+        to_float(
+            state.get("trades"),
+            0,
+        )
+    )
+
+    valid = (
+        start_trades >= 0
+        and target_total > start_trades
+    )
+
+    return {
+        "enabled": valid,
+        "dry_run": config_dry_run(),
+        "start_trades": start_trades,
+        "target_total_trades": target_total,
+        "current_trades": current_trades,
+        "new_trades": max(
+            0,
+            current_trades - start_trades,
+        ),
+        "remaining_trades": max(
+            0,
+            target_total - current_trades,
+        ),
+        "target_reached": (
+            valid
+            and current_trades >= target_total
+        ),
+    }
 
 
 # ============================================================
@@ -1005,6 +1106,111 @@ def build_weekly_report(
 
 
 # ============================================================
+# Automatische dry-run teststop
+# ============================================================
+
+def check_test_target(
+    exchange: ccxt.Exchange,
+) -> bool:
+    """
+    Pauzeert nieuwe aankopen zodra het testdoel is bereikt.
+
+    De controle draait iedere minuut. Open posities blijven door de bot
+    bewaakt en kunnen normaal worden gesloten.
+    """
+    status = get_test_target_status()
+
+    if not status.get("enabled", False):
+        return False
+
+    # Deze automatische teststop hoort uitsluitend bij dry-run.
+    if not status.get("dry_run", True):
+        return False
+
+    if not status.get("target_reached", False):
+        return False
+
+    control = load_control()
+
+    if to_bool(
+        control.get("paused"),
+        False,
+    ):
+        return False
+
+    target_total = int(
+        status["target_total_trades"]
+    )
+
+    current_trades = int(
+        status["current_trades"]
+    )
+
+    start_trades = int(
+        status["start_trades"]
+    )
+
+    new_trades = int(
+        status["new_trades"]
+    )
+
+    state = load_bot_state()
+
+    open_spot = len(
+        state.get("positions")
+        or {}
+    )
+
+    open_shorts = len(
+        state.get("short_positions")
+        or {}
+    )
+
+    pause_reason = (
+        f"testdoel_{target_total}_trades_bereikt"
+    )
+
+    reached_at = now_utc().isoformat()
+
+    save_control(
+        paused=True,
+        reason=pause_reason,
+        extra_values={
+            "pause_date": None,
+            "pause_btc_price": None,
+            "test_target_total_trades": target_total,
+            "test_target_reached_at": reached_at,
+        },
+    )
+
+    LOG.warning(
+        "TESTDOEL BEREIKT | start=%d | huidig=%d | "
+        "nieuwe_trades=%d | nieuwe aankopen gepauzeerd",
+        start_trades,
+        current_trades,
+        new_trades,
+    )
+
+    send_email(
+        "Diamond Trader TESTDOEL BEREIKT",
+        (
+            "De ingestelde dry-run test is klaar.\n\n"
+            f"Startstand trades: {start_trades}\n"
+            f"Huidige trades: {current_trades}\n"
+            f"Nieuwe testtrades: {new_trades}\n"
+            f"Doel: {target_total} totale trades\n"
+            f"Open spotposities: {open_spot}\n"
+            f"Open paper-shorts: {open_shorts}\n\n"
+            "Nieuwe aankopen en nieuwe paper-shorts zijn gepauzeerd.\n"
+            "Eventuele open posities blijven bewaakt en kunnen normaal sluiten.\n\n"
+            f"{build_report(exchange)}"
+        ),
+    )
+
+    return True
+
+
+# ============================================================
 # Veiligheidsanalyse
 # ============================================================
 
@@ -1397,7 +1603,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v6 gestart"
+        "Diamond Agent v6.2 gestart"
     )
 
     LOG.info(
@@ -1416,11 +1622,20 @@ def main() -> None:
     )
 
     LOG.info(
+        "Testbaseline: %s",
+        TEST_BASELINE_FILE,
+    )
+
+    LOG.info(
         "Rapporttijden: 06:00, 10:00, 14:00, 18:00 en 22:00"
     )
 
     while True:
         try:
+            check_test_target(
+                exchange
+            )
+
             handle_scheduled_reports(
                 exchange,
                 agent_state,
