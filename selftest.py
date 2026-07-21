@@ -129,8 +129,8 @@ def test_config() -> None:
         "dry_run staat niet op true"
     )
 
-    assert abs(min_atr_pct - 0.20) < 0.000001, (
-        f"min_atr_pct is {min_atr_pct}, verwacht 0.20"
+    assert abs(min_atr_pct - 0.30) < 0.000001, (
+        f"min_atr_pct is {min_atr_pct}, verwacht 0.30"
     )
 
     symbols = config.get("symbols") or []
