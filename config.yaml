@@ -1,5 +1,6 @@
 # Diamond Trader configuratie
-# Dry-run blijft actief totdat alle technische en strategische tests zijn geslaagd.
+# Longtest en paper-shorttest draaien naast elkaar.
+# Echte orders blijven volledig uitgeschakeld zolang risk.dry_run true is.
 
 quote: EUR
 timeframe: 15m
@@ -13,8 +14,15 @@ symbols:
 
 trading:
   enable_spot: true
-  enable_short_signals: false
+
+  # Alleen gesimuleerde shortposities. Diamond Trader bevat geen code
+  # die hiervoor echte short- of marginorders plaatst.
+  enable_short_signals: true
+
+  # Nooit tegelijk long en short op dezelfde munt.
   allow_long_and_short_same_symbol: false
+
+  # Longs en paper-shorts samen.
   max_total_positions: 5
 
 risk:
@@ -32,7 +40,7 @@ risk:
   avoid_symbols_with_existing_balance: false
   existing_balance_dust: 0.00000001
 
-  # Alleen gebruikt voor de dry-run simulatie.
+  # Alleen gebruikt voor de dry-run simulatie van spotposities.
   simulated_quote_balance: 3000
 
 fees:
@@ -98,11 +106,19 @@ news:
   max_records: 100
 
 short:
-  # Alleen papieren shortsignalen; nooit automatisch live short.
-  enabled: false
+  # Dit onderdeel blijft altijd een papieren simulatie.
+  enabled: true
+  paper_only: true
+
+  # Eerste test: maximaal één short zonder hefboom.
+  max_open_positions: 1
   leverage: 1
-  margin_per_trade: 50
+  margin_per_trade: 30
+  min_profit_eur: 0.05
   cooldown_minutes: 240
+
+  # Automatische afzonderlijke test vanaf de actuele shortstand.
+  test_target_trades: 20
 
   use_sma: true
   sma_fast: 20
@@ -110,7 +126,7 @@ short:
 
   use_rsi: true
   rsi_len: 14
-  rsi_sell_max: 45
+  rsi_sell_max: 40
 
   use_atr_filter: true
   atr_len: 14
@@ -122,6 +138,8 @@ files:
   state_file: /var/data/diamond_state.json
   trades_file: /var/data/diamond_transactions.csv
   control_file: /var/data/diamond_control.json
+  short_test_baseline_file: /var/data/diamond_short_test_baseline.json
+  short_test_report_file: /var/data/diamond_short_test_report.json
 
 logging:
   level: INFO
