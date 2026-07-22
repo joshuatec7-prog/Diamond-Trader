@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v6.3
+Diamond Agent v6.4
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -11,7 +11,9 @@ Functies:
 - Pauzeert alleen nieuwe aankopen.
 - Open posities blijven door diamond_bot.py bewaakt.
 - Pauzeert automatisch wanneer het ingestelde dry-run testdoel is bereikt.
-- Maakt automatisch een eindrapport van uitsluitend de nieuwe testtrades.
+- Maakt automatisch een eindrapport van uitsluitend de nieuwe longtesttrades.
+- Bewaakt daarnaast een volledig afzonderlijke paper-shorttest.
+- Maakt en mailt het paper-shortrapport na 20 gesloten shorts.
 """
 
 import csv
@@ -90,6 +92,16 @@ TEST_BASELINE_FILE = os.getenv(
 TEST_REPORT_FILE = os.getenv(
     "TEST_REPORT_FILE",
     "/var/data/diamond_test_report.json",
+).strip()
+
+SHORT_TEST_BASELINE_FILE = os.getenv(
+    "SHORT_TEST_BASELINE_FILE",
+    "/var/data/diamond_short_test_baseline.json",
+).strip()
+
+SHORT_TEST_REPORT_FILE = os.getenv(
+    "SHORT_TEST_REPORT_FILE",
+    "/var/data/diamond_short_test_report.json",
 ).strip()
 
 GMAIL_USER = os.getenv(
@@ -395,6 +407,159 @@ def get_test_target_status() -> Dict[str, Any]:
         "target_reached": (
             valid
             and current_trades >= target_total
+        ),
+    }
+
+
+def load_short_test_baseline() -> Optional[Dict[str, Any]]:
+    """
+    Leest de afzonderlijke nulmeting van de paper-shorttest.
+    """
+    path = Path(
+        SHORT_TEST_BASELINE_FILE
+    )
+
+    if not path.exists():
+        return None
+
+    try:
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            baseline = json.load(file)
+
+        if not isinstance(
+            baseline,
+            dict,
+        ):
+            raise ValueError(
+                "shortbaseline bevat geen JSON-object"
+            )
+
+        return baseline
+
+    except Exception as exc:
+        LOG.error(
+            "Paper-shortbaseline lezen mislukt voor %s: %s",
+            SHORT_TEST_BASELINE_FILE,
+            exc,
+        )
+
+        return None
+
+
+def config_short_test_enabled() -> bool:
+    try:
+        with Path(CFG_FILE).open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            config = yaml.safe_load(file) or {}
+
+        trading = config.get(
+            "trading"
+        ) or {}
+
+        short = config.get(
+            "short"
+        ) or {}
+
+        return (
+            to_bool(
+                trading.get(
+                    "enable_short_signals"
+                ),
+                False,
+            )
+            and to_bool(
+                short.get(
+                    "enabled"
+                ),
+                False,
+            )
+            and to_bool(
+                short.get(
+                    "paper_only"
+                ),
+                True,
+            )
+        )
+
+    except Exception as exc:
+        LOG.warning(
+            "Paper-shortconfig lezen mislukt: %s",
+            exc,
+        )
+
+        return False
+
+
+def get_short_test_target_status() -> Dict[str, Any]:
+    """
+    Geeft de voortgang van de afzonderlijke paper-shorttest terug.
+    """
+    baseline = load_short_test_baseline()
+    state = load_bot_state()
+
+    if baseline is None:
+        return {
+            "enabled": False,
+            "reason": "geen_geldige_shortbaseline",
+        }
+
+    start = int(
+        to_float(
+            baseline.get(
+                "start_short_trades"
+            ),
+            0,
+        )
+    )
+
+    target_total = int(
+        to_float(
+            baseline.get(
+                "target_total_short_trades"
+            ),
+            0,
+        )
+    )
+
+    current = int(
+        to_float(
+            state.get(
+                "short_trades"
+            ),
+            0,
+        )
+    )
+
+    valid = (
+        start >= 0
+        and target_total > start
+    )
+
+    return {
+        "enabled": (
+            valid
+            and config_short_test_enabled()
+        ),
+        "paper_only": True,
+        "start_short_trades": start,
+        "target_total_short_trades": target_total,
+        "current_short_trades": current,
+        "new_short_trades": max(
+            0,
+            current - start,
+        ),
+        "remaining_short_trades": max(
+            0,
+            target_total - current,
+        ),
+        "target_reached": (
+            valid
+            and current >= target_total
         ),
     }
 
@@ -1298,6 +1463,622 @@ def build_test_report(
     return report
 
 
+def build_short_round_trips(
+    rows: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """
+    Koppelt iedere SHORT_CLOSE aan de oudste nog open SHORT_OPEN
+    van dezelfde munt. De bot laat in deze test maximaal één short toe.
+    """
+    pending: Dict[
+        str,
+        List[Dict[str, str]],
+    ] = {}
+
+    result: List[
+        Dict[str, Any]
+    ] = []
+
+    for row in rows:
+        side = str(
+            row.get("side")
+            or ""
+        ).upper()
+
+        market = trade_market(
+            row
+        )
+
+        if side == "SHORT_OPEN":
+            pending.setdefault(
+                market,
+                [],
+            ).append(
+                row
+            )
+
+        elif side == "SHORT_CLOSE":
+            opens = pending.get(
+                market
+            ) or []
+
+            open_row = (
+                opens.pop(0)
+                if opens
+                else {}
+            )
+
+            open_fee = to_float(
+                open_row.get(
+                    "fees_quote"
+                ),
+                0.0,
+            )
+
+            close_fee = to_float(
+                row.get(
+                    "fees_quote"
+                ),
+                0.0,
+            )
+
+            result.append({
+                "open_row": open_row,
+                "close_row": row,
+                "open_fees_quote": open_fee,
+                "close_fees_quote": close_fee,
+                "total_fees_quote": (
+                    open_fee
+                    + close_fee
+                ),
+            })
+
+    return result
+
+
+def build_short_test_report(
+    require_complete: bool = True,
+) -> Dict[str, Any]:
+    """
+    Bouwt uitsluitend het rapport van de nieuwe paper-shorts
+    vanaf de automatisch vastgelegde shortnulmeting.
+    """
+    baseline = load_short_test_baseline()
+
+    if baseline is None:
+        raise RuntimeError(
+            "Geen geldige paper-shortbaseline beschikbaar"
+        )
+
+    start = int(
+        to_float(
+            baseline.get(
+                "start_short_trades"
+            ),
+            0,
+        )
+    )
+
+    target_total = int(
+        to_float(
+            baseline.get(
+                "target_total_short_trades"
+            ),
+            0,
+        )
+    )
+
+    target_new = int(
+        to_float(
+            baseline.get(
+                "target_new_trades"
+            ),
+            target_total - start,
+        )
+    )
+
+    if (
+        start < 0
+        or target_new <= 0
+        or target_total
+        != start + target_new
+    ):
+        raise RuntimeError(
+            "Paper-shortbaseline bevat "
+            "ongeldige tradegrenzen"
+        )
+
+    round_trips = build_short_round_trips(
+        load_trades()
+    )
+
+    available_new = max(
+        0,
+        len(round_trips) - start,
+    )
+
+    selected_round_trips = round_trips[
+        start:target_total
+    ]
+
+    if (
+        require_complete
+        and len(selected_round_trips)
+        < target_new
+    ):
+        raise RuntimeError(
+            "Transactiebestand bevat nog maar "
+            f"{len(selected_round_trips)} van "
+            f"{target_new} nieuwe gesloten paper-shorts"
+        )
+
+    selected_trades: List[
+        Dict[str, Any]
+    ] = []
+
+    for test_number, round_trip in enumerate(
+        selected_round_trips,
+        start=1,
+    ):
+        row = round_trip[
+            "close_row"
+        ]
+
+        pnl = trade_pnl(
+            row
+        )
+
+        selected_trades.append({
+            "test_trade_number": test_number,
+            "absolute_short_trade_number": (
+                start
+                + test_number
+            ),
+            "timestamp": str(
+                row.get("ts")
+                or ""
+            ),
+            "market": trade_market(
+                row
+            ),
+            "reason": trade_reason(
+                row
+            ),
+            "price": round(
+                to_float(
+                    row.get(
+                        "price"
+                    ),
+                    0.0,
+                ),
+                12,
+            ),
+            "base_amount": round(
+                to_float(
+                    row.get(
+                        "base_amount"
+                    ),
+                    0.0,
+                ),
+                12,
+            ),
+            "quote_amount": round(
+                to_float(
+                    row.get(
+                        "quote_amount"
+                    ),
+                    0.0,
+                ),
+                8,
+            ),
+            "net_pnl_quote": round(
+                pnl,
+                8,
+            ),
+            "holding_time_min": round(
+                to_float(
+                    row.get(
+                        "holding_time_min"
+                    ),
+                    0.0,
+                ),
+                2,
+            ),
+            "open_fees_quote": round(
+                to_float(
+                    round_trip.get(
+                        "open_fees_quote"
+                    ),
+                    0.0,
+                ),
+                8,
+            ),
+            "close_fees_quote": round(
+                to_float(
+                    round_trip.get(
+                        "close_fees_quote"
+                    ),
+                    0.0,
+                ),
+                8,
+            ),
+            "total_fees_quote": round(
+                to_float(
+                    round_trip.get(
+                        "total_fees_quote"
+                    ),
+                    0.0,
+                ),
+                8,
+            ),
+            "open_match_complete": bool(
+                round_trip.get(
+                    "open_row"
+                )
+            ),
+            "paper_only": True,
+            "dry_run": True,
+        })
+
+    pnl_values = [
+        to_float(
+            trade.get(
+                "net_pnl_quote"
+            ),
+            0.0,
+        )
+        for trade in selected_trades
+    ]
+
+    winning_values = [
+        value
+        for value in pnl_values
+        if value > 0
+    ]
+
+    losing_values = [
+        value
+        for value in pnl_values
+        if value < 0
+    ]
+
+    trade_count = len(
+        selected_trades
+    )
+
+    wins = len(
+        winning_values
+    )
+
+    losses = len(
+        losing_values
+    )
+
+    neutral = sum(
+        1
+        for value in pnl_values
+        if value == 0
+    )
+
+    total_pnl = sum(
+        pnl_values
+    )
+
+    gross_profit = sum(
+        winning_values
+    )
+
+    gross_loss = sum(
+        losing_values
+    )
+
+    total_fees = sum(
+        to_float(
+            trade.get(
+                "total_fees_quote"
+            ),
+            0.0,
+        )
+        for trade in selected_trades
+    )
+
+    holding_values = [
+        to_float(
+            trade.get(
+                "holding_time_min"
+            ),
+            0.0,
+        )
+        for trade in selected_trades
+    ]
+
+    best_trade = max(
+        selected_trades,
+        key=lambda item: to_float(
+            item.get(
+                "net_pnl_quote"
+            ),
+            0.0,
+        ),
+        default=None,
+    )
+
+    worst_trade = min(
+        selected_trades,
+        key=lambda item: to_float(
+            item.get(
+                "net_pnl_quote"
+            ),
+            0.0,
+        ),
+        default=None,
+    )
+
+    settings = baseline.get(
+        "settings"
+    ) or {}
+
+    margin = to_float(
+        settings.get(
+            "margin_per_trade"
+        ),
+        0.0,
+    )
+
+    margin_volume = (
+        margin
+        * trade_count
+    )
+
+    report = {
+        "report_version": 1,
+        "report_type": "paper_short_test",
+        "generated_at": now_utc().isoformat(),
+        "test_started_at": baseline.get(
+            "started_at"
+        ),
+        "test_complete": (
+            trade_count >= target_new
+        ),
+        "start_short_trades": start,
+        "target_new_trades": target_new,
+        "target_total_short_trades": target_total,
+        "available_new_closed_shorts": available_new,
+        "included_new_trades": trade_count,
+        "remaining_new_trades": max(
+            0,
+            target_new - trade_count,
+        ),
+        "settings": settings,
+        "summary": {
+            "trades": trade_count,
+            "wins": wins,
+            "losses": losses,
+            "neutral": neutral,
+            "winrate_pct": round(
+                100.0 * wins / trade_count,
+                2,
+            ) if trade_count else 0.0,
+            "net_pnl_quote": round(
+                total_pnl,
+                8,
+            ),
+            "gross_profit_quote": round(
+                gross_profit,
+                8,
+            ),
+            "gross_loss_quote": round(
+                gross_loss,
+                8,
+            ),
+            "profit_factor": round(
+                gross_profit / abs(
+                    gross_loss
+                ),
+                4,
+            ) if gross_loss < 0 else None,
+            "average_pnl_quote": round(
+                total_pnl / trade_count,
+                8,
+            ) if trade_count else 0.0,
+            "average_win_quote": round(
+                gross_profit / wins,
+                8,
+            ) if wins else 0.0,
+            "average_loss_quote": round(
+                gross_loss / losses,
+                8,
+            ) if losses else 0.0,
+            "total_fees_quote": round(
+                total_fees,
+                8,
+            ),
+            "average_holding_time_min": round(
+                sum(holding_values)
+                / len(holding_values),
+                2,
+            ) if holding_values else 0.0,
+            "maximum_loss_streak": maximum_loss_streak(
+                selected_trades
+            ),
+            "margin_volume_quote": round(
+                margin_volume,
+                8,
+            ),
+            "return_on_margin_volume_pct": round(
+                100.0
+                * total_pnl
+                / margin_volume,
+                4,
+            ) if margin_volume > 0 else None,
+            "open_fee_matches_complete": all(
+                bool(
+                    trade.get(
+                        "open_match_complete"
+                    )
+                )
+                for trade in selected_trades
+            ),
+        },
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "by_market": summarize_test_group(
+            selected_trades,
+            "market",
+        ),
+        "by_reason": summarize_test_group(
+            selected_trades,
+            "reason",
+        ),
+        "trades": selected_trades,
+    }
+
+    return report
+
+
+def save_short_test_report(
+    report: Dict[str, Any],
+) -> None:
+    save_json_atomic(
+        SHORT_TEST_REPORT_FILE,
+        report,
+    )
+
+
+def format_short_test_report(
+    report: Dict[str, Any],
+) -> str:
+    summary = report.get(
+        "summary"
+    ) or {}
+
+    settings = report.get(
+        "settings"
+    ) or {}
+
+    best = report.get(
+        "best_trade"
+    ) or {}
+
+    worst = report.get(
+        "worst_trade"
+    ) or {}
+
+    lines = [
+        "=" * 60,
+        "DIAMOND TRADER PAPER-SHORT EINDRAPPORT",
+        now_local().strftime(
+            "%d-%m-%Y %H:%M Nederlandse tijd"
+        ),
+        "=" * 60,
+        "",
+        "TESTGRENS",
+        f"Start shorttrades       : {report.get('start_short_trades', 0)}",
+        f"Nieuwe shorttrades      : {report.get('included_new_trades', 0)}/{report.get('target_new_trades', 0)}",
+        f"Doel totaal             : {report.get('target_total_short_trades', 0)}",
+        f"Test compleet           : {'JA' if report.get('test_complete') else 'NEE'}",
+        "",
+        "RESULTAAT",
+        f"Winsttrades             : {summary.get('wins', 0)}",
+        f"Verliestrades           : {summary.get('losses', 0)}",
+        f"Neutrale trades         : {summary.get('neutral', 0)}",
+        f"Winrate                 : {to_float(summary.get('winrate_pct'), 0.0):.1f}%",
+        f"Netto PnL               : €{to_float(summary.get('net_pnl_quote'), 0.0):+.2f}",
+        f"Profit factor           : {summary.get('profit_factor')}",
+        f"Gemiddelde per short    : €{to_float(summary.get('average_pnl_quote'), 0.0):+.2f}",
+        f"Totale handelskosten    : €{to_float(summary.get('total_fees_quote'), 0.0):.2f}",
+        f"Max. verliesreeks       : {int(to_float(summary.get('maximum_loss_streak'), 0.0))}",
+        f"Gem. looptijd           : {to_float(summary.get('average_holding_time_min'), 0.0):.1f} minuten",
+        "",
+        "BESTE EN SLECHTSTE SHORT",
+        (
+            f"Beste                   : {best.get('market', '-')} "
+            f"€{to_float(best.get('net_pnl_quote'), 0.0):+.2f} "
+            f"({best.get('reason', '-')})"
+        ),
+        (
+            f"Slechtste               : {worst.get('market', '-')} "
+            f"€{to_float(worst.get('net_pnl_quote'), 0.0):+.2f} "
+            f"({worst.get('reason', '-')})"
+        ),
+        "",
+        "RESULTAAT PER MUNT",
+    ]
+
+    by_market = report.get(
+        "by_market"
+    ) or {}
+
+    for market in sorted(
+        by_market
+    ):
+        item = by_market[
+            market
+        ]
+
+        lines.append(
+            f"{market:<10} trades={item.get('trades', 0):>2} | "
+            f"winrate={to_float(item.get('winrate_pct'), 0.0):>5.1f}% | "
+            f"pnl=€{to_float(item.get('net_pnl_quote'), 0.0):+7.2f}"
+        )
+
+    lines.extend([
+        "",
+        "RESULTAAT PER SLUITREDEN",
+    ])
+
+    by_reason = report.get(
+        "by_reason"
+    ) or {}
+
+    for reason in sorted(
+        by_reason
+    ):
+        item = by_reason[
+            reason
+        ]
+
+        lines.append(
+            f"{reason:<24} trades={item.get('trades', 0):>2} | "
+            f"pnl=€{to_float(item.get('net_pnl_quote'), 0.0):+7.2f}"
+        )
+
+    lines.extend([
+        "",
+        "TESTINSTELLINGEN",
+        f"Paper only              : {settings.get('paper_only')}",
+        f"Margin per trade        : €{to_float(settings.get('margin_per_trade'), 0.0):.2f}",
+        f"Hefboom                 : {to_float(settings.get('leverage'), 1.0):.1f}x",
+        f"Maximaal open shorts    : {int(to_float(settings.get('max_open_positions'), 0.0))}",
+        f"RSI verkoopmaximum      : {to_float(settings.get('rsi_sell_max'), 0.0):.1f}",
+        f"Minimum nettowinst      : €{to_float(settings.get('min_profit_eur'), 0.0):.2f}",
+        f"Minimum ATR             : {to_float(settings.get('min_atr_pct'), 0.0):.2f}%",
+        f"Timeframe               : {settings.get('timeframe')}",
+        "",
+        f"JSON-rapport            : {SHORT_TEST_REPORT_FILE}",
+        "=" * 60,
+    ])
+
+    return "\n".join(
+        lines
+    )
+
+
+def load_existing_short_test_report() -> Dict[str, Any]:
+    report = load_json(
+        SHORT_TEST_REPORT_FILE,
+        {},
+    )
+
+    if not isinstance(
+        report,
+        dict,
+    ):
+        return {}
+
+    return report
+
+
 def save_test_report(
     report: Dict[str, Any],
 ) -> None:
@@ -1860,6 +2641,154 @@ def build_weekly_report(
 # ============================================================
 # Automatische dry-run teststop
 # ============================================================
+
+def check_short_test_target(
+    exchange: ccxt.Exchange,
+) -> bool:
+    """
+    Maakt en mailt het afzonderlijke paper-shortrapport zodra
+    de shorttest het doel heeft bereikt.
+
+    De bot zelf weigert daarna nieuwe paper-shorts. De longtest
+    blijft volledig onafhankelijk doorlopen.
+    """
+    status = get_short_test_target_status()
+
+    if not status.get(
+        "enabled",
+        False,
+    ):
+        return False
+
+    if not status.get(
+        "target_reached",
+        False,
+    ):
+        return False
+
+    baseline = (
+        load_short_test_baseline()
+        or {}
+    )
+
+    existing_report = (
+        load_existing_short_test_report()
+    )
+
+    same_test = (
+        existing_report.get(
+            "test_started_at"
+        )
+        == baseline.get(
+            "started_at"
+        )
+    )
+
+    if (
+        same_test
+        and existing_report.get(
+            "test_complete"
+        )
+        and existing_report.get(
+            "email_sent_at"
+        )
+    ):
+        return True
+
+    try:
+        report = build_short_test_report(
+            require_complete=True,
+        )
+
+    except Exception as exc:
+        LOG.warning(
+            "Paper-shortrapport nog niet compleet; "
+            "volgende minuut opnieuw: %s",
+            exc,
+        )
+
+        return True
+
+    if same_test:
+        report["email_sent_at"] = (
+            existing_report.get(
+                "email_sent_at"
+            )
+        )
+
+        report["last_email_attempt_at"] = (
+            existing_report.get(
+                "last_email_attempt_at"
+            )
+        )
+
+    save_short_test_report(
+        report
+    )
+
+    LOG.info(
+        "Paper-shortrapport opgeslagen | "
+        "bestand=%s | trades=%d | pnl=%+.2f EUR",
+        SHORT_TEST_REPORT_FILE,
+        int(
+            to_float(
+                (
+                    report.get(
+                        "summary"
+                    )
+                    or {}
+                ).get(
+                    "trades"
+                ),
+                0.0,
+            )
+        ),
+        to_float(
+            (
+                report.get(
+                    "summary"
+                )
+                or {}
+            ).get(
+                "net_pnl_quote"
+            ),
+            0.0,
+        ),
+    )
+
+    if not email_retry_allowed(
+        report
+    ):
+        return True
+
+    report["last_email_attempt_at"] = (
+        now_utc().isoformat()
+    )
+
+    save_short_test_report(
+        report
+    )
+
+    email_ok = send_email(
+        "Diamond Trader PAPER-SHORTTEST KLAAR",
+        (
+            f"{format_short_test_report(report)}\n\n"
+            "Er worden geen nieuwe paper-shorts geopend.\n"
+            "De longtest blijft afzonderlijk doorlopen."
+        ),
+    )
+
+    if email_ok:
+        report["email_sent_at"] = (
+            now_utc().isoformat()
+        )
+
+        save_short_test_report(
+            report
+        )
+
+    return True
+
 
 def check_test_target(
     exchange: ccxt.Exchange,
@@ -2444,6 +3373,8 @@ def main() -> None:
         CONTROL_FILE,
         TEST_BASELINE_FILE,
         TEST_REPORT_FILE,
+        SHORT_TEST_BASELINE_FILE,
+        SHORT_TEST_REPORT_FILE,
     ):
         ensure_parent(path)
 
@@ -2459,7 +3390,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v6.3 gestart"
+        "Diamond Agent v6.4 gestart"
     )
 
     LOG.info(
@@ -2488,11 +3419,25 @@ def main() -> None:
     )
 
     LOG.info(
+        "Paper-shortbaseline: %s",
+        SHORT_TEST_BASELINE_FILE,
+    )
+
+    LOG.info(
+        "Paper-shortrapport: %s",
+        SHORT_TEST_REPORT_FILE,
+    )
+
+    LOG.info(
         "Rapporttijden: 06:00, 10:00, 14:00, 18:00 en 22:00"
     )
 
     while True:
         try:
+            check_short_test_target(
+                exchange
+            )
+
             check_test_target(
                 exchange
             )
