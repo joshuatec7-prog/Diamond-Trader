@@ -18,6 +18,7 @@ TEST_BASELINE_FILE="$DATA_DIR/diamond_test_baseline.json"
 TEST_REPORT_FILE="$DATA_DIR/diamond_test_report.json"
 SHORT_TEST_BASELINE_FILE="$DATA_DIR/diamond_short_test_baseline.json"
 SHORT_TEST_REPORT_FILE="$DATA_DIR/diamond_short_test_report.json"
+BACKUP_DIR="$DATA_DIR/backups"
 
 NOW_EPOCH=$(date +%s)
 ERRORS=0
@@ -493,6 +494,240 @@ PY
 }
 
 
+show_backup_status() {
+    if ! python3 - "$BACKUP_DIR" <<'PY'
+import hashlib
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+backup_root = Path(sys.argv[1])
+
+if not backup_root.is_dir():
+    print("[FOUT]  Back-upmap ontbreekt")
+    print(f"        Map                : {backup_root}")
+    raise SystemExit(1)
+
+directories = sorted(
+    [
+        path
+        for path in backup_root.iterdir()
+        if (
+            path.is_dir()
+            and not path.name.startswith(".")
+        )
+    ],
+    key=lambda path: path.name,
+)
+
+if not directories:
+    print("[FOUT]  Nog geen dagelijkse back-up aanwezig")
+    print(f"        Map                : {backup_root}")
+    raise SystemExit(1)
+
+latest = directories[-1]
+manifest_path = latest / "manifest.json"
+
+if not manifest_path.is_file():
+    print("[FOUT]  Manifest ontbreekt in nieuwste back-up")
+    print(f"        Map                : {latest}")
+    raise SystemExit(1)
+
+try:
+    with manifest_path.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        manifest = json.load(file)
+except Exception as exc:
+    print(f"[FOUT]  Back-upmanifest lezen mislukt: {exc}")
+    raise SystemExit(1)
+
+created_raw = str(
+    manifest.get("created_at")
+    or ""
+)
+
+try:
+    created = datetime.fromisoformat(
+        created_raw.replace(
+            "Z",
+            "+00:00",
+        )
+    )
+
+    if created.tzinfo is None:
+        created = created.replace(
+            tzinfo=timezone.utc,
+        )
+
+    age_hours = max(
+        0.0,
+        (
+            datetime.now(
+                timezone.utc
+            )
+            - created.astimezone(
+                timezone.utc
+            )
+        ).total_seconds()
+        / 3600.0,
+    )
+except ValueError:
+    print(
+        f"[FOUT]  Ongeldige back-uptijd: "
+        f"{created_raw or '-'}"
+    )
+    raise SystemExit(1)
+
+if manifest.get("status") != "complete":
+    print("[FOUT]  Nieuwste back-up is niet compleet")
+    print(
+        f"        Status             : "
+        f"{manifest.get('status') or '-'}"
+    )
+    raise SystemExit(1)
+
+required_missing = (
+    manifest.get("required_missing")
+    or []
+)
+
+if required_missing:
+    print("[FOUT]  Vereiste bestanden ontbreken in de back-up")
+    for item in required_missing:
+        print(f"          - {item}")
+    raise SystemExit(1)
+
+copied_files = (
+    manifest.get("copied_files")
+    or []
+)
+
+if not copied_files:
+    print("[FOUT]  Back-up bevat geen gekopieerde bestanden")
+    raise SystemExit(1)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+
+    with path.open("rb") as file:
+        while True:
+            chunk = file.read(
+                1024 * 1024
+            )
+
+            if not chunk:
+                break
+
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+integrity_errors = []
+
+for item in copied_files:
+    name = str(
+        item.get("name")
+        or ""
+    )
+
+    expected_hash = str(
+        item.get("sha256")
+        or ""
+    )
+
+    expected_size = int(
+        item.get("size_bytes")
+        or 0
+    )
+
+    path = latest / name
+
+    if not path.is_file():
+        integrity_errors.append(
+            f"{name}: ontbreekt"
+        )
+        continue
+
+    actual_size = path.stat().st_size
+
+    if actual_size != expected_size:
+        integrity_errors.append(
+            f"{name}: grootte {actual_size}, verwacht {expected_size}"
+        )
+        continue
+
+    if expected_hash and sha256_file(path) != expected_hash:
+        integrity_errors.append(
+            f"{name}: SHA256 komt niet overeen"
+        )
+
+if integrity_errors:
+    print("[FOUT]  Integriteitscontrole back-up mislukt")
+    for item in integrity_errors:
+        print(f"          - {item}")
+    raise SystemExit(1)
+
+names = {
+    str(item.get("name") or "")
+    for item in copied_files
+}
+
+core_names = {
+    "config.yaml",
+    "diamond_state.json",
+    "diamond_transactions.csv",
+    "diamond_control.json",
+    "diamond_agent_state.json",
+    "diamond_test_baseline.json",
+    "diamond_short_test_baseline.json",
+}
+
+missing_core = sorted(
+    core_names - names
+)
+
+if missing_core:
+    print("[FOUT]  Kernbestanden ontbreken in de back-up")
+    for item in missing_core:
+        print(f"          - {item}")
+    raise SystemExit(1)
+
+print("[OK]    Dagelijkse back-up aanwezig en gecontroleerd")
+print(f"        Map                : {latest}")
+print(f"        Gemaakt op         : {created_raw}")
+print(f"        Leeftijd           : {age_hours:.1f} uur")
+print(
+    f"        Bestanden          : "
+    f"{len(copied_files)}"
+)
+print(
+    f"        Totale grootte     : "
+    f"{int(manifest.get('total_bytes') or 0)} bytes"
+)
+print(
+    f"        Bewaartermijn      : "
+    f"{int(manifest.get('retention_days') or 0)} dagen"
+)
+print("        Integriteit        : OK")
+print(f"        Back-ups aanwezig  : {len(directories)}")
+
+if age_hours > 36.0:
+    print(
+        "[FOUT]  Nieuwste back-up is ouder dan 36 uur"
+    )
+    raise SystemExit(1)
+PY
+    then
+        ERRORS=$((ERRORS + 1))
+    fi
+}
+
+
 echo "1. PROCESSEN"
 echo "------------------------------------------------------------"
 
@@ -594,13 +829,19 @@ echo "------------------------------------------------------------"
 show_test_progress
 
 echo
-echo "10. SCHIJFRUIMTE"
+echo "10. DAGELIJKSE BACK-UP"
+echo "------------------------------------------------------------"
+
+show_backup_status
+
+echo
+echo "11. SCHIJFRUIMTE"
 echo "------------------------------------------------------------"
 
 df -h "$DATA_DIR" 2>/dev/null || df -h
 
 echo
-echo "11. EINDCONTROLE"
+echo "12. EINDCONTROLE"
 echo "------------------------------------------------------------"
 
 if [ "$ERRORS" -eq 0 ]; then

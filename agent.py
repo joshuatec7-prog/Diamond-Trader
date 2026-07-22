@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v6.4
+Diamond Agent v6.5
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -14,12 +14,16 @@ Functies:
 - Maakt automatisch een eindrapport van uitsluitend de nieuwe longtesttrades.
 - Bewaakt daarnaast een volledig afzonderlijke paper-shorttest.
 - Maakt en mailt het paper-shortrapport na 20 gesloten shorts.
+- Maakt dagelijks een controleerbare back-up op de permanente schijf.
+- Bewaart dagelijkse back-ups 30 dagen en verwijdert alleen oude back-upmappen.
 """
 
 import csv
 import json
+import hashlib
 import logging
 import os
+import shutil
 import smtplib
 import tempfile
 import time
@@ -104,6 +108,21 @@ SHORT_TEST_REPORT_FILE = os.getenv(
     "/var/data/diamond_short_test_report.json",
 ).strip()
 
+DIAG_STATS_FILE = os.getenv(
+    "DIAG_STATS_FILE",
+    "/var/data/diamond_diagnose_stats.json",
+).strip()
+
+SUPERVISOR_STATE_FILE = os.getenv(
+    "SUPERVISOR_STATE_FILE",
+    "/var/data/diamond_supervisor_state.json",
+).strip()
+
+BACKUP_DIR = os.getenv(
+    "BACKUP_DIR",
+    "/var/data/backups",
+).strip()
+
 GMAIL_USER = os.getenv(
     "GMAIL_USER",
     "joshuatec7@gmail.com",
@@ -142,6 +161,11 @@ ANALYZE_INTERVAL_SECONDS = 15 * 60
 
 # Agent controleert iedere minuut of er werk moet gebeuren
 LOOP_SLEEP_SECONDS = 60
+
+# Dagelijkse back-upinstellingen in Nederlandse tijd.
+BACKUP_HOUR_LOCAL = 3
+BACKUP_RETENTION_DAYS = 30
+BACKUP_MAX_AGE_HOURS = 36
 
 # Veiligheidsgrenzen
 MAX_DAY_LOSS_PCT = 1.5
@@ -597,6 +621,14 @@ def default_agent_state() -> Dict[str, Any]:
         "last_analysis_ts": 0.0,
         "sent_reports": [],
         "sent_weekly_reports": [],
+        "last_backup_date": "",
+        "last_backup_at": "",
+        "last_backup_path": "",
+        "last_backup_status": "",
+        "last_backup_file_count": 0,
+        "last_backup_total_bytes": 0,
+        "last_backup_error": "",
+        "last_backup_error_date": "",
     }
 
 
@@ -688,6 +720,14 @@ def load_agent_state() -> Dict[str, Any]:
         list,
     ):
         state["sent_weekly_reports"] = []
+
+    defaults = default_agent_state()
+
+    for key, value in defaults.items():
+        state.setdefault(
+            key,
+            value,
+        )
 
     return state
 
@@ -3250,6 +3290,617 @@ def analyze_and_act(
 
 
 # ============================================================
+# Dagelijkse back-up
+# ============================================================
+
+def backup_source_files() -> List[Dict[str, Any]]:
+    """
+    Bestanden die in iedere dagelijkse back-up worden opgenomen.
+
+    Vereiste bestanden laten de back-up mislukken als ze ontbreken.
+    Rapporten zijn optioneel omdat ze pas na het testdoel ontstaan.
+    """
+    return [
+        {
+            "source": CFG_FILE,
+            "name": "config.yaml",
+            "required": True,
+        },
+        {
+            "source": STATE_FILE,
+            "name": "diamond_state.json",
+            "required": True,
+        },
+        {
+            "source": TRADES_FILE,
+            "name": "diamond_transactions.csv",
+            "required": True,
+        },
+        {
+            "source": CONTROL_FILE,
+            "name": "diamond_control.json",
+            "required": True,
+        },
+        {
+            "source": AGENT_STATE_FILE,
+            "name": "diamond_agent_state.json",
+            "required": True,
+        },
+        {
+            "source": TEST_BASELINE_FILE,
+            "name": "diamond_test_baseline.json",
+            "required": True,
+        },
+        {
+            "source": SHORT_TEST_BASELINE_FILE,
+            "name": "diamond_short_test_baseline.json",
+            "required": True,
+        },
+        {
+            "source": DIAG_STATS_FILE,
+            "name": "diamond_diagnose_stats.json",
+            "required": False,
+        },
+        {
+            "source": SUPERVISOR_STATE_FILE,
+            "name": "diamond_supervisor_state.json",
+            "required": False,
+        },
+        {
+            "source": TEST_REPORT_FILE,
+            "name": "diamond_test_report.json",
+            "required": False,
+        },
+        {
+            "source": SHORT_TEST_REPORT_FILE,
+            "name": "diamond_short_test_report.json",
+            "required": False,
+        },
+    ]
+
+
+def sha256_file(
+    path: Path,
+) -> str:
+    digest = hashlib.sha256()
+
+    with path.open(
+        "rb",
+    ) as file:
+        while True:
+            chunk = file.read(
+                1024 * 1024
+            )
+
+            if not chunk:
+                break
+
+            digest.update(
+                chunk
+            )
+
+    return digest.hexdigest()
+
+
+def validate_backup_copy(
+    path: Path,
+) -> None:
+    """
+    Controleert JSON, YAML en CSV nadat een bestand is gekopieerd.
+    """
+    suffix = path.suffix.lower()
+
+    if suffix == ".json":
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            json.load(
+                file
+            )
+
+    elif suffix in {
+        ".yaml",
+        ".yml",
+    }:
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            config = yaml.safe_load(
+                file
+            )
+
+        if not isinstance(
+            config,
+            dict,
+        ):
+            raise ValueError(
+                f"{path.name} bevat geen geldige YAML-dictionary"
+            )
+
+    elif suffix == ".csv":
+        raw = path.read_bytes()
+
+        if raw and not raw.endswith(
+            b"\n"
+        ):
+            raise ValueError(
+                f"{path.name} eindigt niet op een volledige CSV-regel"
+            )
+
+        with path.open(
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as file:
+            reader = csv.reader(
+                file
+            )
+
+            header = next(
+                reader,
+                [],
+            )
+
+        if not header:
+            raise ValueError(
+                f"{path.name} heeft geen CSV-header"
+            )
+
+
+def copy_backup_file(
+    source: Path,
+    target: Path,
+) -> None:
+    """
+    Kopieert een bestand en probeert opnieuw als een gelijktijdige
+    schrijfopdracht tijdelijk een onvolledige kopie oplevert.
+    """
+    last_error: Optional[Exception] = None
+
+    for attempt in range(
+        1,
+        4,
+    ):
+        try:
+            shutil.copy2(
+                source,
+                target,
+            )
+
+            validate_backup_copy(
+                target
+            )
+
+            return
+
+        except Exception as exc:
+            last_error = exc
+
+            try:
+                target.unlink(
+                    missing_ok=True
+                )
+            except OSError:
+                pass
+
+            if attempt < 3:
+                time.sleep(
+                    0.25 * attempt
+                )
+
+    raise RuntimeError(
+        f"Back-upkopie mislukt voor {source}: {last_error}"
+    )
+
+
+def backup_directories() -> List[Path]:
+    root = Path(
+        BACKUP_DIR
+    )
+
+    if not root.exists():
+        return []
+
+    return sorted(
+        [
+            path
+            for path in root.iterdir()
+            if (
+                path.is_dir()
+                and not path.name.startswith(
+                    "."
+                )
+                and len(path.name) >= 10
+                and path.name[:10].count(
+                    "-"
+                ) == 2
+            )
+        ],
+        key=lambda path: path.name,
+    )
+
+
+def backup_exists_for_date(
+    date_key: str,
+) -> bool:
+    return any(
+        path.name.startswith(
+            f"{date_key}_"
+        )
+        for path in backup_directories()
+    )
+
+
+def prune_old_backups(
+    current: datetime,
+) -> List[str]:
+    """
+    Verwijdert uitsluitend back-upmappen die ouder zijn dan de
+    ingestelde bewaartermijn.
+    """
+    removed: List[str] = []
+
+    cutoff_date = (
+        current.date()
+        - timedelta(
+            days=BACKUP_RETENTION_DAYS,
+        )
+    )
+
+    for path in backup_directories():
+        try:
+            backup_date = datetime.strptime(
+                path.name[:10],
+                "%Y-%m-%d",
+            ).date()
+
+        except ValueError:
+            continue
+
+        if backup_date < cutoff_date:
+            shutil.rmtree(
+                path
+            )
+
+            removed.append(
+                path.name
+            )
+
+    return removed
+
+
+def create_daily_backup(
+    current: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """
+    Maakt een controleerbare, atomair gepubliceerde dagelijkse back-up.
+    """
+    current = current or now_local()
+
+    root = Path(
+        BACKUP_DIR
+    )
+
+    root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    timestamp = current.strftime(
+        "%Y-%m-%d_%H%M%S"
+    )
+
+    final_dir = root / timestamp
+
+    if final_dir.exists():
+        raise FileExistsError(
+            f"Back-upmap bestaat al: {final_dir}"
+        )
+
+    temporary_dir = Path(
+        tempfile.mkdtemp(
+            prefix=".backup_tmp_",
+            dir=str(root),
+        )
+    )
+
+    copied_files: List[
+        Dict[str, Any]
+    ] = []
+
+    skipped_files: List[
+        Dict[str, Any]
+    ] = []
+
+    required_missing: List[str] = []
+
+    try:
+        for item in backup_source_files():
+            source = Path(
+                str(
+                    item["source"]
+                )
+            )
+
+            target = temporary_dir / str(
+                item["name"]
+            )
+
+            required = bool(
+                item["required"]
+            )
+
+            if not source.is_file():
+                skipped_files.append({
+                    "name": target.name,
+                    "source": str(source),
+                    "required": required,
+                    "reason": "bestand_ontbreekt",
+                })
+
+                if required:
+                    required_missing.append(
+                        str(source)
+                    )
+
+                continue
+
+            copy_backup_file(
+                source,
+                target,
+            )
+
+            copied_files.append({
+                "name": target.name,
+                "source": str(source),
+                "size_bytes": target.stat().st_size,
+                "sha256": sha256_file(
+                    target
+                ),
+                "source_modified_at": datetime.fromtimestamp(
+                    source.stat().st_mtime,
+                    tz=timezone.utc,
+                ).isoformat(),
+            })
+
+        if required_missing:
+            raise FileNotFoundError(
+                "Vereiste back-upbestanden ontbreken: "
+                + ", ".join(
+                    required_missing
+                )
+            )
+
+        total_bytes = sum(
+            int(
+                item["size_bytes"]
+            )
+            for item in copied_files
+        )
+
+        manifest = {
+            "backup_version": 1,
+            "status": "complete",
+            "created_at": current.isoformat(),
+            "created_at_utc": now_utc().isoformat(),
+            "backup_name": timestamp,
+            "retention_days": BACKUP_RETENTION_DAYS,
+            "file_count": len(
+                copied_files
+            ),
+            "total_bytes": total_bytes,
+            "required_missing": [],
+            "copied_files": copied_files,
+            "skipped_files": skipped_files,
+        }
+
+        manifest_path = temporary_dir / "manifest.json"
+
+        with manifest_path.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                manifest,
+                file,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        validate_backup_copy(
+            manifest_path
+        )
+
+        os.replace(
+            temporary_dir,
+            final_dir,
+        )
+
+        removed = prune_old_backups(
+            current
+        )
+
+        manifest["removed_old_backups"] = removed
+
+        return {
+            "path": str(
+                final_dir
+            ),
+            "created_at": current.isoformat(),
+            "file_count": len(
+                copied_files
+            ),
+            "total_bytes": total_bytes,
+            "removed_old_backups": removed,
+        }
+
+    except Exception:
+        shutil.rmtree(
+            temporary_dir,
+            ignore_errors=True,
+        )
+
+        raise
+
+
+def handle_daily_backup(
+    agent_state: Dict[str, Any],
+) -> None:
+    """
+    Maakt bij een nieuwe installatie direct een back-up en daarna
+    eenmaal per kalenderdag na 03:00 Nederlandse tijd.
+    """
+    current = now_local()
+    date_key = current.strftime(
+        "%Y-%m-%d"
+    )
+
+    already_exists = backup_exists_for_date(
+        date_key
+    )
+
+    if already_exists:
+        if agent_state.get(
+            "last_backup_date"
+        ) != date_key:
+            agent_state[
+                "last_backup_date"
+            ] = date_key
+
+            agent_state[
+                "last_backup_status"
+            ] = "complete"
+
+            save_agent_state(
+                agent_state
+            )
+
+        return
+
+    existing_backups = backup_directories()
+
+    due = (
+        not existing_backups
+        or (
+            agent_state.get(
+                "last_backup_date"
+            ) != date_key
+            and current.hour >= BACKUP_HOUR_LOCAL
+        )
+    )
+
+    if not due:
+        return
+
+    try:
+        result = create_daily_backup(
+            current
+        )
+
+        agent_state[
+            "last_backup_date"
+        ] = date_key
+
+        agent_state[
+            "last_backup_at"
+        ] = result[
+            "created_at"
+        ]
+
+        agent_state[
+            "last_backup_path"
+        ] = result[
+            "path"
+        ]
+
+        agent_state[
+            "last_backup_status"
+        ] = "complete"
+
+        agent_state[
+            "last_backup_file_count"
+        ] = result[
+            "file_count"
+        ]
+
+        agent_state[
+            "last_backup_total_bytes"
+        ] = result[
+            "total_bytes"
+        ]
+
+        agent_state[
+            "last_backup_error"
+        ] = ""
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.info(
+            "DAGELIJKSE BACK-UP GESLAAGD | "
+            "map=%s | bestanden=%d | grootte=%d bytes | "
+            "oude_backups_verwijderd=%d",
+            result["path"],
+            result["file_count"],
+            result["total_bytes"],
+            len(
+                result[
+                    "removed_old_backups"
+                ]
+            ),
+        )
+
+    except Exception as exc:
+        error_text = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        LOG.exception(
+            "Dagelijkse back-up mislukt: %s",
+            exc,
+        )
+
+        agent_state[
+            "last_backup_status"
+        ] = "failed"
+
+        agent_state[
+            "last_backup_error"
+        ] = error_text
+
+        notify = (
+            agent_state.get(
+                "last_backup_error_date"
+            )
+            != date_key
+        )
+
+        agent_state[
+            "last_backup_error_date"
+        ] = date_key
+
+        save_agent_state(
+            agent_state
+        )
+
+        if notify:
+            send_email(
+                "Diamond Trader BACK-UP MISLUKT",
+                (
+                    "De dagelijkse Diamond Trader-back-up is mislukt.\n\n"
+                    f"Datum: {current.isoformat()}\n"
+                    f"Fout: {error_text}\n"
+                    f"Back-upmap: {BACKUP_DIR}\n\n"
+                    "De bot blijft draaien. Controleer de Render-schijf "
+                    "en voer healthcheck.sh uit."
+                ),
+            )
+
+
+# ============================================================
 # Rapportplanning
 # ============================================================
 
@@ -3375,6 +4026,8 @@ def main() -> None:
         TEST_REPORT_FILE,
         SHORT_TEST_BASELINE_FILE,
         SHORT_TEST_REPORT_FILE,
+        DIAG_STATS_FILE,
+        SUPERVISOR_STATE_FILE,
     ):
         ensure_parent(path)
 
@@ -3390,7 +4043,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v6.4 gestart"
+        "Diamond Agent v6.5 gestart"
     )
 
     LOG.info(
@@ -3429,11 +4082,22 @@ def main() -> None:
     )
 
     LOG.info(
+        "Dagelijkse back-up: %s | na %02d:00 | bewaren=%d dagen",
+        BACKUP_DIR,
+        BACKUP_HOUR_LOCAL,
+        BACKUP_RETENTION_DAYS,
+    )
+
+    LOG.info(
         "Rapporttijden: 06:00, 10:00, 14:00, 18:00 en 22:00"
     )
 
     while True:
         try:
+            handle_daily_backup(
+                agent_state
+            )
+
             check_short_test_target(
                 exchange
             )
