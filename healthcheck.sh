@@ -16,6 +16,8 @@ SUPERVISOR_FILE="$DATA_DIR/diamond_supervisor_state.json"
 TRADES_FILE="$DATA_DIR/diamond_transactions.csv"
 TEST_BASELINE_FILE="$DATA_DIR/diamond_test_baseline.json"
 TEST_REPORT_FILE="$DATA_DIR/diamond_test_report.json"
+SHORT_TEST_BASELINE_FILE="$DATA_DIR/diamond_short_test_baseline.json"
+SHORT_TEST_REPORT_FILE="$DATA_DIR/diamond_short_test_report.json"
 
 NOW_EPOCH=$(date +%s)
 ERRORS=0
@@ -221,8 +223,15 @@ PY
 
 show_test_progress() {
     if [ ! -f "$TEST_BASELINE_FILE" ]; then
-        echo "[FOUT]  Testbaseline ontbreekt"
+        echo "[FOUT]  Longtestbaseline ontbreekt"
         echo "        Bestand: $TEST_BASELINE_FILE"
+        ERRORS=$((ERRORS + 1))
+        return
+    fi
+
+    if [ ! -f "$SHORT_TEST_BASELINE_FILE" ]; then
+        echo "[FOUT]  Paper-shortbaseline ontbreekt"
+        echo "        Bestand: $SHORT_TEST_BASELINE_FILE"
         ERRORS=$((ERRORS + 1))
         return
     fi
@@ -230,14 +239,18 @@ show_test_progress() {
     if ! python3 - \
         "$PROJECT_DIR" \
         "$TEST_BASELINE_FILE" \
-        "$TEST_REPORT_FILE" <<'PY'
+        "$TEST_REPORT_FILE" \
+        "$SHORT_TEST_BASELINE_FILE" \
+        "$SHORT_TEST_REPORT_FILE" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 project_dir = Path(sys.argv[1])
-baseline_file = Path(sys.argv[2])
-report_file = Path(sys.argv[3])
+long_baseline_file = Path(sys.argv[2])
+long_report_file = Path(sys.argv[3])
+short_baseline_file = Path(sys.argv[4])
+short_report_file = Path(sys.argv[5])
 
 sys.path.insert(
     0,
@@ -254,6 +267,9 @@ required_functions = (
     "get_test_target_status",
     "check_test_target",
     "build_test_report",
+    "get_short_test_target_status",
+    "check_short_test_target",
+    "build_short_test_report",
 )
 
 missing_functions = [
@@ -264,136 +280,209 @@ missing_functions = [
 
 if missing_functions:
     print(
-        "[FOUT]  Automatische testfuncties ontbreken: "
+        "[FOUT]  Testfuncties ontbreken: "
         + ", ".join(missing_functions)
     )
     raise SystemExit(1)
 
+
+def print_report_status(
+    report_file: Path,
+    target_reached: bool,
+    target_total: int,
+    label: str,
+) -> None:
+    if report_file.exists():
+        try:
+            with report_file.open(
+                "r",
+                encoding="utf-8",
+            ) as file:
+                report = json.load(file)
+
+            print(f"[OK]    {label}rapport aanwezig")
+            print(f"        Bestand           : {report_file}")
+            print(
+                f"        Test compleet     : "
+                f"{'JA' if report.get('test_complete') else 'NEE'}"
+            )
+            print(
+                f"        Trades in rapport : "
+                f"{report.get('included_new_trades', 0)}"
+            )
+            print(
+                f"        Gegenereerd op    : "
+                f"{report.get('generated_at') or '-'}"
+            )
+
+        except Exception as exc:
+            print(
+                f"[WAARSCHUWING] {label}rapport lezen mislukt: {exc}"
+            )
+    else:
+        if target_reached:
+            print(
+                f"[WAARSCHUWING] {label}doel bereikt, maar "
+                "eindrapport nog niet aanwezig"
+            )
+            print(
+                "        De agent maakt dit normaal binnen één minuut."
+            )
+        else:
+            print(
+                f"[INFO]  {label}eindrapport wordt gemaakt zodra "
+                f"trade {target_total} is bereikt"
+            )
+
+
 try:
-    status = agent.get_test_target_status()
+    long_status = agent.get_test_target_status()
 except Exception as exc:
-    print(f"[FOUT]  Teststatus opvragen mislukt: {exc}")
+    print(f"[FOUT]  Longteststatus opvragen mislukt: {exc}")
     raise SystemExit(1)
 
-if not status.get("enabled", False):
-    print("[FOUT]  Testbaseline is niet geldig of niet actief")
+if not long_status.get("enabled", False):
+    print("[FOUT]  Longtestbaseline is niet geldig of niet actief")
     print(
         f"        Reden             : "
-        f"{status.get('reason') or 'onbekend'}"
+        f"{long_status.get('reason') or 'onbekend'}"
     )
     raise SystemExit(1)
 
-start_trades = int(
-    status.get("start_trades", 0)
+long_start = int(
+    long_status.get("start_trades", 0)
     or 0
 )
-
-target_total = int(
-    status.get("target_total_trades", 0)
+long_target_total = int(
+    long_status.get("target_total_trades", 0)
     or 0
 )
-
-current_trades = int(
-    status.get("current_trades", 0)
+long_current = int(
+    long_status.get("current_trades", 0)
     or 0
 )
-
-new_trades = int(
-    status.get("new_trades", 0)
+long_new = int(
+    long_status.get("new_trades", 0)
     or 0
 )
-
-remaining = int(
-    status.get("remaining_trades", 0)
+long_remaining = int(
+    long_status.get("remaining_trades", 0)
     or 0
 )
-
-target_new = max(
+long_target_new = max(
     0,
-    target_total - start_trades,
+    long_target_total - long_start,
+)
+long_dry_run = bool(
+    long_status.get("dry_run", False)
+)
+long_reached = bool(
+    long_status.get("target_reached", False)
 )
 
-dry_run = bool(
-    status.get("dry_run", False)
-)
-
-target_reached = bool(
-    status.get("target_reached", False)
-)
-
-teststop_active = (
-    dry_run
-    and target_total > start_trades
-)
-
-print("[OK]    Testbaseline actief")
-print(f"        Bestand           : {baseline_file}")
-print(f"        Start trades      : {start_trades}")
-print(f"        Huidige trades    : {current_trades}")
+print("LONGTEST")
+print("[OK]    Longtestbaseline actief")
+print(f"        Bestand           : {long_baseline_file}")
+print(f"        Start trades      : {long_start}")
+print(f"        Huidige trades    : {long_current}")
 print(
     f"        Nieuwe testtrades : "
-    f"{new_trades}/{target_new}"
+    f"{long_new}/{long_target_new}"
 )
-print(f"        Nog nodig         : {remaining}")
-print(f"        Doel totaal       : {target_total}")
+print(f"        Nog nodig         : {long_remaining}")
+print(f"        Doel totaal       : {long_target_total}")
 print(
     f"        Dry-run           : "
-    f"{'JA' if dry_run else 'NEE'}"
+    f"{'JA' if long_dry_run else 'NEE'}"
 )
 print(
     f"        Teststop actief   : "
-    f"{'JA' if teststop_active else 'NEE'}"
+    f"{'JA' if long_dry_run else 'NEE'}"
 )
 print(
     f"        Doel bereikt      : "
-    f"{'JA' if target_reached else 'NEE'}"
+    f"{'JA' if long_reached else 'NEE'}"
 )
 
-if report_file.exists():
-    try:
-        with report_file.open(
-            "r",
-            encoding="utf-8",
-        ) as file:
-            report = json.load(file)
+print_report_status(
+    long_report_file,
+    long_reached,
+    long_target_total,
+    "Longtest",
+)
 
-        print("[OK]    Testrapport aanwezig")
-        print(f"        Bestand           : {report_file}")
-        print(
-            f"        Test compleet     : "
-            f"{'JA' if report.get('test_complete') else 'NEE'}"
-        )
-        print(
-            f"        Trades in rapport : "
-            f"{report.get('included_new_trades', 0)}"
-        )
-        print(
-            f"        Gegenereerd op    : "
-            f"{report.get('generated_at') or '-'}"
-        )
+try:
+    short_status = agent.get_short_test_target_status()
+except Exception as exc:
+    print(f"[FOUT]  Paper-shortstatus opvragen mislukt: {exc}")
+    raise SystemExit(1)
 
-    except Exception as exc:
-        print(
-            f"[WAARSCHUWING] Testrapport lezen mislukt: {exc}"
-        )
-else:
-    if target_reached:
-        print(
-            "[WAARSCHUWING] Doel bereikt, maar eindrapport "
-            "nog niet aanwezig"
-        )
-        print(
-            "        De agent maakt dit normaal binnen één minuut."
-        )
-    else:
-        print(
-            "[INFO]  Eindrapport wordt gemaakt zodra "
-            f"trade {target_total} is bereikt"
-        )
-
-if not teststop_active:
+if not short_status.get("enabled", False):
+    print("[FOUT]  Paper-shorttest is niet geldig of niet actief")
     print(
-        "[FOUT]  Automatische teststop is niet actief; "
+        f"        Reden             : "
+        f"{short_status.get('reason') or 'onbekend'}"
+    )
+    raise SystemExit(1)
+
+short_start = int(
+    short_status.get("start_short_trades", 0)
+    or 0
+)
+short_target_total = int(
+    short_status.get("target_total_short_trades", 0)
+    or 0
+)
+short_current = int(
+    short_status.get("current_short_trades", 0)
+    or 0
+)
+short_new = int(
+    short_status.get("new_short_trades", 0)
+    or 0
+)
+short_remaining = int(
+    short_status.get("remaining_short_trades", 0)
+    or 0
+)
+short_target_new = max(
+    0,
+    short_target_total - short_start,
+)
+short_reached = bool(
+    short_status.get("target_reached", False)
+)
+
+print("")
+print("PAPER-SHORTTEST")
+print("[OK]    Paper-shortbaseline actief")
+print(f"        Bestand           : {short_baseline_file}")
+print(f"        Start shorts      : {short_start}")
+print(f"        Huidige shorts    : {short_current}")
+print(
+    f"        Nieuwe shorts     : "
+    f"{short_new}/{short_target_new}"
+)
+print(f"        Nog nodig         : {short_remaining}")
+print(f"        Doel totaal       : {short_target_total}")
+print("        Paper only        : JA")
+print("        Maximaal open     : 1")
+print("        Hefboom           : 1x")
+print(
+    f"        Doel bereikt      : "
+    f"{'JA' if short_reached else 'NEE'}"
+)
+
+print_report_status(
+    short_report_file,
+    short_reached,
+    short_target_total,
+    "Paper-short",
+)
+
+if not long_dry_run:
+    print(
+        "[FOUT]  Longteststop is niet actief; "
         "dry-run moet aanstaan"
     )
     raise SystemExit(1)
