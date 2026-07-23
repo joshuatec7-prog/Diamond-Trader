@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v6.5
+Diamond Agent v6.6
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -13,7 +13,8 @@ Functies:
 - Pauzeert automatisch wanneer het ingestelde dry-run testdoel is bereikt.
 - Maakt automatisch een eindrapport van uitsluitend de nieuwe longtesttrades.
 - Bewaakt daarnaast een volledig afzonderlijke paper-shorttest.
-- Maakt en mailt het paper-shortrapport na 20 gesloten shorts.
+- Maakt en mailt paper-shorttussenrapporten na 5 en 10 gesloten shorts.
+- Maakt en mailt het paper-shorteindrapport na 20 gesloten shorts.
 - Maakt dagelijks een controleerbare back-up op de permanente schijf.
 - Bewaart dagelijkse back-ups 30 dagen en verwijdert alleen oude back-upmappen.
 """
@@ -107,6 +108,11 @@ SHORT_TEST_REPORT_FILE = os.getenv(
     "SHORT_TEST_REPORT_FILE",
     "/var/data/diamond_short_test_report.json",
 ).strip()
+
+SHORT_TEST_INTERIM_MILESTONES = (
+    5,
+    10,
+)
 
 DIAG_STATS_FILE = os.getenv(
     "DIAG_STATS_FILE",
@@ -1578,6 +1584,7 @@ def build_short_round_trips(
 
 def build_short_test_report(
     require_complete: bool = True,
+    max_new_trades: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Bouwt uitsluitend het rapport van de nieuwe paper-shorts
@@ -1641,6 +1648,20 @@ def build_short_test_report(
         start:target_total
     ]
 
+    if max_new_trades is not None:
+        cap = max(
+            0,
+            int(
+                max_new_trades
+            ),
+        )
+
+        selected_round_trips = (
+            selected_round_trips[
+                :cap
+            ]
+        )
+
     if (
         require_complete
         and len(selected_round_trips)
@@ -1664,6 +1685,13 @@ def build_short_test_report(
             "close_row"
         ]
 
+        open_row = (
+            round_trip.get(
+                "open_row"
+            )
+            or {}
+        )
+
         pnl = trade_pnl(
             row
         )
@@ -1681,8 +1709,23 @@ def build_short_test_report(
             "market": trade_market(
                 row
             ),
+            "entry_reason": trade_reason(
+                open_row
+            ),
+            "close_reason": trade_reason(
+                row
+            ),
             "reason": trade_reason(
                 row
+            ),
+            "entry_price": round(
+                to_float(
+                    open_row.get(
+                        "price"
+                    ),
+                    0.0,
+                ),
+                12,
             ),
             "price": round(
                 to_float(
@@ -1966,12 +2009,108 @@ def build_short_test_report(
             selected_trades,
             "market",
         ),
+        "by_entry_reason": summarize_test_group(
+            selected_trades,
+            "entry_reason",
+        ),
         "by_reason": summarize_test_group(
             selected_trades,
             "reason",
         ),
         "trades": selected_trades,
     }
+
+    return report
+
+
+def short_interim_report_file(
+    milestone: int,
+) -> str:
+    path = Path(
+        SHORT_TEST_REPORT_FILE
+    )
+
+    return str(
+        path.with_name(
+            f"diamond_short_test_interim_{int(milestone)}.json"
+        )
+    )
+
+
+def load_existing_short_interim_report(
+    milestone: int,
+) -> Dict[str, Any]:
+    report = load_json(
+        short_interim_report_file(
+            milestone
+        ),
+        {},
+    )
+
+    if not isinstance(
+        report,
+        dict,
+    ):
+        return {}
+
+    return report
+
+
+def save_short_interim_report(
+    milestone: int,
+    report: Dict[str, Any],
+) -> None:
+    save_json_atomic(
+        short_interim_report_file(
+            milestone
+        ),
+        report,
+    )
+
+
+def build_short_interim_report(
+    milestone: int,
+) -> Dict[str, Any]:
+    report = build_short_test_report(
+        require_complete=False,
+        max_new_trades=milestone,
+    )
+
+    included = int(
+        to_float(
+            report.get(
+                "included_new_trades"
+            ),
+            0.0,
+        )
+    )
+
+    if included < milestone:
+        raise RuntimeError(
+            "Transactiebestand bevat nog maar "
+            f"{included} van {milestone} shorts "
+            "voor het tussenrapport"
+        )
+
+    report[
+        "report_type"
+    ] = "paper_short_interim"
+
+    report[
+        "interim_milestone"
+    ] = milestone
+
+    report[
+        "test_complete"
+    ] = False
+
+    report[
+        "email_sent_at"
+    ] = None
+
+    report[
+        "last_email_attempt_at"
+    ] = None
 
     return report
 
@@ -2004,9 +2143,32 @@ def format_short_test_report(
         "worst_trade"
     ) or {}
 
+    milestone = int(
+        to_float(
+            report.get(
+                "interim_milestone"
+            ),
+            0.0,
+        )
+    )
+
+    report_title = (
+        f"DIAMOND TRADER PAPER-SHORT TUSSENRAPPORT NA {milestone} SHORTS"
+        if milestone > 0
+        else "DIAMOND TRADER PAPER-SHORT EINDRAPPORT"
+    )
+
+    report_file = (
+        short_interim_report_file(
+            milestone
+        )
+        if milestone > 0
+        else SHORT_TEST_REPORT_FILE
+    )
+
     lines = [
         "=" * 60,
-        "DIAMOND TRADER PAPER-SHORT EINDRAPPORT",
+        report_title,
         now_local().strftime(
             "%d-%m-%Y %H:%M Nederlandse tijd"
         ),
@@ -2064,6 +2226,28 @@ def format_short_test_report(
 
     lines.extend([
         "",
+        "RESULTAAT PER INSTAPREDEN",
+    ])
+
+    by_entry_reason = report.get(
+        "by_entry_reason"
+    ) or {}
+
+    for reason in sorted(
+        by_entry_reason
+    ):
+        item = by_entry_reason[
+            reason
+        ]
+
+        lines.append(
+            f"{reason:<32} trades={item.get('trades', 0):>2} | "
+            f"winrate={to_float(item.get('winrate_pct'), 0.0):>5.1f}% | "
+            f"pnl=€{to_float(item.get('net_pnl_quote'), 0.0):+7.2f}"
+        )
+
+    lines.extend([
+        "",
         "RESULTAAT PER SLUITREDEN",
     ])
 
@@ -2090,12 +2274,15 @@ def format_short_test_report(
         f"Margin per trade        : €{to_float(settings.get('margin_per_trade'), 0.0):.2f}",
         f"Hefboom                 : {to_float(settings.get('leverage'), 1.0):.1f}x",
         f"Maximaal open shorts    : {int(to_float(settings.get('max_open_positions'), 0.0))}",
+        f"Strategieversie         : {settings.get('strategy_version')}",
+        f"RSI verkoopminimum      : {to_float(settings.get('rsi_sell_min'), 0.0):.1f}",
         f"RSI verkoopmaximum      : {to_float(settings.get('rsi_sell_max'), 0.0):.1f}",
+        f"Breakout terugkijk      : {int(to_float(settings.get('breakout_lookback_candles'), 0.0))} candles",
         f"Minimum nettowinst      : €{to_float(settings.get('min_profit_eur'), 0.0):.2f}",
         f"Minimum ATR             : {to_float(settings.get('min_atr_pct'), 0.0):.2f}%",
         f"Timeframe               : {settings.get('timeframe')}",
         "",
-        f"JSON-rapport            : {SHORT_TEST_REPORT_FILE}",
+        f"JSON-rapport            : {report_file}",
         "=" * 60,
     ])
 
@@ -2681,6 +2868,175 @@ def build_weekly_report(
 # ============================================================
 # Automatische dry-run teststop
 # ============================================================
+
+def check_short_test_interim_reports(
+    exchange: ccxt.Exchange,
+) -> bool:
+    """
+    Maakt en mailt exact één tussenrapport na 5 en 10
+    gesloten paper-shorts. De test en open posities lopen door.
+    """
+    del exchange
+
+    status = get_short_test_target_status()
+
+    if not status.get(
+        "enabled",
+        False,
+    ):
+        return False
+
+    baseline = (
+        load_short_test_baseline()
+        or {}
+    )
+
+    target_new = int(
+        to_float(
+            baseline.get(
+                "target_new_trades"
+            ),
+            0.0,
+        )
+    )
+
+    completed = int(
+        to_float(
+            status.get(
+                "new_short_trades"
+            ),
+            0.0,
+        )
+    )
+
+    handled_any = False
+
+    for milestone in SHORT_TEST_INTERIM_MILESTONES:
+        if (
+            milestone >= target_new
+            or completed < milestone
+        ):
+            continue
+
+        handled_any = True
+
+        existing_report = (
+            load_existing_short_interim_report(
+                milestone
+            )
+        )
+
+        same_test = (
+            existing_report.get(
+                "test_started_at"
+            )
+            == baseline.get(
+                "started_at"
+            )
+        )
+
+        if (
+            same_test
+            and existing_report.get(
+                "email_sent_at"
+            )
+        ):
+            continue
+
+        try:
+            report = build_short_interim_report(
+                milestone
+            )
+
+        except Exception as exc:
+            LOG.warning(
+                "Paper-shorttussenrapport %d nog niet compleet; "
+                "volgende minuut opnieuw: %s",
+                milestone,
+                exc,
+            )
+
+            continue
+
+        if same_test:
+            report["email_sent_at"] = (
+                existing_report.get(
+                    "email_sent_at"
+                )
+            )
+
+            report["last_email_attempt_at"] = (
+                existing_report.get(
+                    "last_email_attempt_at"
+                )
+            )
+
+        save_short_interim_report(
+            milestone,
+            report,
+        )
+
+        summary = (
+            report.get(
+                "summary"
+            )
+            or {}
+        )
+
+        LOG.info(
+            "Paper-shorttussenrapport opgeslagen | "
+            "mijlpaal=%d | bestand=%s | pnl=%+.2f EUR",
+            milestone,
+            short_interim_report_file(
+                milestone
+            ),
+            to_float(
+                summary.get(
+                    "net_pnl_quote"
+                ),
+                0.0,
+            ),
+        )
+
+        if not email_retry_allowed(
+            report
+        ):
+            continue
+
+        report[
+            "last_email_attempt_at"
+        ] = now_utc().isoformat()
+
+        save_short_interim_report(
+            milestone,
+            report,
+        )
+
+        email_ok = send_email(
+            (
+                "Diamond Trader PAPER-SHORT "
+                f"TUSSENRAPPORT {milestone}/{target_new}"
+            ),
+            (
+                f"{format_short_test_report(report)}\n\n"
+                "De paper-shorttest loopt ongewijzigd door.\n"
+                "Er zijn geen instellingen aangepast en er is "
+                "geen veiligheidspauze geactiveerd."
+            ),
+        )
+
+        if email_ok:
+            report[
+                "email_sent_at"
+            ] = now_utc().isoformat()
+
+            save_short_interim_report(
+                milestone,
+                report,
+            )
+
+    return handled_any
+
 
 def check_short_test_target(
     exchange: ccxt.Exchange,
@@ -3354,6 +3710,16 @@ def backup_source_files() -> List[Dict[str, Any]]:
         {
             "source": SHORT_TEST_REPORT_FILE,
             "name": "diamond_short_test_report.json",
+            "required": False,
+        },
+        {
+            "source": short_interim_report_file(5),
+            "name": "diamond_short_test_interim_5.json",
+            "required": False,
+        },
+        {
+            "source": short_interim_report_file(10),
+            "name": "diamond_short_test_interim_10.json",
             "required": False,
         },
     ]
@@ -4043,7 +4409,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v6.5 gestart"
+        "Diamond Agent v6.6 gestart"
     )
 
     LOG.info(
@@ -4082,6 +4448,12 @@ def main() -> None:
     )
 
     LOG.info(
+        "Paper-shorttussenrapporten: %s en %s",
+        short_interim_report_file(5),
+        short_interim_report_file(10),
+    )
+
+    LOG.info(
         "Dagelijkse back-up: %s | na %02d:00 | bewaren=%d dagen",
         BACKUP_DIR,
         BACKUP_HOUR_LOCAL,
@@ -4096,6 +4468,10 @@ def main() -> None:
         try:
             handle_daily_backup(
                 agent_state
+            )
+
+            check_short_test_interim_reports(
+                exchange
             )
 
             check_short_test_target(
