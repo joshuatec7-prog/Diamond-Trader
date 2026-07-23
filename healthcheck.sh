@@ -728,6 +728,35 @@ PY
 }
 
 
+
+show_short_diagnose() {
+    local diagnose_script="$PROJECT_DIR/short_diagnose.py"
+
+    if [ ! -f "$diagnose_script" ]; then
+        echo "[FOUT]  short_diagnose.py ontbreekt"
+        echo "        Bestand: $diagnose_script"
+        ERRORS=$((ERRORS + 1))
+        return
+    fi
+
+    echo "[INFO]  Veilige paper-shortdiagnose wordt uitgevoerd"
+    echo "        Alleen lezen: geen orders en geen bestanden gewijzigd"
+    echo
+
+    if (
+        cd "$PROJECT_DIR"
+        python3 short_diagnose.py --compact
+    ); then
+        echo
+        echo "[OK]    Paper-shortdiagnose succesvol afgerond"
+    else
+        local exit_code=$?
+        echo
+        echo "[FOUT]  Paper-shortdiagnose mislukt (exitcode $exit_code)"
+        ERRORS=$((ERRORS + 1))
+    fi
+}
+
 echo "1. PROCESSEN"
 echo "------------------------------------------------------------"
 
@@ -758,6 +787,7 @@ for file_name in \
     diagnose.py \
     supervisor_agent.py \
     diamond_bot.py \
+    short_diagnose.py \
     requirements.txt \
     start.sh \
     healthcheck.sh
@@ -829,19 +859,25 @@ echo "------------------------------------------------------------"
 show_test_progress
 
 echo
-echo "10. DAGELIJKSE BACK-UP"
+echo "10. PAPER-SHORTDIAGNOSE"
+echo "------------------------------------------------------------"
+
+show_short_diagnose
+
+echo
+echo "11. DAGELIJKSE BACK-UP"
 echo "------------------------------------------------------------"
 
 show_backup_status
 
 echo
-echo "11. SCHIJFRUIMTE"
+echo "12. SCHIJFRUIMTE"
 echo "------------------------------------------------------------"
 
 df -h "$DATA_DIR" 2>/dev/null || df -h
 
 echo
-echo "12. EINDCONTROLE"
+echo "13. EINDCONTROLE"
 echo "------------------------------------------------------------"
 
 if [ "$ERRORS" -eq 0 ]; then
