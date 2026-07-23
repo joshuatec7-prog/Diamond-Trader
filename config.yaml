@@ -1,5 +1,6 @@
 # Diamond Trader configuratie
-# Longtest en paper-shorttest draaien naast elkaar.
+# Nieuwe longposities staan tijdelijk uit.
+# De paper-shorttest gebruikt strategie short_breakout_v2.
 # Echte orders blijven volledig uitgeschakeld zolang risk.dry_run true is.
 
 quote: EUR
@@ -13,10 +14,10 @@ symbols:
   - ADA/EUR
 
 trading:
+  # Tijdelijk uitgeschakeld na de zwakke eerste longtest.
   enable_spot: false
 
-  # Alleen gesimuleerde shortposities. Diamond Trader bevat geen code
-  # die hiervoor echte short- of marginorders plaatst.
+  # Alleen gesimuleerde shortposities.
   enable_short_signals: true
 
   # Nooit tegelijk long en short op dezelfde munt.
@@ -35,8 +36,7 @@ risk:
   cooldown_minutes: 240
   skip_log_every_seconds: 600
 
-  # De bot mag een munt kopen die je zelf al bezit,
-  # maar verkoopt uitsluitend de hoeveelheid die hij zelf heeft gekocht.
+  # Handmatig bezit wordt nooit door de bot verkocht.
   avoid_symbols_with_existing_balance: false
   existing_balance_dust: 0.00000001
 
@@ -50,9 +50,6 @@ signals:
   use_sma: true
   sma_fast: 20
   sma_slow: 60
-
-  # Alleen kopen bij een nieuwe kruising van de snelle SMA
-  # boven de langzame SMA.
   require_crossover: true
 
   use_rsi: true
@@ -70,10 +67,8 @@ signals:
 
   trailing_enabled: true
   trailing_atr_mult: 1.2
-
   profit_trailing_trigger_pct: 1.0
   profit_trailing_pullback_pct: 0.5
-
   exit_on_trend_break: true
 
 scanner:
@@ -88,27 +83,24 @@ scanner:
     - DAI
 
 news:
-  # Nieuwsfilter blijft voorlopig uit tijdens de technische dry-run.
   enabled: false
-
   timespan_hours: 24
   top_n_for_news_check: 3
   min_news_score_to_buy: 0.0
   bad_news_score_to_exit: -1.5
-
   allow_buy_without_news: true
   fail_open: true
   block_on_severe_negative: true
   force_exit_on_severe_negative: false
-
   use_fear_greed: false
   fear_greed_buy_max: 75
   max_records: 100
 
 short:
-  # Dit onderdeel blijft altijd een papieren simulatie.
+  # Altijd uitsluitend een papieren simulatie.
   enabled: true
   paper_only: true
+  strategy_version: short_breakout_v2
 
   # Eerste test: maximaal één short zonder hefboom.
   max_open_positions: 1
@@ -116,17 +108,24 @@ short:
   margin_per_trade: 30
   min_profit_eur: 0.05
   cooldown_minutes: 240
-
-  # Automatische afzonderlijke test vanaf de actuele shortstand.
   test_target_trades: 20
 
   use_sma: true
   sma_fast: 20
   sma_slow: 60
 
+  # Instap bij een nieuwe bearish kruising OF bij een nieuwe
+  # neerwaartse uitbraak binnen een bestaande dalende trend.
+  allow_crossover_entry: true
+  allow_breakout_entry: true
+  breakout_lookback_candles: 8
+  require_fast_sma_falling: true
+
+  # Niet shorten wanneer RSI al extreem oversold is.
   use_rsi: true
   rsi_len: 14
-  rsi_sell_max: 40
+  rsi_sell_min: 25
+  rsi_sell_max: 45
 
   use_atr_filter: true
   atr_len: 14

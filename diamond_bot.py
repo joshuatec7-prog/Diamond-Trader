@@ -457,6 +457,8 @@ class Bot:
         )
 
         self.state = load_state(self.state_file)
+        self.short_strategy_baseline_mismatch = False
+
         if self.state.get("simulated_free_quote") is None:
             self.state["simulated_free_quote"] = to_float(
                 get_cfg(self.cfg, "risk.simulated_quote_balance", 3000), 3000.0
@@ -765,6 +767,7 @@ class Bot:
             signals_enabled
             and module_enabled
             and paper_only
+            and not self.short_strategy_baseline_mismatch
         )
 
     def short_test_target_trades(self) -> int:
@@ -786,9 +789,13 @@ class Bot:
         """
         Legt vóór de eerste paper-short automatisch de nulmeting vast.
 
-        Een bestaande nulmeting wordt nooit overschreven. Daardoor blijft
-        de shorttest reproduceerbaar bij een herstart of nieuwe deploy.
+        Wanneer de shortstrategie wijzigt en er nog geen shorttrade of
+        open shortpositie bestaat, wordt de nulmeting veilig vernieuwd.
+        Een reeds gestarte shorttest wordt nooit stilzwijgend gemengd met
+        een andere strategie.
         """
+        self.short_strategy_baseline_mismatch = False
+
         if not self.short_enabled():
             return
 
@@ -800,9 +807,6 @@ class Bot:
         path = Path(
             self.short_test_baseline_file
         )
-
-        if path.exists():
-            return
 
         ensure_parent(
             self.short_test_baseline_file
@@ -816,6 +820,192 @@ class Bot:
             or 0
         )
 
+        strategy_version = str(
+            get_cfg(
+                self.cfg,
+                "short.strategy_version",
+                "short_breakout_v2",
+            )
+        ).strip() or "short_breakout_v2"
+
+        settings = {
+            "strategy_version": strategy_version,
+            "paper_only": True,
+            "symbols": self.scanned_symbols(),
+            "timeframe": get_cfg(
+                self.cfg,
+                "timeframe",
+                "15m",
+            ),
+            "max_open_positions": (
+                self.max_open_short_positions()
+            ),
+            "margin_per_trade": to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.margin_per_trade",
+                    30,
+                ),
+                30.0,
+            ),
+            "leverage": to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.leverage",
+                    1,
+                ),
+                1.0,
+            ),
+            "allow_crossover_entry": to_bool(
+                get_cfg(
+                    self.cfg,
+                    "short.allow_crossover_entry",
+                    True,
+                ),
+                True,
+            ),
+            "allow_breakout_entry": to_bool(
+                get_cfg(
+                    self.cfg,
+                    "short.allow_breakout_entry",
+                    True,
+                ),
+                True,
+            ),
+            "breakout_lookback_candles": int(
+                to_float(
+                    get_cfg(
+                        self.cfg,
+                        "short.breakout_lookback_candles",
+                        8,
+                    ),
+                    8,
+                )
+            ),
+            "require_fast_sma_falling": to_bool(
+                get_cfg(
+                    self.cfg,
+                    "short.require_fast_sma_falling",
+                    True,
+                ),
+                True,
+            ),
+            "rsi_sell_min": to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.rsi_sell_min",
+                    25,
+                ),
+                25.0,
+            ),
+            "rsi_sell_max": to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.rsi_sell_max",
+                    45,
+                ),
+                45.0,
+            ),
+            "min_profit_eur": to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.min_profit_eur",
+                    0.05,
+                ),
+                0.05,
+            ),
+            "min_atr_pct": to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.min_atr_pct",
+                    0.30,
+                ),
+                0.30,
+            ),
+            "atr_tp_mult": to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.atr_tp_mult",
+                    2.4,
+                ),
+                2.4,
+            ),
+            "atr_sl_mult": to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.atr_sl_mult",
+                    1.2,
+                ),
+                1.2,
+            ),
+        }
+
+        replace_existing = False
+
+        if path.exists():
+            try:
+                with path.open(
+                    "r",
+                    encoding="utf-8",
+                ) as file:
+                    existing = json.load(file)
+
+                existing_settings = (
+                    existing.get("settings")
+                    or {}
+                )
+
+                existing_version = str(
+                    existing_settings.get(
+                        "strategy_version"
+                    )
+                    or ""
+                ).strip()
+
+                existing_start = int(
+                    existing.get(
+                        "start_short_trades",
+                        start_short_trades,
+                    )
+                    or 0
+                )
+
+                test_has_started = (
+                    start_short_trades > existing_start
+                    or self.short_positions_count() > 0
+                )
+
+                if existing_version == strategy_version:
+                    return
+
+                if test_has_started:
+                    self.short_strategy_baseline_mismatch = True
+
+                    LOG.error(
+                        "PAPER-SHORTTEST GEBLOKKEERD | "
+                        "baseline strategie=%s | config strategie=%s | "
+                        "gesloten shorts=%d | open shorts=%d",
+                        existing_version or "onbekend",
+                        strategy_version,
+                        start_short_trades - existing_start,
+                        self.short_positions_count(),
+                    )
+
+                    return
+
+                replace_existing = True
+
+            except Exception as exc:
+                self.short_strategy_baseline_mismatch = True
+
+                LOG.error(
+                    "PAPER-SHORTTEST GEBLOKKEERD | "
+                    "bestaande baseline kon niet veilig worden gelezen: %s",
+                    exc,
+                )
+
+                return
+
         baseline = {
             "started_at": now_iso(),
             "start_short_trades": start_short_trades,
@@ -824,74 +1014,7 @@ class Bot:
                 start_short_trades
                 + target_new
             ),
-            "settings": {
-                "paper_only": True,
-                "symbols": self.scanned_symbols(),
-                "timeframe": get_cfg(
-                    self.cfg,
-                    "timeframe",
-                    "15m",
-                ),
-                "max_open_positions": (
-                    self.max_open_short_positions()
-                ),
-                "margin_per_trade": to_float(
-                    get_cfg(
-                        self.cfg,
-                        "short.margin_per_trade",
-                        30,
-                    ),
-                    30.0,
-                ),
-                "leverage": to_float(
-                    get_cfg(
-                        self.cfg,
-                        "short.leverage",
-                        1,
-                    ),
-                    1.0,
-                ),
-                "rsi_sell_max": to_float(
-                    get_cfg(
-                        self.cfg,
-                        "short.rsi_sell_max",
-                        40,
-                    ),
-                    40.0,
-                ),
-                "min_profit_eur": to_float(
-                    get_cfg(
-                        self.cfg,
-                        "short.min_profit_eur",
-                        0.05,
-                    ),
-                    0.05,
-                ),
-                "min_atr_pct": to_float(
-                    get_cfg(
-                        self.cfg,
-                        "short.min_atr_pct",
-                        0.30,
-                    ),
-                    0.30,
-                ),
-                "atr_tp_mult": to_float(
-                    get_cfg(
-                        self.cfg,
-                        "short.atr_tp_mult",
-                        2.4,
-                    ),
-                    2.4,
-                ),
-                "atr_sl_mult": to_float(
-                    get_cfg(
-                        self.cfg,
-                        "short.atr_sl_mult",
-                        1.2,
-                    ),
-                    1.2,
-                ),
-            },
+            "settings": settings,
         }
 
         with tempfile.NamedTemporaryFile(
@@ -909,16 +1032,21 @@ class Bot:
             temporary_name = temporary.name
 
         try:
-            # Niet overschrijven als een ander proces het bestand
-            # precies tegelijk heeft aangemaakt.
-            if not path.exists():
+            if not path.exists() or replace_existing:
                 os.replace(
                     temporary_name,
                     path,
                 )
+
                 LOG.info(
-                    "PAPER-SHORT NULMETING OPGESLAGEN | "
-                    "start=%d | doel=%d | bestand=%s",
+                    "PAPER-SHORT NULMETING %s | "
+                    "strategie=%s | start=%d | doel=%d | bestand=%s",
+                    (
+                        "VERNIEUWD"
+                        if replace_existing
+                        else "OPGESLAGEN"
+                    ),
+                    strategy_version,
                     start_short_trades,
                     start_short_trades + target_new,
                     self.short_test_baseline_file,
@@ -927,6 +1055,7 @@ class Bot:
                 os.unlink(
                     temporary_name
                 )
+
         except Exception:
             try:
                 os.unlink(
@@ -934,6 +1063,7 @@ class Bot:
                 )
             except OSError:
                 pass
+
             raise
 
     def short_test_status(self) -> Dict[str, Any]:
@@ -1313,48 +1443,507 @@ class Bot:
             return "trend_break"
         return None
 
-    def short_entry_signal(self, symbol: str) -> Optional[Dict[str, Any]]:
-        df = self.fetch_ohlcv_df(symbol)
-        sma_fast = int(to_float(get_cfg(self.cfg, "short.sma_fast", 20), 20))
-        sma_slow = int(to_float(get_cfg(self.cfg, "short.sma_slow", 60), 60))
-        rsi_len = int(to_float(get_cfg(self.cfg, "short.rsi_len", 14), 14))
-        atr_len = int(to_float(get_cfg(self.cfg, "short.atr_len", 14), 14))
-        df = enrich_indicators(df, sma_fast, sma_slow, rsi_len, atr_len)
-        if len(df) < max(sma_slow + 2, 80):
-            return None
+    def short_entry_diagnostics(
+        self,
+        symbol: str,
+    ) -> Dict[str, Any]:
+        """
+        Geeft alle paper-shortvoorwaarden terug.
+
+        Een short kan starten bij:
+        1. een nieuwe bearish SMA-kruising; of
+        2. een bestaande dalende trend met een nieuwe neerwaartse
+           uitbraak onder het recente dieptepunt.
+
+        Alleen volledig afgesloten candles worden gebruikt wanneer de bot
+        via closed_candle_runner.py draait.
+        """
+        df = self.fetch_ohlcv_df(
+            symbol
+        )
+
+        sma_fast = max(
+            2,
+            int(
+                to_float(
+                    get_cfg(
+                        self.cfg,
+                        "short.sma_fast",
+                        20,
+                    ),
+                    20,
+                )
+            ),
+        )
+
+        sma_slow = max(
+            sma_fast + 1,
+            int(
+                to_float(
+                    get_cfg(
+                        self.cfg,
+                        "short.sma_slow",
+                        60,
+                    ),
+                    60,
+                )
+            ),
+        )
+
+        rsi_len = max(
+            2,
+            int(
+                to_float(
+                    get_cfg(
+                        self.cfg,
+                        "short.rsi_len",
+                        14,
+                    ),
+                    14,
+                )
+            ),
+        )
+
+        atr_len = max(
+            2,
+            int(
+                to_float(
+                    get_cfg(
+                        self.cfg,
+                        "short.atr_len",
+                        14,
+                    ),
+                    14,
+                )
+            ),
+        )
+
+        breakout_lookback = max(
+            2,
+            min(
+                50,
+                int(
+                    to_float(
+                        get_cfg(
+                            self.cfg,
+                            "short.breakout_lookback_candles",
+                            8,
+                        ),
+                        8,
+                    )
+                ),
+            ),
+        )
+
+        df = enrich_indicators(
+            df,
+            sma_fast,
+            sma_slow,
+            rsi_len,
+            atr_len,
+        )
+
+        required_rows = max(
+            sma_slow + 2,
+            breakout_lookback + 2,
+            80,
+        )
+
+        if len(df) < required_rows:
+            return {
+                "symbol": symbol,
+                "signal": False,
+                "entry_trigger": "",
+                "blockers": [
+                    (
+                        f"onvoldoende candles: "
+                        f"{len(df)}/{required_rows}"
+                    )
+                ],
+            }
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
-        fast_now = to_float(last["sma_fast"], 0.0)
-        slow_now = to_float(last["sma_slow"], 0.0)
-        fast_prev = to_float(prev["sma_fast"], 0.0)
-        slow_prev = to_float(prev["sma_slow"], 0.0)
-        close_now = to_float(last["close"], 0.0)
-        rsi_now = to_float(last["rsi"], 50.0)
-        atr_now = to_float(last["atr"], 0.0)
-        atr_pct = to_float(last["atr_pct"], 0.0)
 
-        use_sma = to_bool(get_cfg(self.cfg, "short.use_sma", True), True)
-        use_rsi = to_bool(get_cfg(self.cfg, "short.use_rsi", True), True)
-        use_atr_filter = to_bool(get_cfg(self.cfg, "short.use_atr_filter", True), True)
+        fast_now = to_float(
+            last["sma_fast"],
+            0.0,
+        )
 
-        cross_down = fast_prev >= slow_prev and fast_now < slow_now
-        trend_ok = fast_now < slow_now and close_now < fast_now
-        sma_ok = (cross_down and trend_ok) if use_sma else True
-        rsi_max = to_float(get_cfg(self.cfg, "short.rsi_sell_max", 40), 40.0)
-        rsi_ok = (rsi_now <= rsi_max) if use_rsi else True
-        min_atr_pct = to_float(get_cfg(self.cfg, "short.min_atr_pct", 0.30), 0.30)
-        atr_filter_ok = (atr_pct >= min_atr_pct) if use_atr_filter else True
+        slow_now = to_float(
+            last["sma_slow"],
+            0.0,
+        )
 
-        if sma_ok and rsi_ok and atr_filter_ok and atr_now > 0:
-            tp_mult = to_float(get_cfg(self.cfg, "short.atr_tp_mult", 2.3), 2.3)
-            sl_mult = to_float(get_cfg(self.cfg, "short.atr_sl_mult", 1.1), 1.1)
-            return {
-                "close": close_now, "atr": atr_now, "rsi": rsi_now, "atr_pct": atr_pct,
-                "stop_loss": close_now + atr_now * sl_mult,
-                "take_profit": close_now - atr_now * tp_mult,
-            }
-        return None
+        fast_prev = to_float(
+            prev["sma_fast"],
+            0.0,
+        )
+
+        slow_prev = to_float(
+            prev["sma_slow"],
+            0.0,
+        )
+
+        close_now = to_float(
+            last["close"],
+            0.0,
+        )
+
+        rsi_now = to_float(
+            last["rsi"],
+            50.0,
+        )
+
+        atr_now = to_float(
+            last["atr"],
+            0.0,
+        )
+
+        atr_pct = to_float(
+            last["atr_pct"],
+            0.0,
+        )
+
+        recent_window = df.iloc[
+            -(breakout_lookback + 1):-1
+        ]
+
+        recent_low = to_float(
+            pd.to_numeric(
+                recent_window["low"],
+                errors="coerce",
+            ).min(),
+            0.0,
+        )
+
+        use_sma = to_bool(
+            get_cfg(
+                self.cfg,
+                "short.use_sma",
+                True,
+            ),
+            True,
+        )
+
+        use_rsi = to_bool(
+            get_cfg(
+                self.cfg,
+                "short.use_rsi",
+                True,
+            ),
+            True,
+        )
+
+        use_atr_filter = to_bool(
+            get_cfg(
+                self.cfg,
+                "short.use_atr_filter",
+                True,
+            ),
+            True,
+        )
+
+        allow_crossover = to_bool(
+            get_cfg(
+                self.cfg,
+                "short.allow_crossover_entry",
+                True,
+            ),
+            True,
+        )
+
+        allow_breakout = to_bool(
+            get_cfg(
+                self.cfg,
+                "short.allow_breakout_entry",
+                True,
+            ),
+            True,
+        )
+
+        require_fast_falling = to_bool(
+            get_cfg(
+                self.cfg,
+                "short.require_fast_sma_falling",
+                True,
+            ),
+            True,
+        )
+
+        cross_down = (
+            fast_prev >= slow_prev
+            and fast_now < slow_now
+        )
+
+        trend_ok = (
+            fast_now < slow_now
+            and close_now < fast_now
+        )
+
+        fast_falling = (
+            fast_now < fast_prev
+        )
+
+        breakout_down = (
+            recent_low > 0
+            and close_now < recent_low
+        )
+
+        crossover_trigger = (
+            allow_crossover
+            and cross_down
+            and trend_ok
+        )
+
+        breakout_trigger = (
+            allow_breakout
+            and trend_ok
+            and breakout_down
+            and (
+                fast_falling
+                or not require_fast_falling
+            )
+        )
+
+        entry_trigger = ""
+
+        if not use_sma:
+            entry_trigger = (
+                "sma_filter_disabled"
+            )
+        elif crossover_trigger:
+            entry_trigger = (
+                "bearish_crossover"
+            )
+        elif breakout_trigger:
+            entry_trigger = (
+                "bearish_breakout"
+            )
+
+        rsi_min = to_float(
+            get_cfg(
+                self.cfg,
+                "short.rsi_sell_min",
+                25,
+            ),
+            25.0,
+        )
+
+        rsi_max = to_float(
+            get_cfg(
+                self.cfg,
+                "short.rsi_sell_max",
+                45,
+            ),
+            45.0,
+        )
+
+        if rsi_min > rsi_max:
+            rsi_min, rsi_max = (
+                rsi_max,
+                rsi_min,
+            )
+
+        rsi_ok = (
+            rsi_min <= rsi_now <= rsi_max
+            if use_rsi
+            else True
+        )
+
+        min_atr_pct = to_float(
+            get_cfg(
+                self.cfg,
+                "short.min_atr_pct",
+                0.30,
+            ),
+            0.30,
+        )
+
+        atr_filter_ok = (
+            atr_pct >= min_atr_pct
+            if use_atr_filter
+            else True
+        )
+
+        atr_valid = atr_now > 0
+
+        blockers: List[str] = []
+
+        if use_sma and not entry_trigger:
+            if not trend_ok:
+                blockers.append(
+                    "trend is niet volledig bearish"
+                )
+
+            if (
+                allow_crossover
+                and not cross_down
+            ):
+                blockers.append(
+                    "geen nieuwe bearish SMA-kruising"
+                )
+
+            if (
+                allow_breakout
+                and not breakout_down
+            ):
+                blockers.append(
+                    (
+                        "geen slot onder recent dieptepunt "
+                        f"({recent_low:.8f})"
+                    )
+                )
+
+            if (
+                allow_breakout
+                and require_fast_falling
+                and not fast_falling
+            ):
+                blockers.append(
+                    "snelle SMA daalt niet"
+                )
+
+        if not rsi_ok:
+            blockers.append(
+                (
+                    f"RSI {rsi_now:.2f} buiten "
+                    f"{rsi_min:.2f}-{rsi_max:.2f}"
+                )
+            )
+
+        if not atr_filter_ok:
+            blockers.append(
+                (
+                    f"ATR {atr_pct:.3f}% lager dan "
+                    f"{min_atr_pct:.3f}%"
+                )
+            )
+
+        if not atr_valid:
+            blockers.append(
+                "ATR is ongeldig"
+            )
+
+        signal_ok = bool(
+            entry_trigger
+            and rsi_ok
+            and atr_filter_ok
+            and atr_valid
+        )
+
+        return {
+            "symbol": symbol,
+            "signal": signal_ok,
+            "entry_trigger": entry_trigger,
+            "close": close_now,
+            "atr": atr_now,
+            "atr_pct": atr_pct,
+            "rsi": rsi_now,
+            "rsi_min": rsi_min,
+            "rsi_max": rsi_max,
+            "sma_fast": fast_now,
+            "sma_slow": slow_now,
+            "cross_down": cross_down,
+            "trend_ok": trend_ok,
+            "fast_sma_falling": fast_falling,
+            "breakout_down": breakout_down,
+            "breakout_lookback_candles": breakout_lookback,
+            "breakout_level": recent_low,
+            "min_atr_pct": min_atr_pct,
+            "blockers": blockers,
+            "last_candle": str(
+                last.get(
+                    "ts",
+                    "",
+                )
+            ),
+        }
+
+    def short_entry_signal(
+        self,
+        symbol: str,
+    ) -> Optional[Dict[str, Any]]:
+        diagnostics = (
+            self.short_entry_diagnostics(
+                symbol
+            )
+        )
+
+        if not diagnostics.get(
+            "signal",
+            False,
+        ):
+            return None
+
+        close_now = to_float(
+            diagnostics.get(
+                "close"
+            ),
+            0.0,
+        )
+
+        atr_now = to_float(
+            diagnostics.get(
+                "atr"
+            ),
+            0.0,
+        )
+
+        tp_mult = to_float(
+            get_cfg(
+                self.cfg,
+                "short.atr_tp_mult",
+                2.4,
+            ),
+            2.4,
+        )
+
+        sl_mult = to_float(
+            get_cfg(
+                self.cfg,
+                "short.atr_sl_mult",
+                1.2,
+            ),
+            1.2,
+        )
+
+        return {
+            "close": close_now,
+            "atr": atr_now,
+            "rsi": to_float(
+                diagnostics.get(
+                    "rsi"
+                ),
+                0.0,
+            ),
+            "atr_pct": to_float(
+                diagnostics.get(
+                    "atr_pct"
+                ),
+                0.0,
+            ),
+            "entry_trigger": str(
+                diagnostics.get(
+                    "entry_trigger"
+                )
+                or "paper_short_entry"
+            ),
+            "breakout_level": to_float(
+                diagnostics.get(
+                    "breakout_level"
+                ),
+                0.0,
+            ),
+            "stop_loss": (
+                close_now
+                + atr_now * sl_mult
+            ),
+            "take_profit": (
+                close_now
+                - atr_now * tp_mult
+            ),
+        }
 
     def short_exit_signal(self, symbol: str, position: Dict[str, Any]) -> Optional[str]:
         df = self.fetch_ohlcv_df(symbol)
@@ -2012,8 +2601,37 @@ class Bot:
 
         ticker = self.get_ticker(symbol)
         bid = to_float(ticker.get("bid"), 0.0)
+
         if bid <= 0:
             return
+
+        spread_pct = self.estimate_spread_pct(
+            ticker
+        )
+
+        max_spread_pct = to_float(
+            get_cfg(
+                self.cfg,
+                "max_spread_pct",
+                0.25,
+            ),
+            0.25,
+        )
+
+        if spread_pct > max_spread_pct:
+            self.rate_limited_info(
+                self.last_skip_log_ts,
+                f"short_spread:{symbol}",
+                600,
+                "PAPER SHORT OVERSLAAN %s | "
+                "spread=%.4f%% > max=%.4f%%",
+                symbol,
+                spread_pct,
+                max_spread_pct,
+            )
+
+            return
+
         leverage = max(1.0, to_float(get_cfg(self.cfg, "short.leverage", 2), 2.0))
         margin_per_trade = to_float(get_cfg(self.cfg, "short.margin_per_trade", 30), 30.0)
         quote_amount = margin_per_trade * leverage
@@ -2026,6 +2644,10 @@ class Bot:
             "amount": amount, "margin_quote": margin_per_trade, "leverage": leverage,
             "quote_amount": quote_amount, "fees_open_quote": fee_open_quote,
             "stop_loss": signal["stop_loss"], "take_profit": signal["take_profit"],
+            "entry_trigger": signal.get("entry_trigger", "paper_short_entry"),
+            "entry_rsi": signal.get("rsi"),
+            "entry_atr_pct": signal.get("atr_pct"),
+            "breakout_level": signal.get("breakout_level"),
         }
         save_state(self.state_file, self.state)
         append_trade_csv(self.trades_file, {
@@ -2034,10 +2656,32 @@ class Bot:
             "quote_amount": round(quote_amount, 8), "fees_quote": round(fee_open_quote, 8),
             "spread_pct": round(self.estimate_spread_pct(ticker), 6),
             "net_pnl_quote": "", "holding_time_min": "",
-            "reason": "paper_short_entry", "dry_run": True,
+            "reason": (
+                "paper_short_"
+                + str(
+                    signal.get(
+                        "entry_trigger",
+                        "entry",
+                    )
+                )
+            ),
+            "dry_run": True,
         })
-        LOG.info("PAPER SHORT OPEN %s | prijs=%.8f amount=%s notional=%.2f %s lev=%.2f",
-                 symbol, bid, amount, quote_amount, self.quote, leverage)
+        LOG.info(
+            "PAPER SHORT OPEN %s | trigger=%s | prijs=%.8f | "
+            "amount=%s | notional=%.2f %s | lev=%.2f | "
+            "RSI=%.2f | ATR=%.3f%% | spread=%.4f%%",
+            symbol,
+            signal.get("entry_trigger", "onbekend"),
+            bid,
+            amount,
+            quote_amount,
+            self.quote,
+            leverage,
+            to_float(signal.get("rsi"), 0.0),
+            to_float(signal.get("atr_pct"), 0.0),
+            spread_pct,
+        )
 
     def close_paper_short(self, symbol: str, position: Dict[str, Any], reason: str) -> None:
         ticker = self.get_ticker(symbol)
@@ -2311,7 +2955,7 @@ def main() -> None:
     cfg = load_yaml(cfg_path)
     setup_logging(str(get_cfg(cfg, "log_level", "INFO")))
     bot = Bot(cfg)
-    LOG.info("Diamond Bot v6.3 gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
+    LOG.info("Diamond Bot v6.4 gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
     bot.run_forever()
 
 

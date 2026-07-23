@@ -316,7 +316,7 @@ def run_bot() -> None:
     )
 
     diamond_bot.LOG.info(
-        "Diamond Bot v6.3 gestart | "
+        "Diamond Bot v6.4 gestart | "
         "closed_candles=True | "
         "dry_run=%s | state=%s | "
         "trades=%s | control=%s",
