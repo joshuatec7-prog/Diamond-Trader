@@ -13,7 +13,7 @@ symbols:
   - ADA/EUR
 
 trading:
-  enable_spot: true
+  enable_spot: false
 
   # Alleen gesimuleerde shortposities. Diamond Trader bevat geen code
   # die hiervoor echte short- of marginorders plaatst.
