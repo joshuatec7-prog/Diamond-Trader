@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Readiness Gate v1.0
+Diamond Readiness Gate v1.1
 
 Centrale, uitsluitend lezende gereedheidscontrole voor Diamond Trader.
 
@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 
-VERSION = "1.0"
+VERSION = "1.1"
 MODE = "READ_ONLY_READINESS_GATE"
 
 DATA_DIR = Path(
@@ -120,6 +120,13 @@ SCANNER_STATE_FILE = Path(
     os.getenv(
         "MARKET_SCANNER_STATE_FILE",
         str(DATA_DIR / "diamond_market_scanner_state.json"),
+    ).strip()
+)
+
+SCANNER_REPORT_FILE = Path(
+    os.getenv(
+        "MARKET_SCANNER_REPORT_FILE",
+        str(DATA_DIR / "diamond_market_signals.json"),
     ).strip()
 )
 
@@ -888,8 +895,12 @@ def build_report() -> Dict[str, Any]:
         SUPERVISOR_STATE_FILE
     )
 
-    scanner, scanner_error = load_json(
+    scanner_state, scanner_state_error = load_json(
         SCANNER_STATE_FILE
+    )
+
+    scanner_report, scanner_report_error = load_json(
+        SCANNER_REPORT_FILE
     )
 
     strategy_lab, lab_error = load_json(
@@ -999,32 +1010,33 @@ def build_report() -> Dict[str, Any]:
         ),
     )
 
+    # De scanner bewaart voortgang in het statebestand, maar de
+    # modus en veiligheidsverklaring in diamond_market_signals.json.
     scanner_safety = (
-        scanner.get(
+        scanner_report.get(
             "safety"
         )
         or {}
     )
 
     scanner_mode = str(
-        scanner.get(
+        scanner_report.get(
             "mode"
         )
         or ""
     ).strip()
 
     scanner_orders_impossible = (
-        scanner_safety.get(
+        scanner_report_error is None
+        and scanner_safety.get(
             "orders_possible"
         )
         is False
-        or (
+        and (
             "SHADOW"
             in scanner_mode.upper()
-            and scanner_safety.get(
-                "orders_possible"
-            )
-            is not True
+            or "VIRTUAL"
+            in scanner_mode.upper()
         )
     )
 
@@ -1033,15 +1045,12 @@ def build_report() -> Dict[str, Any]:
         "scanner_orders_impossible",
         "veiligheid",
         "critical",
-        (
-            scanner_error is None
-            and scanner_orders_impossible
-        ),
+        scanner_orders_impossible,
         (
             f"scanner mode={scanner_mode or '-'}; orders_possible="
             f"{scanner_safety.get('orders_possible')}"
-            if scanner_error is None
-            else scanner_error
+            if scanner_report_error is None
+            else scanner_report_error
         ),
     )
 
@@ -1164,8 +1173,13 @@ def build_report() -> Dict[str, Any]:
         ),
         (
             "diagnose_recent",
-            diagnose.get(
-                "last_round"
+            (
+                diagnose.get(
+                    "last_round_at"
+                )
+                or diagnose.get(
+                    "last_round"
+                )
             ),
             MAX_DIAGNOSE_AGE_MINUTES,
             diagnose_error,
@@ -1180,11 +1194,20 @@ def build_report() -> Dict[str, Any]:
         ),
         (
             "scanner_recent",
-            scanner.get(
-                "last_scan_at"
+            (
+                scanner_state.get(
+                    "last_scan_at"
+                )
+                or scanner_report.get(
+                    "generated_at"
+                )
             ),
             MAX_SCANNER_AGE_MINUTES,
-            scanner_error,
+            (
+                scanner_state_error
+                if scanner_state_error is not None
+                else scanner_report_error
+            ),
         ),
         (
             "strategy_lab_recent",

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.8
+# Diamond Trader Healthcheck v7.9
 # Alleen lezen: wijzigt geen bot-, test-, scanner-, Strategy Lab- of Readiness-bestanden.
 
 set -u
@@ -1064,7 +1064,7 @@ print(f"        Nog nodig          : {remaining}")
 print(f"        Rapportfouten      : {len(errors)}")
 print(f"        Alleen-lezen       : {'JA' if safe else 'NEE'}")
 
-if report.get("version") != "1.0":
+if report.get("version") != "1.1":
     print("[FOUT]  Onverwachte Strategy Lab-versie")
     raise SystemExit(1)
 
