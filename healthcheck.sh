@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.7
-# Alleen lezen: wijzigt geen bot-, test-, scanner- of Strategy Lab-bestanden.
+# Diamond Trader Healthcheck v7.8
+# Alleen lezen: wijzigt geen bot-, test-, scanner-, Strategy Lab- of Readiness-bestanden.
 
 set -u
 
@@ -33,6 +33,11 @@ SHADOW_MILESTONE_10_JSON="$DATA_DIR/diamond_market_shadow_milestone_10.json"
 SHADOW_MILESTONE_10_TEXT="$DATA_DIR/diamond_market_shadow_milestone_10.txt"
 SHADOW_MILESTONE_20_JSON="$DATA_DIR/diamond_market_shadow_milestone_20.json"
 SHADOW_MILESTONE_20_TEXT="$DATA_DIR/diamond_market_shadow_milestone_20.txt"
+
+READINESS_GATE_JSON_FILE="$DATA_DIR/diamond_readiness_gate.json"
+READINESS_GATE_TEXT_FILE="$DATA_DIR/diamond_readiness_gate.txt"
+FINAL_VALIDATION_FILE="$DATA_DIR/diamond_final_validation.json"
+LIVE_APPROVAL_FILE="$DATA_DIR/diamond_live_approval.json"
 
 BACKUP_DIR="$DATA_DIR/backups"
 
@@ -132,6 +137,7 @@ for file_name in \
     short_diagnose.py \
     market_scanner.py \
     strategy_lab.py \
+    readiness_gate.py \
     requirements.txt \
     start.sh \
     healthcheck.sh \
@@ -349,6 +355,46 @@ print(
     "        Watchfout        : "
     f"{data.get('scanner_watch_last_error') or '-'}"
 )
+print(
+    "        Readiness-runs   : "
+    f"{int(data.get('readiness_gate_runs', 0) or 0)}"
+)
+print(
+    "        Readiness-status : "
+    f"{data.get('readiness_gate_last_status') or '-'}"
+)
+print(
+    "        Readiness-fase   : "
+    f"{data.get('readiness_gate_last_phase') or '-'}"
+)
+print(
+    "        Testvoortgang    : "
+    f"{float(data.get('readiness_gate_test_completion_pct', 0) or 0):.1f}%"
+)
+print(
+    "        Readiness kritiek: "
+    f"{int(data.get('readiness_gate_critical_count', 0) or 0)}"
+)
+print(
+    "        Readiness waars. : "
+    f"{int(data.get('readiness_gate_warning_count', 0) or 0)}"
+)
+print(
+    "        Readiness stap   : "
+    f"{data.get('readiness_gate_last_next_step') or '-'}"
+)
+print(
+    "        Readiness-mail   : "
+    f"{int(data.get('readiness_gate_email_count', 0) or 0)}"
+)
+print(
+    "        Laatste gate-mail: "
+    f"{data.get('readiness_gate_last_email_at') or '-'}"
+)
+print(
+    "        Readiness-fout   : "
+    f"{data.get('readiness_gate_last_error') or '-'}"
+)
 print(f"        Laatste back-up   : {data.get('last_backup_at') or '-'}")
 print(f"        Back-upstatus     : {data.get('last_backup_status') or '-'}")
 
@@ -372,6 +418,20 @@ watch_status = str(
 
 if watch_status == "FOUT":
     print("        [FOUT] Laatste Scannerwatch-controle is mislukt")
+    raise SystemExit(1)
+
+readiness_error = str(
+    data.get(
+        "readiness_gate_last_error"
+    )
+    or ""
+).strip()
+
+if readiness_error:
+    print(
+        "        [FOUT] Laatste Readiness Gate-run is mislukt: "
+        f"{readiness_error}"
+    )
     raise SystemExit(1)
 PY
     then
@@ -895,6 +955,17 @@ else
     ERRORS=$((ERRORS + 1))
 fi
 
+if \
+    grep -q "def refresh_readiness_gate" "$PROJECT_DIR/agent.py" \
+    && grep -q "def append_readiness_gate_status" "$PROJECT_DIR/agent.py" \
+    && grep -q "Readiness Gate: centrale alleen-lezen gereedheidscontrole" "$PROJECT_DIR/agent.py"
+then
+    echo "[OK]    Readiness Gate is gekoppeld aan Agent, statusmail en weekrapport"
+else
+    echo "[FOUT]  Readiness Gate-integratie ontbreekt of is onvolledig"
+    ERRORS=$((ERRORS + 1))
+fi
+
 if [ -f "$STRATEGY_LAB_JSON_FILE" ]; then
     if ! python3 - \
         "$STRATEGY_LAB_JSON_FILE" \
@@ -1159,13 +1230,235 @@ do
 done
 
 echo
-echo "14. SCHIJFRUIMTE"
+echo "14. READINESS GATE"
+echo "------------------------------------------------------------"
+
+file_info "$READINESS_GATE_JSON_FILE" "Readiness Gate JSON" "true"
+file_info "$READINESS_GATE_TEXT_FILE" "Readiness Gate tekstrapport" "true"
+
+if [ -f "$PROJECT_DIR/readiness_gate.py" ]; then
+    if python3 -m py_compile "$PROJECT_DIR/readiness_gate.py" 2>/dev/null; then
+        echo "[OK]    Readiness Gate Pythoncontrole geslaagd"
+    else
+        echo "[FOUT]  Readiness Gate Pythoncontrole mislukt"
+        ERRORS=$((ERRORS + 1))
+    fi
+
+    if python3 "$PROJECT_DIR/readiness_gate.py" --self-test 2>/dev/null | grep -q "READINESS_GATE_SELF_TEST_OK"; then
+        echo "[OK]    Readiness Gate interne statustest geslaagd"
+    else
+        echo "[FOUT]  Readiness Gate interne statustest mislukt"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+if [ -f "$READINESS_GATE_JSON_FILE" ]; then
+    if ! python3 - "$READINESS_GATE_JSON_FILE" "$NOW_EPOCH" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+now_epoch = int(sys.argv[2])
+
+try:
+    report = json.loads(
+        path.read_text(
+            encoding="utf-8"
+        )
+    )
+except Exception as exc:
+    print(f"[FOUT]  Readiness Gate JSON lezen mislukt: {exc}")
+    raise SystemExit(1)
+
+if not isinstance(report, dict):
+    print("[FOUT]  Readiness Gate JSON bevat geen object")
+    raise SystemExit(1)
+
+try:
+    generated = datetime.fromisoformat(
+        str(
+            report.get(
+                "generated_at"
+            )
+        ).replace(
+            "Z",
+            "+00:00",
+        )
+    )
+
+    if generated.tzinfo is None:
+        generated = generated.replace(
+            tzinfo=timezone.utc
+        )
+
+    generated = generated.astimezone(
+        timezone.utc
+    )
+
+except Exception:
+    print("[FOUT]  Readiness Gate heeft geen geldige genereertijd")
+    raise SystemExit(1)
+
+age_minutes = max(
+    0.0,
+    (
+        datetime.fromtimestamp(
+            now_epoch,
+            tz=timezone.utc,
+        )
+        - generated
+    ).total_seconds()
+    / 60.0,
+)
+
+progress = (
+    report.get(
+        "test_progress"
+    )
+    or {}
+)
+
+long_progress = (
+    progress.get(
+        "long"
+    )
+    or {}
+)
+
+short_progress = (
+    progress.get(
+        "paper_short"
+    )
+    or {}
+)
+
+shadow_progress = (
+    progress.get(
+        "shadow"
+    )
+    or {}
+)
+
+safety = (
+    report.get(
+        "safety"
+    )
+    or {}
+)
+
+safe = (
+    safety.get(
+        "orders_possible"
+    )
+    is False
+    and safety.get(
+        "exchange_connection_used"
+    )
+    is False
+    and safety.get(
+        "bot_state_modified"
+    )
+    is False
+    and safety.get(
+        "control_state_modified"
+    )
+    is False
+    and safety.get(
+        "scanner_state_modified"
+    )
+    is False
+    and safety.get(
+        "settings_modified"
+    )
+    is False
+    and safety.get(
+        "automatic_live_activation"
+    )
+    is False
+    and safety.get(
+        "manual_live_approval_required"
+    )
+    is True
+)
+
+print("[OK]    Readiness Gate rapport leesbaar")
+print(f"        Versie             : {report.get('version') or '-'}")
+print(f"        Modus              : {report.get('mode') or '-'}")
+print(f"        Gegenereerd        : {report.get('generated_at') or '-'}")
+print(f"        Leeftijd rapport   : {age_minutes:.1f} minuten")
+print(f"        Centrale status    : {report.get('status') or '-'}")
+print(f"        Huidige fase       : {report.get('phase') or '-'}")
+print(f"        Testvoortgang      : {float(report.get('test_completion_pct', 0) or 0):.1f}%")
+print(
+    "        Longtest          : "
+    f"{int(long_progress.get('completed', 0) or 0)}/"
+    f"{int(long_progress.get('target', 20) or 20)}"
+)
+print(
+    "        Paper-shorttest   : "
+    f"{int(short_progress.get('completed', 0) or 0)}/"
+    f"{int(short_progress.get('target', 20) or 20)}"
+)
+print(
+    "        Schaduwtest       : "
+    f"{int(shadow_progress.get('completed', 0) or 0)}/"
+    f"{int(shadow_progress.get('target', 20) or 20)}"
+)
+print(f"        Kritieke problemen: {int(report.get('critical_failure_count', 0) or 0)}")
+print(f"        Waarschuwingen     : {int(report.get('warning_count', 0) or 0)}")
+print(f"        Volgende stap      : {report.get('next_step') or '-'}")
+print(f"        Alleen-lezen       : {'JA' if safe else 'NEE'}")
+print("        Automatisch live   : NEE")
+
+if report.get("version") != "1.0":
+    print("[FOUT]  Onverwachte Readiness Gate-versie")
+    raise SystemExit(1)
+
+if report.get("mode") != "READ_ONLY_READINESS_GATE":
+    print("[FOUT]  Onverwachte Readiness Gate-modus")
+    raise SystemExit(1)
+
+if not safe:
+    print("[FOUT]  Readiness Gate is niet volledig alleen-lezen")
+    raise SystemExit(1)
+
+if age_minutes > 35.0:
+    print("[FOUT]  Readiness Gate-rapport is ouder dan 35 minuten")
+    raise SystemExit(1)
+
+if int(report.get("critical_failure_count", 0) or 0) > 0:
+    print("[FOUT]  Readiness Gate meldt één of meer kritieke problemen")
+    raise SystemExit(1)
+
+print("[OK]    Readiness Gate is actueel en veilig")
+PY
+    then
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+if [ -f "$FINAL_VALIDATION_FILE" ]; then
+    echo "[OK]    Definitieve eindtestregistratie aanwezig"
+else
+    echo "[INFO]  Definitieve eindtestregistratie nog niet verwacht"
+fi
+
+if [ -f "$LIVE_APPROVAL_FILE" ]; then
+    echo "[OK]    Handmatig live-goedkeuringsbestand aanwezig"
+else
+    echo "[INFO]  Handmatige live-goedkeuring nog niet aanwezig"
+fi
+
+echo
+echo "15. SCHIJFRUIMTE"
 echo "------------------------------------------------------------"
 
 df -h "$DATA_DIR" 2>/dev/null || df -h
 
 echo
-echo "15. EINDCONTROLE"
+echo "16. EINDCONTROLE"
 echo "------------------------------------------------------------"
 
 if [ "$ERRORS" -eq 0 ]; then

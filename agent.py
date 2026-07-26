@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v7.4
+Diamond Agent v7.5
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -23,7 +23,8 @@ Functies:
 - Ververst Strategy Lab direct zodra een schaduwpositie opent of sluit.
 - Neemt Strategy Lab-resultaten op in statusmails en weekrapporten.
 - Waarschuwt bij langdurig geen geschikte schaduwtrade of een dominant afwijzingsfilter.
-- Neemt de Strategy Lab- en schaduwmijlpaalrapporten mee in de dagelijkse back-up.
+- Draait een centrale, alleen-lezen Readiness Gate en mailt statuswijzigingen.
+- Neemt Strategy Lab-, schaduwmijlpaal- en Readiness Gate-rapporten mee in de back-up.
 - Bewaart dagelijkse back-ups 30 dagen en verwijdert alleen oude back-upmappen.
 """
 
@@ -173,6 +174,31 @@ STRATEGY_LAB_SCRIPT_FILE = os.getenv(
     "/opt/render/project/src/strategy_lab.py",
 ).strip()
 
+READINESS_GATE_SCRIPT_FILE = os.getenv(
+    "READINESS_GATE_SCRIPT_FILE",
+    "/opt/render/project/src/readiness_gate.py",
+).strip()
+
+READINESS_GATE_JSON_FILE = os.getenv(
+    "READINESS_GATE_JSON_FILE",
+    "/var/data/diamond_readiness_gate.json",
+).strip()
+
+READINESS_GATE_TEXT_FILE = os.getenv(
+    "READINESS_GATE_TEXT_FILE",
+    "/var/data/diamond_readiness_gate.txt",
+).strip()
+
+FINAL_VALIDATION_FILE = os.getenv(
+    "FINAL_VALIDATION_FILE",
+    "/var/data/diamond_final_validation.json",
+).strip()
+
+LIVE_APPROVAL_FILE = os.getenv(
+    "LIVE_APPROVAL_FILE",
+    "/var/data/diamond_live_approval.json",
+).strip()
+
 BACKUP_DIR = os.getenv(
     "BACKUP_DIR",
     "/var/data/backups",
@@ -261,6 +287,11 @@ SCANNER_WATCH_RETRY_MINUTES = 15
 SCANNER_WATCH_MIN_REJECTED_SIGNALS = 10
 SCANNER_WATCH_DOMINANT_MIN_COUNT = 8
 SCANNER_WATCH_DOMINANT_SHARE_PCT = 60.0
+
+# Centrale gereedheidscontrole.
+READINESS_GATE_CHECK_INTERVAL_SECONDS = 15 * 60
+READINESS_GATE_TIMEOUT_SECONDS = 120
+READINESS_GATE_RETRY_MINUTES = 15
 
 
 # ============================================================
@@ -785,6 +816,22 @@ def default_agent_state() -> Dict[str, Any]:
         "scanner_watch_last_recovery_at": "",
         "scanner_watch_recovery_count": 0,
         "scanner_watch_last_error": "",
+        "last_readiness_gate_ts": 0.0,
+        "readiness_gate_runs": 0,
+        "readiness_gate_last_run_at": "",
+        "readiness_gate_last_status": "",
+        "readiness_gate_last_phase": "",
+        "readiness_gate_last_next_step": "",
+        "readiness_gate_test_completion_pct": 0.0,
+        "readiness_gate_critical_count": 0,
+        "readiness_gate_warning_count": 0,
+        "readiness_gate_last_error": "",
+        "readiness_gate_current_fingerprint": "",
+        "readiness_gate_notified_fingerprint": "",
+        "readiness_gate_last_attempt_fingerprint": "",
+        "readiness_gate_last_attempt_at": "",
+        "readiness_gate_last_email_at": "",
+        "readiness_gate_email_count": 0,
         "last_backup_date": "",
         "last_backup_at": "",
         "last_backup_path": "",
@@ -4022,6 +4069,670 @@ def append_strategy_lab_weekly(
             )
 
 
+# ============================================================
+# Diamond Readiness Gate
+# ============================================================
+
+def load_readiness_gate_summary() -> Dict[str, Any]:
+    report = load_json(
+        READINESS_GATE_JSON_FILE,
+        {},
+    )
+
+    if not isinstance(
+        report,
+        dict,
+    ):
+        report = {}
+
+    generated = parse_iso_datetime(
+        report.get(
+            "generated_at"
+        )
+    )
+
+    age = (
+        max(
+            0.0,
+            (
+                now_local()
+                - generated
+            ).total_seconds()
+            / 60.0,
+        )
+        if generated is not None
+        else None
+    )
+
+    progress = (
+        report.get(
+            "test_progress"
+        )
+        or {}
+    )
+
+    return {
+        "available": bool(
+            report
+        ),
+        "version": report.get(
+            "version"
+        )
+        or "-",
+        "mode": report.get(
+            "mode"
+        )
+        or "-",
+        "generated_at": report.get(
+            "generated_at"
+        ),
+        "generated_text": (
+            generated.strftime(
+                "%d-%m-%Y %H:%M"
+            )
+            if generated is not None
+            else "-"
+        ),
+        "age_minutes": age,
+        "status": report.get(
+            "status"
+        )
+        or "NOG NIET BESCHIKBAAR",
+        "phase": report.get(
+            "phase"
+        )
+        or "-",
+        "next_step": report.get(
+            "next_step"
+        )
+        or "-",
+        "test_completion_pct": to_float(
+            report.get(
+                "test_completion_pct"
+            ),
+            0.0,
+        ),
+        "critical_count": int(
+            to_float(
+                report.get(
+                    "critical_failure_count"
+                ),
+                0.0,
+            )
+        ),
+        "warning_count": int(
+            to_float(
+                report.get(
+                    "warning_count"
+                ),
+                0.0,
+            )
+        ),
+        "long": (
+            progress.get(
+                "long"
+            )
+            or {}
+        ),
+        "paper_short": (
+            progress.get(
+                "paper_short"
+            )
+            or {}
+        ),
+        "shadow": (
+            progress.get(
+                "shadow"
+            )
+            or {}
+        ),
+        "final_validation": (
+            report.get(
+                "final_validation"
+            )
+            or {}
+        ),
+        "live_approval": (
+            report.get(
+                "live_approval"
+            )
+            or {}
+        ),
+        "safety": (
+            report.get(
+                "safety"
+            )
+            or {}
+        ),
+    }
+
+
+def readiness_gate_fingerprint(
+    report: Dict[str, Any],
+) -> str:
+    critical = sorted(
+        str(
+            item.get(
+                "name"
+            )
+            or ""
+        )
+        for item in (
+            report.get(
+                "critical_failures"
+            )
+            or []
+        )
+    )
+
+    warnings = sorted(
+        str(
+            item.get(
+                "name"
+            )
+            or ""
+        )
+        for item in (
+            report.get(
+                "warnings"
+            )
+            or []
+        )
+    )
+
+    payload = {
+        "status": report.get(
+            "status"
+        ),
+        "phase": report.get(
+            "phase"
+        ),
+        "critical": critical,
+        "warnings": warnings,
+    }
+
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def readiness_gate_retry_allowed(
+    agent_state: Dict[str, Any],
+    fingerprint: str,
+) -> bool:
+    if (
+        agent_state.get(
+            "readiness_gate_last_attempt_fingerprint"
+        )
+        != fingerprint
+    ):
+        return True
+
+    attempted = parse_iso_datetime(
+        agent_state.get(
+            "readiness_gate_last_attempt_at"
+        )
+    )
+
+    if attempted is None:
+        return True
+
+    return (
+        now_local()
+        - attempted
+    ).total_seconds() >= (
+        READINESS_GATE_RETRY_MINUTES
+        * 60
+    )
+
+
+def format_readiness_gate_email(
+    report: Dict[str, Any],
+) -> str:
+    text_path = Path(
+        READINESS_GATE_TEXT_FILE
+    )
+
+    if text_path.is_file():
+        try:
+            return text_path.read_text(
+                encoding="utf-8"
+            )
+
+        except Exception:
+            pass
+
+    progress = (
+        report.get(
+            "test_progress"
+        )
+        or {}
+    )
+
+    long_progress = (
+        progress.get(
+            "long"
+        )
+        or {}
+    )
+
+    short_progress = (
+        progress.get(
+            "paper_short"
+        )
+        or {}
+    )
+
+    shadow_progress = (
+        progress.get(
+            "shadow"
+        )
+        or {}
+    )
+
+    return "\n".join([
+        "=" * 68,
+        "DIAMOND TRADER READINESS GATE",
+        "=" * 68,
+        f"Status                  : {report.get('status') or '-'}",
+        f"Fase                    : {report.get('phase') or '-'}",
+        f"Testvoortgang           : {to_float(report.get('test_completion_pct'), 0.0):.1f}%",
+        f"Longtest                : {int(to_float(long_progress.get('completed'), 0.0))}/20",
+        f"Paper-shorttest         : {int(to_float(short_progress.get('completed'), 0.0))}/20",
+        f"Schaduwtest             : {int(to_float(shadow_progress.get('completed'), 0.0))}/20",
+        f"Kritieke problemen      : {int(to_float(report.get('critical_failure_count'), 0.0))}",
+        f"Waarschuwingen          : {int(to_float(report.get('warning_count'), 0.0))}",
+        f"Volgende stap           : {report.get('next_step') or '-'}",
+        "",
+        "Deze controle is uitsluitend adviserend en alleen-lezen.",
+        "Diamond Trader wordt nooit automatisch live gezet.",
+        "=" * 68,
+    ])
+
+
+def refresh_readiness_gate(
+    agent_state: Dict[str, Any],
+    force: bool = False,
+) -> bool:
+    last_run_ts = to_float(
+        agent_state.get(
+            "last_readiness_gate_ts"
+        ),
+        0.0,
+    )
+
+    if (
+        not force
+        and time.time()
+        - last_run_ts
+        < READINESS_GATE_CHECK_INTERVAL_SECONDS
+    ):
+        return False
+
+    agent_state[
+        "last_readiness_gate_ts"
+    ] = time.time()
+
+    agent_state[
+        "readiness_gate_last_run_at"
+    ] = now_local().isoformat()
+
+    save_agent_state(
+        agent_state
+    )
+
+    script = Path(
+        READINESS_GATE_SCRIPT_FILE
+    )
+
+    if not script.is_file():
+        error_text = (
+            f"Readiness Gate-script ontbreekt: {script}"
+        )
+
+        agent_state[
+            "readiness_gate_last_error"
+        ] = error_text
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.error(
+            "%s",
+            error_text,
+        )
+
+        return False
+
+    try:
+        result = subprocess.run(
+            [
+                "python3",
+                str(
+                    script
+                ),
+                "--no-print",
+            ],
+            cwd=str(
+                script.parent
+            ),
+            capture_output=True,
+            text=True,
+            timeout=(
+                READINESS_GATE_TIMEOUT_SECONDS
+            ),
+            check=False,
+        )
+
+    except subprocess.TimeoutExpired:
+        error_text = (
+            "Readiness Gate duurde langer dan "
+            f"{READINESS_GATE_TIMEOUT_SECONDS} seconden"
+        )
+
+        agent_state[
+            "readiness_gate_last_error"
+        ] = error_text
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.error(
+            "%s",
+            error_text,
+        )
+
+        return False
+
+    except Exception as exc:
+        error_text = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        agent_state[
+            "readiness_gate_last_error"
+        ] = error_text
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.exception(
+            "Readiness Gate uitvoeren mislukt: %s",
+            exc,
+        )
+
+        return False
+
+    if result.returncode != 0:
+        output = (
+            result.stderr
+            or result.stdout
+            or "geen fouttekst"
+        ).strip()
+
+        error_text = (
+            f"exitcode {result.returncode}: "
+            f"{output[-1000:]}"
+        )
+
+        agent_state[
+            "readiness_gate_last_error"
+        ] = error_text
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.error(
+            "Readiness Gate uitvoeren mislukt | %s",
+            error_text,
+        )
+
+        return False
+
+    report = load_json(
+        READINESS_GATE_JSON_FILE,
+        {},
+    )
+
+    if not report:
+        error_text = (
+            "Readiness Gate heeft geen leesbaar JSON-rapport gemaakt"
+        )
+
+        agent_state[
+            "readiness_gate_last_error"
+        ] = error_text
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.error(
+            "%s",
+            error_text,
+        )
+
+        return False
+
+    fingerprint = readiness_gate_fingerprint(
+        report
+    )
+
+    agent_state[
+        "readiness_gate_runs"
+    ] = int(
+        to_float(
+            agent_state.get(
+                "readiness_gate_runs"
+            ),
+            0.0,
+        )
+    ) + 1
+
+    agent_state[
+        "readiness_gate_last_status"
+    ] = report.get(
+        "status"
+    ) or "-"
+
+    agent_state[
+        "readiness_gate_last_phase"
+    ] = report.get(
+        "phase"
+    ) or "-"
+
+    agent_state[
+        "readiness_gate_last_next_step"
+    ] = report.get(
+        "next_step"
+    ) or "-"
+
+    agent_state[
+        "readiness_gate_test_completion_pct"
+    ] = to_float(
+        report.get(
+            "test_completion_pct"
+        ),
+        0.0,
+    )
+
+    agent_state[
+        "readiness_gate_critical_count"
+    ] = int(
+        to_float(
+            report.get(
+                "critical_failure_count"
+            ),
+            0.0,
+        )
+    )
+
+    agent_state[
+        "readiness_gate_warning_count"
+    ] = int(
+        to_float(
+            report.get(
+                "warning_count"
+            ),
+            0.0,
+        )
+    )
+
+    agent_state[
+        "readiness_gate_last_error"
+    ] = ""
+
+    agent_state[
+        "readiness_gate_current_fingerprint"
+    ] = fingerprint
+
+    save_agent_state(
+        agent_state
+    )
+
+    LOG.info(
+        "Readiness Gate ververst | status=%s | fase=%s | voortgang=%.1f%%",
+        report.get(
+            "status"
+        ),
+        report.get(
+            "phase"
+        ),
+        to_float(
+            report.get(
+                "test_completion_pct"
+            ),
+            0.0,
+        ),
+    )
+
+    if (
+        agent_state.get(
+            "readiness_gate_notified_fingerprint"
+        )
+        == fingerprint
+    ):
+        return True
+
+    if not readiness_gate_retry_allowed(
+        agent_state,
+        fingerprint,
+    ):
+        return True
+
+    agent_state[
+        "readiness_gate_last_attempt_fingerprint"
+    ] = fingerprint
+
+    agent_state[
+        "readiness_gate_last_attempt_at"
+    ] = now_local().isoformat()
+
+    save_agent_state(
+        agent_state
+    )
+
+    sent = send_email(
+        (
+            "Diamond Readiness Gate - "
+            f"{report.get('status') or 'ONBEKEND'}"
+        ),
+        format_readiness_gate_email(
+            report
+        ),
+    )
+
+    if not sent:
+        return True
+
+    agent_state[
+        "readiness_gate_notified_fingerprint"
+    ] = fingerprint
+
+    agent_state[
+        "readiness_gate_last_email_at"
+    ] = now_local().isoformat()
+
+    agent_state[
+        "readiness_gate_email_count"
+    ] = int(
+        to_float(
+            agent_state.get(
+                "readiness_gate_email_count"
+            ),
+            0.0,
+        )
+    ) + 1
+
+    save_agent_state(
+        agent_state
+    )
+
+    return True
+
+
+def append_readiness_gate_status(
+    lines: List[str],
+    readiness: Dict[str, Any],
+) -> None:
+    age_text = (
+        f"{to_float(readiness.get('age_minutes'), 0.0):.1f} minuten"
+        if readiness.get(
+            "age_minutes"
+        )
+        is not None
+        else "-"
+    )
+
+    long_progress = (
+        readiness.get(
+            "long"
+        )
+        or {}
+    )
+
+    short_progress = (
+        readiness.get(
+            "paper_short"
+        )
+        or {}
+    )
+
+    shadow_progress = (
+        readiness.get(
+            "shadow"
+        )
+        or {}
+    )
+
+    lines.extend([
+        "",
+        "READINESS GATE",
+        f"Status                  : {readiness.get('status') or '-'}",
+        f"Fase                    : {readiness.get('phase') or '-'}",
+        f"Laatste controle        : {readiness.get('generated_text') or '-'}",
+        f"Leeftijd rapport        : {age_text}",
+        f"Totale testvoortgang    : {to_float(readiness.get('test_completion_pct'), 0.0):.1f}%",
+        f"Longtest                : {int(to_float(long_progress.get('completed'), 0.0))}/20",
+        f"Paper-shorttest         : {int(to_float(short_progress.get('completed'), 0.0))}/20",
+        f"Schaduwtest             : {int(to_float(shadow_progress.get('completed'), 0.0))}/20",
+        f"Kritieke problemen      : {int(to_float(readiness.get('critical_count'), 0.0))}",
+        f"Waarschuwingen          : {int(to_float(readiness.get('warning_count'), 0.0))}",
+        f"Volgende stap           : {readiness.get('next_step') or '-'}",
+        "Automatisch live zetten: NEE",
+    ])
+
+
 def build_report(
     exchange: ccxt.Exchange,
 ) -> str:
@@ -4031,6 +4742,7 @@ def build_report(
     scanner = load_market_scanner_summary()
     strategy_lab = load_strategy_lab_email_summary()
     scanner_watch = scanner_watch_summary_from_state()
+    readiness = load_readiness_gate_summary()
 
     spot_sells = [
         row
@@ -4199,6 +4911,11 @@ def build_report(
         scanner_watch,
     )
 
+    append_readiness_gate_status(
+        lines,
+        readiness,
+    )
+
     lines.extend([
         "",
         "=" * 60,
@@ -4223,6 +4940,7 @@ def build_weekly_report(
     scanner_week = load_market_scanner_week_activity()
     strategy_lab = load_strategy_lab_email_summary()
     scanner_watch = scanner_watch_summary_from_state()
+    readiness = load_readiness_gate_summary()
 
     week_trades = get_week_trades(
         trades
@@ -4353,6 +5071,11 @@ def build_weekly_report(
     append_scanner_watch_status(
         lines,
         scanner_watch,
+    )
+
+    append_readiness_gate_status(
+        lines,
+        readiness,
     )
 
     lines.extend([
@@ -6276,6 +6999,26 @@ def backup_source_files() -> List[Dict[str, Any]]:
         {
             "source": STRATEGY_LAB_GROUPS_FILE,
             "name": "diamond_strategy_lab_groups.csv",
+            "required": False,
+        },
+        {
+            "source": READINESS_GATE_JSON_FILE,
+            "name": "diamond_readiness_gate.json",
+            "required": False,
+        },
+        {
+            "source": READINESS_GATE_TEXT_FILE,
+            "name": "diamond_readiness_gate.txt",
+            "required": False,
+        },
+        {
+            "source": FINAL_VALIDATION_FILE,
+            "name": "diamond_final_validation.json",
+            "required": False,
+        },
+        {
+            "source": LIVE_APPROVAL_FILE,
+            "name": "diamond_live_approval.json",
             "required": False,
         },
         {
@@ -9019,6 +9762,10 @@ def main() -> None:
         STRATEGY_LAB_JSON_FILE,
         STRATEGY_LAB_TEXT_FILE,
         STRATEGY_LAB_GROUPS_FILE,
+        READINESS_GATE_JSON_FILE,
+        READINESS_GATE_TEXT_FILE,
+        FINAL_VALIDATION_FILE,
+        LIVE_APPROVAL_FILE,
     ):
         ensure_parent(path)
 
@@ -9034,7 +9781,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v7.4 gestart"
+        "Diamond Agent v7.5 gestart"
     )
 
     LOG.info(
@@ -9114,6 +9861,16 @@ def main() -> None:
     )
 
     LOG.info(
+        "Readiness Gate: centrale alleen-lezen gereedheidscontrole"
+    )
+
+    LOG.info(
+        "Readiness Gate-rapporten: %s en %s",
+        READINESS_GATE_JSON_FILE,
+        READINESS_GATE_TEXT_FILE,
+    )
+
+    LOG.info(
         "Rapporttijden: 06:00, 10:00, 14:00, 18:00 en 22:00"
     )
 
@@ -9132,6 +9889,10 @@ def main() -> None:
             )
 
             handle_scanner_watch_alerts(
+                agent_state
+            )
+
+            refresh_readiness_gate(
                 agent_state
             )
 
