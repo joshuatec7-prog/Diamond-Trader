@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v6.9
+Diamond Agent v7.0
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -18,6 +18,7 @@ Functies:
 - Maakt dagelijks een controleerbare back-up op de permanente schijf.
 - Neemt de Market Scanner-signalen, scanner-state en schaduwtrades mee in de back-up.
 - Neemt Market Scanner-status en schaduwresultaten op in status- en weekmails.
+- Stuurt direct een e-mail wanneer een Market Scanner-schaduwtrade opent of sluit.
 - Neemt de Strategy Lab-rapporten mee in de dagelijkse back-up.
 - Bewaart dagelijkse back-ups 30 dagen en verwijdert alleen oude back-upmappen.
 """
@@ -217,6 +218,10 @@ BTC_DROP_LIMIT_PCT = -8.0
 BTC_RECOVERY_PCT = 4.0
 
 DEFAULT_TOTAL_CAPITAL = 3000.0
+
+# Market Scanner-schaduwmeldingen
+SHADOW_NOTIFICATION_HISTORY_LIMIT = 250
+SHADOW_NOTIFICATION_RETRY_MINUTES = 15
 
 
 # ============================================================
@@ -665,6 +670,18 @@ def default_agent_state() -> Dict[str, Any]:
         "last_analysis_ts": 0.0,
         "sent_reports": [],
         "sent_weekly_reports": [],
+        "notified_shadow_open_keys": [],
+        "notified_shadow_close_keys": [],
+        "shadow_open_notifications_sent": 0,
+        "shadow_close_notifications_sent": 0,
+        "last_shadow_open_email_at": "",
+        "last_shadow_open_symbol": "",
+        "last_shadow_close_email_at": "",
+        "last_shadow_close_symbol": "",
+        "last_shadow_open_attempt_key": "",
+        "last_shadow_open_attempt_at": "",
+        "last_shadow_close_attempt_key": "",
+        "last_shadow_close_attempt_at": "",
         "last_backup_date": "",
         "last_backup_at": "",
         "last_backup_path": "",
@@ -764,6 +781,18 @@ def load_agent_state() -> Dict[str, Any]:
         list,
     ):
         state["sent_weekly_reports"] = []
+
+    if not isinstance(
+        state.get("notified_shadow_open_keys"),
+        list,
+    ):
+        state["notified_shadow_open_keys"] = []
+
+    if not isinstance(
+        state.get("notified_shadow_close_keys"),
+        list,
+    ):
+        state["notified_shadow_close_keys"] = []
 
     defaults = default_agent_state()
 
@@ -5027,6 +5056,555 @@ def handle_daily_backup(
             )
 
 
+
+# ============================================================
+# Market Scanner-schaduwtrade meldingen
+# ============================================================
+
+def shadow_event_key(
+    event_type: str,
+    row: Dict[str, Any],
+) -> str:
+    """
+    Maakt een stabiele sleutel waarmee dubbele e-mails worden voorkomen.
+    """
+    if event_type == "open":
+        timestamp = row.get(
+            "opened_at"
+        )
+    else:
+        timestamp = row.get(
+            "closed_at"
+        )
+
+    raw = "|".join([
+        event_type,
+        str(
+            timestamp
+            or ""
+        ),
+        str(
+            row.get("symbol")
+            or ""
+        ),
+        str(
+            row.get("strategy")
+            or ""
+        ),
+        str(
+            row.get("side")
+            or ""
+        ),
+    ])
+
+    return hashlib.sha256(
+        raw.encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def format_shadow_event_time(
+    value: Any,
+) -> str:
+    parsed = parse_iso_datetime(
+        value
+    )
+
+    if parsed is None:
+        return str(
+            value
+            or "-"
+        )
+
+    return parsed.strftime(
+        "%d-%m-%Y %H:%M Nederlandse tijd"
+    )
+
+
+def load_shadow_open_positions() -> List[Dict[str, Any]]:
+    scanner_state = load_json(
+        MARKET_SCANNER_STATE_FILE,
+        {},
+    )
+
+    raw_positions = (
+        scanner_state.get(
+            "open_positions"
+        )
+        or {}
+    )
+
+    if isinstance(
+        raw_positions,
+        dict,
+    ):
+        positions = [
+            value
+            for value
+            in raw_positions.values()
+            if isinstance(
+                value,
+                dict,
+            )
+        ]
+
+    elif isinstance(
+        raw_positions,
+        list,
+    ):
+        positions = [
+            value
+            for value
+            in raw_positions
+            if isinstance(
+                value,
+                dict,
+            )
+        ]
+
+    else:
+        positions = []
+
+    return sorted(
+        positions,
+        key=lambda item: str(
+            item.get(
+                "opened_at"
+            )
+            or ""
+        ),
+    )
+
+
+def load_shadow_closed_trades() -> List[Dict[str, str]]:
+    path = Path(
+        SHADOW_TRADES_FILE
+    )
+
+    if not path.is_file():
+        return []
+
+    try:
+        with path.open(
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as file:
+            rows = list(
+                csv.DictReader(
+                    file
+                )
+            )
+
+        return sorted(
+            rows,
+            key=lambda item: str(
+                item.get(
+                    "closed_at"
+                )
+                or ""
+            ),
+        )
+
+    except Exception as exc:
+        LOG.warning(
+            "Schaduwtransacties voor meldingen lezen mislukt: %s",
+            exc,
+        )
+
+        return []
+
+
+def trim_shadow_notification_history(
+    agent_state: Dict[str, Any],
+) -> None:
+    agent_state[
+        "notified_shadow_open_keys"
+    ] = (
+        agent_state.get(
+            "notified_shadow_open_keys",
+            [],
+        )[
+            -SHADOW_NOTIFICATION_HISTORY_LIMIT:
+        ]
+    )
+
+    agent_state[
+        "notified_shadow_close_keys"
+    ] = (
+        agent_state.get(
+            "notified_shadow_close_keys",
+            [],
+        )[
+            -SHADOW_NOTIFICATION_HISTORY_LIMIT:
+        ]
+    )
+
+
+def shadow_notification_retry_allowed(
+    agent_state: Dict[str, Any],
+    event_type: str,
+    event_key: str,
+) -> bool:
+    key_field = (
+        f"last_shadow_{event_type}_attempt_key"
+    )
+
+    time_field = (
+        f"last_shadow_{event_type}_attempt_at"
+    )
+
+    if (
+        agent_state.get(
+            key_field
+        )
+        != event_key
+    ):
+        return True
+
+    attempted = parse_iso_datetime(
+        agent_state.get(
+            time_field
+        )
+    )
+
+    if attempted is None:
+        return True
+
+    return (
+        now_utc()
+        - attempted
+    ).total_seconds() >= (
+        SHADOW_NOTIFICATION_RETRY_MINUTES
+        * 60
+    )
+
+
+def record_shadow_notification_attempt(
+    agent_state: Dict[str, Any],
+    event_type: str,
+    event_key: str,
+) -> None:
+    agent_state[
+        f"last_shadow_{event_type}_attempt_key"
+    ] = event_key
+
+    agent_state[
+        f"last_shadow_{event_type}_attempt_at"
+    ] = now_utc().isoformat()
+
+    save_agent_state(
+        agent_state
+    )
+
+
+def format_shadow_open_email(
+    position: Dict[str, Any],
+) -> str:
+    return "\n".join([
+        "=" * 60,
+        "DIAMOND MARKET SCANNER - SCHADUWTRADE GEOPEND",
+        "=" * 60,
+        "",
+        f"Geopend                 : {format_shadow_event_time(position.get('opened_at'))}",
+        f"Munt                    : {position.get('symbol') or '-'}",
+        f"Richting                : {position.get('side') or '-'}",
+        f"Strategie               : {position.get('strategy') or '-'}",
+        f"Marktregime             : {position.get('market_regime') or '-'}",
+        f"Signaalscore            : {to_float(position.get('signal_score'), 0.0):.1f}",
+        f"Virtuele inzet          : €{to_float(position.get('stake_eur'), 0.0):.2f}",
+        f"Instapprijs             : {to_float(position.get('entry_price'), 0.0):.12f}",
+        f"Take-profit             : {to_float(position.get('take_profit'), 0.0):.12f}",
+        f"Stop-loss               : {to_float(position.get('stop_loss'), 0.0):.12f}",
+        f"ATR                     : {to_float(position.get('atr_pct'), 0.0):.4f}%",
+        f"Spread bij instap       : {to_float(position.get('entry_spread_pct'), 0.0):.4f}%",
+        "",
+        "VEILIGHEID",
+        "Dit is uitsluitend een virtuele schaduwtrade.",
+        "Er is geen Bitvavo-order geplaatst.",
+        "Bestaande munten en botposities zijn niet gewijzigd.",
+        "=" * 60,
+    ])
+
+
+def format_shadow_close_email(
+    trade: Dict[str, Any],
+) -> str:
+    pnl = to_float(
+        trade.get(
+            "net_pnl_eur"
+        ),
+        0.0,
+    )
+
+    if pnl > 0.000001:
+        result = "WINST"
+    elif pnl < -0.000001:
+        result = "VERLIES"
+    else:
+        result = "NEUTRAAL"
+
+    return "\n".join([
+        "=" * 60,
+        "DIAMOND MARKET SCANNER - SCHADUWTRADE GESLOTEN",
+        "=" * 60,
+        "",
+        f"Resultaat               : {result}",
+        f"Geopend                 : {format_shadow_event_time(trade.get('opened_at'))}",
+        f"Gesloten                : {format_shadow_event_time(trade.get('closed_at'))}",
+        f"Munt                    : {trade.get('symbol') or '-'}",
+        f"Richting                : {trade.get('side') or '-'}",
+        f"Strategie               : {trade.get('strategy') or '-'}",
+        f"Marktregime             : {trade.get('market_regime') or '-'}",
+        f"Sluitreden              : {trade.get('exit_reason') or '-'}",
+        f"Virtuele inzet          : €{to_float(trade.get('stake_eur'), 0.0):.2f}",
+        f"Instapprijs             : {to_float(trade.get('entry_price'), 0.0):.12f}",
+        f"Uitstapprijs            : {to_float(trade.get('exit_price'), 0.0):.12f}",
+        f"Brutoresultaat          : €{to_float(trade.get('gross_pnl_eur'), 0.0):+.4f}",
+        f"Totale kosten           : €{to_float(trade.get('total_fees_eur'), 0.0):.4f}",
+        f"Nettoresultaat          : €{pnl:+.4f}",
+        f"Rendement               : {to_float(trade.get('return_pct'), 0.0):+.4f}%",
+        f"Looptijd                : {to_float(trade.get('duration_minutes'), 0.0):.1f} minuten",
+        "",
+        "VEILIGHEID",
+        "Dit was uitsluitend een virtuele schaduwtrade.",
+        "Er is geen Bitvavo-order geplaatst.",
+        "Het Strategy Lab verwerkt deze trade automatisch.",
+        "=" * 60,
+    ])
+
+
+def handle_shadow_trade_notifications(
+    agent_state: Dict[str, Any],
+) -> int:
+    """
+    Stuurt één e-mail per nieuwe virtuele opening en sluiting.
+
+    De sleutels worden in diamond_agent_state.json bewaard. Daardoor
+    veroorzaakt een herstart of deploy geen dubbele meldingen.
+    """
+    open_history = set(
+        str(
+            value
+        )
+        for value
+        in (
+            agent_state.get(
+                "notified_shadow_open_keys"
+            )
+            or []
+        )
+    )
+
+    close_history = set(
+        str(
+            value
+        )
+        for value
+        in (
+            agent_state.get(
+                "notified_shadow_close_keys"
+            )
+            or []
+        )
+    )
+
+    sent_count = 0
+
+    # Eerst sluitingen melden, daarna eventueel een nieuwe opening
+    # uit dezelfde scannerscan.
+    for trade in load_shadow_closed_trades()[-50:]:
+        event_key = shadow_event_key(
+            "close",
+            trade,
+        )
+
+        if event_key in close_history:
+            continue
+
+        if not shadow_notification_retry_allowed(
+            agent_state,
+            "close",
+            event_key,
+        ):
+            continue
+
+        record_shadow_notification_attempt(
+            agent_state,
+            "close",
+            event_key,
+        )
+
+        pnl = to_float(
+            trade.get(
+                "net_pnl_eur"
+            ),
+            0.0,
+        )
+
+        sent = send_email(
+            (
+                "Diamond Scanner SCHADUWTRADE GESLOTEN - "
+                f"{trade.get('symbol') or '-'} "
+                f"€{pnl:+.2f}"
+            ),
+            format_shadow_close_email(
+                trade
+            ),
+        )
+
+        if not sent:
+            continue
+
+        agent_state[
+            "notified_shadow_close_keys"
+        ].append(
+            event_key
+        )
+
+        close_history.add(
+            event_key
+        )
+
+        agent_state[
+            "shadow_close_notifications_sent"
+        ] = int(
+            to_float(
+                agent_state.get(
+                    "shadow_close_notifications_sent"
+                ),
+                0.0,
+            )
+        ) + 1
+
+        agent_state[
+            "last_shadow_close_email_at"
+        ] = now_utc().isoformat()
+
+        agent_state[
+            "last_shadow_close_symbol"
+        ] = str(
+            trade.get(
+                "symbol"
+            )
+            or ""
+        )
+
+        trim_shadow_notification_history(
+            agent_state
+        )
+
+        save_agent_state(
+            agent_state
+        )
+
+        sent_count += 1
+
+        LOG.info(
+            "Schaduwtrade-sluitmail verstuurd | %s | pnl=%+.4f EUR",
+            trade.get(
+                "symbol"
+            ),
+            pnl,
+        )
+
+    for position in load_shadow_open_positions():
+        event_key = shadow_event_key(
+            "open",
+            position,
+        )
+
+        if event_key in open_history:
+            continue
+
+        if not shadow_notification_retry_allowed(
+            agent_state,
+            "open",
+            event_key,
+        ):
+            continue
+
+        record_shadow_notification_attempt(
+            agent_state,
+            "open",
+            event_key,
+        )
+
+        sent = send_email(
+            (
+                "Diamond Scanner SCHADUWTRADE GEOPEND - "
+                f"{position.get('symbol') or '-'} "
+                f"{position.get('side') or '-'}"
+            ),
+            format_shadow_open_email(
+                position
+            ),
+        )
+
+        if not sent:
+            continue
+
+        agent_state[
+            "notified_shadow_open_keys"
+        ].append(
+            event_key
+        )
+
+        open_history.add(
+            event_key
+        )
+
+        agent_state[
+            "shadow_open_notifications_sent"
+        ] = int(
+            to_float(
+                agent_state.get(
+                    "shadow_open_notifications_sent"
+                ),
+                0.0,
+            )
+        ) + 1
+
+        agent_state[
+            "last_shadow_open_email_at"
+        ] = now_utc().isoformat()
+
+        agent_state[
+            "last_shadow_open_symbol"
+        ] = str(
+            position.get(
+                "symbol"
+            )
+            or ""
+        )
+
+        trim_shadow_notification_history(
+            agent_state
+        )
+
+        save_agent_state(
+            agent_state
+        )
+
+        sent_count += 1
+
+        LOG.info(
+            "Schaduwtrade-openmail verstuurd | %s | %s | %s",
+            position.get(
+                "symbol"
+            ),
+            position.get(
+                "side"
+            ),
+            position.get(
+                "strategy"
+            ),
+        )
+
+    return sent_count
+
+
 # ============================================================
 # Rapportplanning
 # ============================================================
@@ -5046,6 +5624,10 @@ def clean_agent_history(
             "sent_weekly_reports",
             [],
         )[-12:]
+    )
+
+    trim_shadow_notification_history(
+        agent_state
     )
 
 
@@ -5177,7 +5759,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v6.9 gestart"
+        "Diamond Agent v7.0 gestart"
     )
 
     LOG.info(
@@ -5237,12 +5819,20 @@ def main() -> None:
     )
 
     LOG.info(
+        "Schaduwtrade-e-mails: direct bij openen en sluiten"
+    )
+
+    LOG.info(
         "Rapporttijden: 06:00, 10:00, 14:00, 18:00 en 22:00"
     )
 
     while True:
         try:
             handle_daily_backup(
+                agent_state
+            )
+
+            handle_shadow_trade_notifications(
                 agent_state
             )
 

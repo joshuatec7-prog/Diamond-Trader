@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.2
+# Diamond Trader Healthcheck v7.3
 # Alleen lezen: wijzigt geen bot-, test-, scanner- of Strategy Lab-bestanden.
 
 set -u
@@ -249,6 +249,30 @@ weekly = data.get("sent_weekly_reports") or []
 print(f"        Laatste analyse   : {format_time(data.get('last_analysis_ts'))}")
 print(f"        Statusmails       : {len(reports)}")
 print(f"        Weekrapporten     : {len(weekly)}")
+print(
+    "        Schaduw-openmails: "
+    f"{int(data.get('shadow_open_notifications_sent', 0) or 0)}"
+)
+print(
+    "        Schaduw-sluitmail: "
+    f"{int(data.get('shadow_close_notifications_sent', 0) or 0)}"
+)
+print(
+    "        Laatste openmail : "
+    f"{data.get('last_shadow_open_email_at') or '-'}"
+)
+print(
+    "        Laatste open munt: "
+    f"{data.get('last_shadow_open_symbol') or '-'}"
+)
+print(
+    "        Laatste sluitmail: "
+    f"{data.get('last_shadow_close_email_at') or '-'}"
+)
+print(
+    "        Laatste sluitmunt: "
+    f"{data.get('last_shadow_close_symbol') or '-'}"
+)
 print(f"        Laatste back-up   : {data.get('last_backup_at') or '-'}")
 print(f"        Back-upstatus     : {data.get('last_backup_status') or '-'}")
 PY
