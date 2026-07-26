@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.4
+# Diamond Trader Healthcheck v7.5
 # Alleen lezen: wijzigt geen bot-, test-, scanner- of Strategy Lab-bestanden.
 
 set -u
@@ -280,8 +280,35 @@ print(
     "        Laatste sluitmunt: "
     f"{data.get('last_shadow_close_symbol') or '-'}"
 )
+print(
+    "        Lab-verversingen : "
+    f"{int(data.get('strategy_lab_refresh_count', 0) or 0)}"
+)
+print(
+    "        Laatste Lab-run  : "
+    f"{data.get('last_strategy_lab_refresh_at') or '-'}"
+)
+print(
+    "        Lab-runstatus    : "
+    f"{data.get('last_strategy_lab_refresh_status') or '-'}"
+)
+print(
+    "        Lab-runfout      : "
+    f"{data.get('last_strategy_lab_refresh_error') or '-'}"
+)
 print(f"        Laatste back-up   : {data.get('last_backup_at') or '-'}")
 print(f"        Back-upstatus     : {data.get('last_backup_status') or '-'}")
+
+lab_status = str(
+    data.get(
+        "last_strategy_lab_refresh_status"
+    )
+    or ""
+).strip().lower()
+
+if lab_status == "failed":
+    print("        [FOUT] Laatste directe Strategy Lab-verversing is mislukt")
+    raise SystemExit(1)
 PY
     then
         ERRORS=$((ERRORS + 1))

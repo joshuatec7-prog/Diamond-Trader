@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v7.1
+Diamond Agent v7.2
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -20,6 +20,7 @@ Functies:
 - Neemt Market Scanner-status en schaduwresultaten op in status- en weekmails.
 - Stuurt direct een e-mail wanneer een Market Scanner-schaduwtrade opent of sluit.
 - Maakt en mailt vaste schaduwmijlpaalrapporten na 5, 10 en 20 gesloten trades.
+- Ververst Strategy Lab direct zodra een schaduwpositie opent of sluit.
 - Neemt de Strategy Lab- en schaduwmijlpaalrapporten mee in de dagelijkse back-up.
 - Bewaart dagelijkse back-ups 30 dagen en verwijdert alleen oude back-upmappen.
 """
@@ -31,6 +32,7 @@ import logging
 import os
 import shutil
 import smtplib
+import subprocess
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -164,6 +166,11 @@ STRATEGY_LAB_GROUPS_FILE = os.getenv(
     "/var/data/diamond_strategy_lab_groups.csv",
 ).strip()
 
+STRATEGY_LAB_SCRIPT_FILE = os.getenv(
+    "STRATEGY_LAB_SCRIPT_FILE",
+    "/opt/render/project/src/strategy_lab.py",
+).strip()
+
 BACKUP_DIR = os.getenv(
     "BACKUP_DIR",
     "/var/data/backups",
@@ -237,6 +244,10 @@ SHADOW_MILESTONE_STAKES = (
     130.0,
     135.0,
 )
+
+# Directe Strategy Lab-verversing bij een gewijzigde schaduwstand.
+STRATEGY_LAB_REFRESH_TIMEOUT_SECONDS = 120
+STRATEGY_LAB_REFRESH_RETRY_MINUTES = 15
 
 
 # ============================================================
@@ -732,6 +743,13 @@ def default_agent_state() -> Dict[str, Any]:
         "last_shadow_open_attempt_at": "",
         "last_shadow_close_attempt_key": "",
         "last_shadow_close_attempt_at": "",
+        "last_strategy_lab_input_fingerprint": "",
+        "last_strategy_lab_attempt_fingerprint": "",
+        "last_strategy_lab_refresh_attempt_at": "",
+        "last_strategy_lab_refresh_at": "",
+        "last_strategy_lab_refresh_status": "",
+        "last_strategy_lab_refresh_error": "",
+        "strategy_lab_refresh_count": 0,
         "last_backup_date": "",
         "last_backup_at": "",
         "last_backup_path": "",
@@ -6360,6 +6378,326 @@ def load_shadow_closed_trades() -> List[Dict[str, str]]:
         return []
 
 
+def strategy_lab_input_fingerprint() -> str:
+    """
+    Maakt een stabiele vingerafdruk van de actuele schaduwstand.
+
+    De vingerafdruk verandert uitsluitend wanneer:
+    - een schaduwpositie opent;
+    - een schaduwpositie sluit;
+    - de historische sluitlijst inhoudelijk verandert.
+    """
+    open_positions = load_shadow_open_positions()
+    closed_trades = load_shadow_closed_trades()
+
+    open_keys = sorted(
+        shadow_event_key(
+            "open",
+            position,
+        )
+        for position in open_positions
+    )
+
+    closed_keys = [
+        shadow_event_key(
+            "close",
+            trade,
+        )
+        for trade in closed_trades
+    ]
+
+    payload = {
+        "open_keys": open_keys,
+        "closed_count": len(
+            closed_keys
+        ),
+        "last_closed_key": (
+            closed_keys[-1]
+            if closed_keys
+            else ""
+        ),
+        "closed_keys_digest": hashlib.sha256(
+            "|".join(
+                closed_keys
+            ).encode(
+                "utf-8"
+            )
+        ).hexdigest(),
+    }
+
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(
+            ",",
+            ":",
+        ),
+    )
+
+    return hashlib.sha256(
+        serialized.encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def strategy_lab_refresh_retry_allowed(
+    agent_state: Dict[str, Any],
+    fingerprint: str,
+) -> bool:
+    if (
+        agent_state.get(
+            "last_strategy_lab_attempt_fingerprint"
+        )
+        != fingerprint
+    ):
+        return True
+
+    attempted = parse_iso_datetime(
+        agent_state.get(
+            "last_strategy_lab_refresh_attempt_at"
+        )
+    )
+
+    if attempted is None:
+        return True
+
+    return (
+        now_utc()
+        - attempted
+    ).total_seconds() >= (
+        STRATEGY_LAB_REFRESH_RETRY_MINUTES
+        * 60
+    )
+
+
+def refresh_strategy_lab_if_needed(
+    agent_state: Dict[str, Any],
+) -> bool:
+    """
+    Ververst Strategy Lab direct na een gewijzigde schaduwstand.
+
+    De normale Strategy Lab-loop van zes uur blijft bestaan als vangnet.
+    Bij een fout wordt niets aan scanner- of botbestanden gewijzigd en
+    volgt na vijftien minuten een nieuwe poging.
+    """
+    fingerprint = (
+        strategy_lab_input_fingerprint()
+    )
+
+    if (
+        agent_state.get(
+            "last_strategy_lab_input_fingerprint"
+        )
+        == fingerprint
+        and agent_state.get(
+            "last_strategy_lab_refresh_status"
+        )
+        == "complete"
+    ):
+        return False
+
+    if not strategy_lab_refresh_retry_allowed(
+        agent_state,
+        fingerprint,
+    ):
+        return False
+
+    attempt_at = now_utc().isoformat()
+
+    agent_state[
+        "last_strategy_lab_attempt_fingerprint"
+    ] = fingerprint
+
+    agent_state[
+        "last_strategy_lab_refresh_attempt_at"
+    ] = attempt_at
+
+    save_agent_state(
+        agent_state
+    )
+
+    script = Path(
+        STRATEGY_LAB_SCRIPT_FILE
+    )
+
+    if not script.is_file():
+        error_text = (
+            f"Strategy Lab-script ontbreekt: {script}"
+        )
+
+        agent_state[
+            "last_strategy_lab_refresh_status"
+        ] = "failed"
+
+        agent_state[
+            "last_strategy_lab_refresh_error"
+        ] = error_text
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.error(
+            "%s",
+            error_text,
+        )
+
+        return False
+
+    try:
+        result = subprocess.run(
+            [
+                "python3",
+                str(
+                    script
+                ),
+                "--no-print",
+            ],
+            cwd=str(
+                script.parent
+            ),
+            capture_output=True,
+            text=True,
+            timeout=(
+                STRATEGY_LAB_REFRESH_TIMEOUT_SECONDS
+            ),
+            check=False,
+        )
+
+    except subprocess.TimeoutExpired:
+        error_text = (
+            "Strategy Lab directe verversing "
+            f"duurde langer dan {STRATEGY_LAB_REFRESH_TIMEOUT_SECONDS} seconden"
+        )
+
+        agent_state[
+            "last_strategy_lab_refresh_status"
+        ] = "failed"
+
+        agent_state[
+            "last_strategy_lab_refresh_error"
+        ] = error_text
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.error(
+            "%s",
+            error_text,
+        )
+
+        return False
+
+    except Exception as exc:
+        error_text = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        agent_state[
+            "last_strategy_lab_refresh_status"
+        ] = "failed"
+
+        agent_state[
+            "last_strategy_lab_refresh_error"
+        ] = error_text
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.exception(
+            "Strategy Lab directe verversing mislukt: %s",
+            exc,
+        )
+
+        return False
+
+    if result.returncode != 0:
+        output = (
+            result.stderr
+            or result.stdout
+            or "geen fouttekst"
+        ).strip()
+
+        error_text = (
+            f"exitcode {result.returncode}: "
+            f"{output[-1000:]}"
+        )
+
+        agent_state[
+            "last_strategy_lab_refresh_status"
+        ] = "failed"
+
+        agent_state[
+            "last_strategy_lab_refresh_error"
+        ] = error_text
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.error(
+            "Strategy Lab directe verversing mislukt | %s",
+            error_text,
+        )
+
+        return False
+
+    agent_state[
+        "last_strategy_lab_input_fingerprint"
+    ] = fingerprint
+
+    agent_state[
+        "last_strategy_lab_refresh_at"
+    ] = now_utc().isoformat()
+
+    agent_state[
+        "last_strategy_lab_refresh_status"
+    ] = "complete"
+
+    agent_state[
+        "last_strategy_lab_refresh_error"
+    ] = ""
+
+    agent_state[
+        "strategy_lab_refresh_count"
+    ] = int(
+        to_float(
+            agent_state.get(
+                "strategy_lab_refresh_count"
+            ),
+            0.0,
+        )
+    ) + 1
+
+    save_agent_state(
+        agent_state
+    )
+
+    log_output = (
+        result.stdout
+        or result.stderr
+        or ""
+    ).strip()
+
+    if log_output:
+        LOG.info(
+            "Strategy Lab direct ververst | %s",
+            log_output.splitlines()[-1][
+                -500:
+            ],
+        )
+    else:
+        LOG.info(
+            "Strategy Lab direct ververst"
+        )
+
+    return True
+
+
 def trim_shadow_notification_history(
     agent_state: Dict[str, Any],
 ) -> None:
@@ -6903,7 +7241,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v7.1 gestart"
+        "Diamond Agent v7.2 gestart"
     )
 
     LOG.info(
@@ -6971,6 +7309,10 @@ def main() -> None:
     )
 
     LOG.info(
+        "Strategy Lab directe verversing: bij openen en sluiten"
+    )
+
+    LOG.info(
         "Rapporttijden: 06:00, 10:00, 14:00, 18:00 en 22:00"
     )
 
@@ -6981,6 +7323,10 @@ def main() -> None:
             )
 
             handle_shadow_trade_notifications(
+                agent_state
+            )
+
+            refresh_strategy_lab_if_needed(
                 agent_state
             )
 
