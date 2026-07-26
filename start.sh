@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 
-# Diamond Trader startscript
-# Start en bewaak alle hoofdprocessen, inclusief de veilige TA-schaduwscanner.
+# Diamond Trader startscript v2.0
+# Start en bewaak alle hoofdprocessen, inclusief Market Scanner en Strategy Lab.
 
 set -Eeuo pipefail
 
 PROJECT_DIR="/opt/render/project/src"
 DATA_DIR="/var/data"
 SCANNER_LOG="$DATA_DIR/diamond_market_scanner_runner.log"
+STRATEGY_LAB_LOG="$DATA_DIR/diamond_strategy_lab_runner.log"
 
 cd "$PROJECT_DIR"
 mkdir -p "$DATA_DIR"
@@ -74,6 +75,14 @@ SCANNER_PID=$!
 PIDS+=("$SCANNER_PID")
 echo "        PID $SCANNER_PID"
 echo "        Log: $SCANNER_LOG"
+
+echo "[START] Diamond Strategy Lab"
+python3 strategy_lab.py --loop --interval-minutes 360 --no-print     >> "$STRATEGY_LAB_LOG" 2>&1 &
+STRATEGY_LAB_PID=$!
+PIDS+=("$STRATEGY_LAB_PID")
+echo "        PID $STRATEGY_LAB_PID"
+echo "        Interval: iedere 360 minuten"
+echo "        Log: $STRATEGY_LAB_LOG"
 
 echo
 echo "[OK] Alle Diamond Trader-processen zijn gestart."

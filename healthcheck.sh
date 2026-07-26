@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.1
-# Alleen lezen: wijzigt geen bot-, test- of scannerbestanden.
+# Diamond Trader Healthcheck v7.2
+# Alleen lezen: wijzigt geen bot-, test-, scanner- of Strategy Lab-bestanden.
 
 set -u
 
@@ -21,6 +21,11 @@ SHORT_BASELINE_FILE="$DATA_DIR/diamond_short_test_baseline.json"
 SHORT_REPORT_FILE="$DATA_DIR/diamond_short_test_report.json"
 SHORT_INTERIM_5_FILE="$DATA_DIR/diamond_short_test_interim_5.json"
 SHORT_INTERIM_10_FILE="$DATA_DIR/diamond_short_test_interim_10.json"
+
+STRATEGY_LAB_JSON_FILE="$DATA_DIR/diamond_strategy_lab.json"
+STRATEGY_LAB_TEXT_FILE="$DATA_DIR/diamond_strategy_lab.txt"
+STRATEGY_LAB_GROUPS_FILE="$DATA_DIR/diamond_strategy_lab_groups.csv"
+STRATEGY_LAB_RUNNER_LOG="$DATA_DIR/diamond_strategy_lab_runner.log"
 
 BACKUP_DIR="$DATA_DIR/backups"
 
@@ -102,6 +107,10 @@ check_process \
     'python3[[:space:]]+market_scanner\.py[[:space:]]+--loop[[:space:]]+--top[[:space:]]+20([[:space:]]|$)' \
     "Diamond Market Scanner"
 
+check_process \
+    'python3[[:space:]]+strategy_lab\.py[[:space:]]+--loop[[:space:]]+--interval-minutes[[:space:]]+360[[:space:]]+--no-print([[:space:]]|$)' \
+    "Diamond Strategy Lab"
+
 echo
 echo "2. PROJECTBESTANDEN"
 echo "------------------------------------------------------------"
@@ -115,6 +124,7 @@ for file_name in \
     diamond_bot.py \
     short_diagnose.py \
     market_scanner.py \
+    strategy_lab.py \
     requirements.txt \
     start.sh \
     healthcheck.sh \
@@ -730,13 +740,136 @@ else
 fi
 
 echo
-echo "12. SCHIJFRUIMTE"
+echo "12. STRATEGY LAB"
+echo "------------------------------------------------------------"
+
+file_info "$STRATEGY_LAB_JSON_FILE" "Strategy Lab JSON" "true"
+file_info "$STRATEGY_LAB_TEXT_FILE" "Strategy Lab tekstrapport" "true"
+file_info "$STRATEGY_LAB_GROUPS_FILE" "Strategy Lab groepen-CSV" "true"
+file_info "$STRATEGY_LAB_RUNNER_LOG" "Strategy Lab runnerlog" "true"
+
+if [ -f "$PROJECT_DIR/strategy_lab.py" ]; then
+    if python3 -m py_compile "$PROJECT_DIR/strategy_lab.py" 2>/dev/null; then
+        echo "[OK]    Strategy Lab Pythoncontrole geslaagd"
+    else
+        echo "[FOUT]  Strategy Lab Pythoncontrole mislukt"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+if [ -f "$STRATEGY_LAB_JSON_FILE" ]; then
+    if ! python3 - \
+        "$STRATEGY_LAB_JSON_FILE" \
+        "$NOW_EPOCH" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+now_epoch = int(sys.argv[2])
+
+try:
+    report = json.loads(path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"[FOUT]  Strategy Lab JSON lezen mislukt: {exc}")
+    raise SystemExit(1)
+
+if not isinstance(report, dict):
+    print("[FOUT]  Strategy Lab JSON bevat geen object")
+    raise SystemExit(1)
+
+generated_at = report.get("generated_at")
+generated = None
+
+try:
+    generated = datetime.fromisoformat(
+        str(generated_at).replace("Z", "+00:00")
+    )
+    if generated.tzinfo is None:
+        generated = generated.replace(tzinfo=timezone.utc)
+    generated = generated.astimezone(timezone.utc)
+except Exception:
+    pass
+
+if generated is None:
+    print("[FOUT]  Strategy Lab heeft geen geldige genereertijd")
+    raise SystemExit(1)
+
+age_minutes = max(
+    0.0,
+    (
+        datetime.fromtimestamp(now_epoch, tz=timezone.utc)
+        - generated
+    ).total_seconds()
+    / 60.0,
+)
+
+safety = report.get("safety") or {}
+signals = report.get("signals") or {}
+shadow = report.get("shadow_trades") or {}
+scanner_state = report.get("scanner_state") or {}
+errors = report.get("errors") or []
+open_positions = scanner_state.get("open_positions") or []
+
+safe = (
+    safety.get("orders_possible") is False
+    and safety.get("exchange_connection_used") is False
+    and safety.get("bot_state_modified") is False
+    and safety.get("scanner_state_modified") is False
+    and safety.get("settings_modified") is False
+    and safety.get("automatic_strategy_changes") is False
+)
+
+print("[OK]    Strategy Lab rapport leesbaar")
+print(f"        Versie             : {report.get('version') or '-'}")
+print(f"        Modus              : {report.get('mode') or '-'}")
+print(f"        Gegenereerd        : {generated_at}")
+print(f"        Leeftijd rapport   : {age_minutes:.1f} minuten")
+print(f"        Scans totaal       : {int(scanner_state.get('scan_count', 0) or 0)}")
+print(f"        Signalen CSV       : {int(signals.get('signals', 0) or 0)}")
+print(f"        Filters gepasseerd : {int(signals.get('shadow_eligible', 0) or 0)}")
+print(f"        Open schaduw       : {len(open_positions)}")
+print(f"        Gesloten schaduw   : {int(shadow.get('trades', 0) or 0)}")
+print(f"        Winrate            : {float(shadow.get('winrate_pct', 0) or 0):.2f}%")
+print(f"        Nettoresultaat     : €{float(shadow.get('net_pnl_eur', 0) or 0):+.4f}")
+print(f"        Datastatus         : {shadow.get('data_status') or '-'}")
+print(f"        Rapportfouten      : {len(errors)}")
+print(f"        Alleen-lezen       : {'JA' if safe else 'NEE'}")
+
+if report.get("version") != "1.0":
+    print("[FOUT]  Onverwachte Strategy Lab-versie")
+    raise SystemExit(1)
+
+if report.get("mode") != "READ_ONLY_STRATEGY_ANALYSIS":
+    print("[FOUT]  Onverwachte Strategy Lab-modus")
+    raise SystemExit(1)
+
+if not safe:
+    print("[FOUT]  Strategy Lab veiligheidsstatus is niet volledig alleen-lezen")
+    raise SystemExit(1)
+
+# Het proces draait iedere zes uur. Een marge van 30 minuten voorkomt
+# onnodige foutmeldingen tijdens een rapportcyclus of deploy.
+if age_minutes > 390.0:
+    print("[FOUT]  Strategy Lab rapport is ouder dan 390 minuten")
+    raise SystemExit(1)
+
+print("[OK]    Strategy Lab is actueel en veilig")
+PY
+    then
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+echo
+echo "13. SCHIJFRUIMTE"
 echo "------------------------------------------------------------"
 
 df -h "$DATA_DIR" 2>/dev/null || df -h
 
 echo
-echo "13. EINDCONTROLE"
+echo "14. EINDCONTROLE"
 echo "------------------------------------------------------------"
 
 if [ "$ERRORS" -eq 0 ]; then

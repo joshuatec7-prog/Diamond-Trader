@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v6.8
+Diamond Agent v6.9
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -18,6 +18,7 @@ Functies:
 - Maakt dagelijks een controleerbare back-up op de permanente schijf.
 - Neemt de Market Scanner-signalen, scanner-state en schaduwtrades mee in de back-up.
 - Neemt Market Scanner-status en schaduwresultaten op in status- en weekmails.
+- Neemt de Strategy Lab-rapporten mee in de dagelijkse back-up.
 - Bewaart dagelijkse back-ups 30 dagen en verwijdert alleen oude back-upmappen.
 """
 
@@ -144,6 +145,21 @@ MARKET_SCANNER_STATE_FILE = os.getenv(
 SHADOW_TRADES_FILE = os.getenv(
     "SHADOW_TRADES_FILE",
     "/var/data/diamond_shadow_trades.csv",
+).strip()
+
+STRATEGY_LAB_JSON_FILE = os.getenv(
+    "STRATEGY_LAB_JSON_FILE",
+    "/var/data/diamond_strategy_lab.json",
+).strip()
+
+STRATEGY_LAB_TEXT_FILE = os.getenv(
+    "STRATEGY_LAB_TEXT_FILE",
+    "/var/data/diamond_strategy_lab.txt",
+).strip()
+
+STRATEGY_LAB_GROUPS_FILE = os.getenv(
+    "STRATEGY_LAB_GROUPS_FILE",
+    "/var/data/diamond_strategy_lab_groups.csv",
 ).strip()
 
 BACKUP_DIR = os.getenv(
@@ -4433,6 +4449,21 @@ def backup_source_files() -> List[Dict[str, Any]]:
             "required": False,
         },
         {
+            "source": STRATEGY_LAB_JSON_FILE,
+            "name": "diamond_strategy_lab.json",
+            "required": False,
+        },
+        {
+            "source": STRATEGY_LAB_TEXT_FILE,
+            "name": "diamond_strategy_lab.txt",
+            "required": False,
+        },
+        {
+            "source": STRATEGY_LAB_GROUPS_FILE,
+            "name": "diamond_strategy_lab_groups.csv",
+            "required": False,
+        },
+        {
             "source": TEST_REPORT_FILE,
             "name": "diamond_test_report.json",
             "required": False,
@@ -5128,6 +5159,9 @@ def main() -> None:
         MARKET_SIGNALS_CSV_FILE,
         MARKET_SCANNER_STATE_FILE,
         SHADOW_TRADES_FILE,
+        STRATEGY_LAB_JSON_FILE,
+        STRATEGY_LAB_TEXT_FILE,
+        STRATEGY_LAB_GROUPS_FILE,
     ):
         ensure_parent(path)
 
@@ -5143,7 +5177,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v6.8 gestart"
+        "Diamond Agent v6.9 gestart"
     )
 
     LOG.info(
@@ -5196,6 +5230,10 @@ def main() -> None:
 
     LOG.info(
         "Market Scanner-back-up: signalen JSON/CSV, scanner-state en schaduwtrades"
+    )
+
+    LOG.info(
+        "Strategy Lab-back-up: JSON-, tekst- en groepenrapport"
     )
 
     LOG.info(
