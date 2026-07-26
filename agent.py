@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v7.2
+Diamond Agent v7.3
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -21,6 +21,7 @@ Functies:
 - Stuurt direct een e-mail wanneer een Market Scanner-schaduwtrade opent of sluit.
 - Maakt en mailt vaste schaduwmijlpaalrapporten na 5, 10 en 20 gesloten trades.
 - Ververst Strategy Lab direct zodra een schaduwpositie opent of sluit.
+- Neemt Strategy Lab-resultaten op in statusmails en weekrapporten.
 - Neemt de Strategy Lab- en schaduwmijlpaalrapporten mee in de dagelijkse back-up.
 - Bewaart dagelijkse back-ups 30 dagen en verwijdert alleen oude back-upmappen.
 """
@@ -3393,6 +3394,594 @@ def append_market_scanner_status(
         )
 
 
+def format_strategy_lab_profit_factor(
+    value: Any,
+) -> str:
+    if value is None:
+        return "n.v.t."
+
+    return f"{to_float(value, 0.0):.2f}"
+
+
+def strategy_lab_best_group(
+    groups: Dict[str, Any],
+) -> Dict[str, Any]:
+    candidates: List[
+        Dict[str, Any]
+    ] = []
+
+    for name, raw_summary in (
+        groups
+        or {}
+    ).items():
+        if not isinstance(
+            raw_summary,
+            dict,
+        ):
+            continue
+
+        summary = dict(
+            raw_summary
+        )
+
+        summary[
+            "name"
+        ] = str(
+            name
+        )
+
+        candidates.append(
+            summary
+        )
+
+    if not candidates:
+        return {}
+
+    return max(
+        candidates,
+        key=lambda item: (
+            to_float(
+                item.get(
+                    "net_pnl_eur"
+                ),
+                0.0,
+            ),
+            to_float(
+                item.get(
+                    "profit_factor"
+                ),
+                0.0,
+            ),
+            to_float(
+                item.get(
+                    "winrate_pct"
+                ),
+                0.0,
+            ),
+            int(
+                to_float(
+                    item.get(
+                        "trades"
+                    ),
+                    0.0,
+                )
+            ),
+        ),
+    )
+
+
+def load_strategy_lab_email_summary() -> Dict[str, Any]:
+    """
+    Leest het alleen-lezen Strategy Lab-rapport voor status- en weekmails.
+
+    Een ontbrekend, oud of ongeldig rapport blokkeert de gewone
+    Diamond Trader-rapportage niet.
+    """
+    result: Dict[
+        str,
+        Any
+    ] = {
+        "available": False,
+        "status": "NIET BESCHIKBAAR",
+        "version": "-",
+        "mode": "-",
+        "generated_at": None,
+        "generated_text": "-",
+        "age_minutes": None,
+        "safe": False,
+        "errors": [],
+        "data_status": "-",
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "neutral": 0,
+        "winrate_pct": 0.0,
+        "net_pnl_eur": 0.0,
+        "total_fees_eur": 0.0,
+        "profit_factor": None,
+        "average_pnl_eur": 0.0,
+        "average_return_pct": 0.0,
+        "average_duration_minutes": 0.0,
+        "maximum_loss_streak": 0,
+        "stake_scenarios": {},
+        "best_trade": {},
+        "worst_trade": {},
+        "best_strategy": {},
+        "best_symbol": {},
+        "best_side": {},
+        "best_market_regime": {},
+        "recommendations": [],
+    }
+
+    path = Path(
+        STRATEGY_LAB_JSON_FILE
+    )
+
+    if not path.is_file():
+        return result
+
+    report = load_json(
+        STRATEGY_LAB_JSON_FILE,
+        {},
+    )
+
+    if not report:
+        result[
+            "status"
+        ] = "ONLEESBAAR"
+
+        return result
+
+    generated = parse_iso_datetime(
+        report.get(
+            "generated_at"
+        )
+    )
+
+    age_minutes: Optional[
+        float
+    ] = None
+
+    if generated is not None:
+        age_minutes = max(
+            0.0,
+            (
+                now_local()
+                - generated
+            ).total_seconds()
+            / 60.0,
+        )
+
+    safety = (
+        report.get(
+            "safety"
+        )
+        or {}
+    )
+
+    safe = (
+        report.get(
+            "mode"
+        )
+        == "READ_ONLY_STRATEGY_ANALYSIS"
+        and safety.get(
+            "orders_possible"
+        )
+        is False
+        and safety.get(
+            "exchange_connection_used"
+        )
+        is False
+        and safety.get(
+            "bot_state_modified"
+        )
+        is False
+        and safety.get(
+            "scanner_state_modified"
+        )
+        is False
+        and safety.get(
+            "settings_modified"
+        )
+        is False
+        and safety.get(
+            "automatic_strategy_changes"
+        )
+        is False
+    )
+
+    errors = (
+        report.get(
+            "errors"
+        )
+        or []
+    )
+
+    if not isinstance(
+        errors,
+        list,
+    ):
+        errors = [
+            str(
+                errors
+            )
+        ]
+
+    if not safe:
+        status = "VEILIGHEID CONTROLEREN"
+    elif errors:
+        status = "RAPPORTFOUTEN"
+    elif age_minutes is None:
+        status = "GEEN GELDIGE TIJD"
+    elif age_minutes > 390.0:
+        status = "VEROUDERD"
+    else:
+        status = "ACTUEEL EN VEILIG"
+
+    shadow = (
+        report.get(
+            "shadow_trades"
+        )
+        or {}
+    )
+
+    groups = (
+        report.get(
+            "groups"
+        )
+        or {}
+    )
+
+    result.update({
+        "available": True,
+        "status": status,
+        "version": report.get(
+            "version"
+        )
+        or "-",
+        "mode": report.get(
+            "mode"
+        )
+        or "-",
+        "generated_at": report.get(
+            "generated_at"
+        ),
+        "generated_text": (
+            generated.strftime(
+                "%d-%m-%Y %H:%M"
+            )
+            if generated is not None
+            else "-"
+        ),
+        "age_minutes": age_minutes,
+        "safe": safe,
+        "errors": errors,
+        "data_status": shadow.get(
+            "data_status"
+        )
+        or "-",
+        "trades": int(
+            to_float(
+                shadow.get(
+                    "trades"
+                ),
+                0.0,
+            )
+        ),
+        "wins": int(
+            to_float(
+                shadow.get(
+                    "wins"
+                ),
+                0.0,
+            )
+        ),
+        "losses": int(
+            to_float(
+                shadow.get(
+                    "losses"
+                ),
+                0.0,
+            )
+        ),
+        "neutral": int(
+            to_float(
+                shadow.get(
+                    "neutral"
+                ),
+                0.0,
+            )
+        ),
+        "winrate_pct": to_float(
+            shadow.get(
+                "winrate_pct"
+            ),
+            0.0,
+        ),
+        "net_pnl_eur": to_float(
+            shadow.get(
+                "net_pnl_eur"
+            ),
+            0.0,
+        ),
+        "total_fees_eur": to_float(
+            shadow.get(
+                "total_fees_eur"
+            ),
+            0.0,
+        ),
+        "profit_factor": shadow.get(
+            "profit_factor"
+        ),
+        "average_pnl_eur": to_float(
+            shadow.get(
+                "average_pnl_eur"
+            ),
+            0.0,
+        ),
+        "average_return_pct": to_float(
+            shadow.get(
+                "average_return_pct"
+            ),
+            0.0,
+        ),
+        "average_duration_minutes": to_float(
+            shadow.get(
+                "average_duration_minutes"
+            ),
+            0.0,
+        ),
+        "maximum_loss_streak": int(
+            to_float(
+                shadow.get(
+                    "maximum_loss_streak"
+                ),
+                0.0,
+            )
+        ),
+        "stake_scenarios": (
+            shadow.get(
+                "stake_scenarios"
+            )
+            or {}
+        ),
+        "best_trade": (
+            shadow.get(
+                "best_trade"
+            )
+            or {}
+        ),
+        "worst_trade": (
+            shadow.get(
+                "worst_trade"
+            )
+            or {}
+        ),
+        "best_strategy": strategy_lab_best_group(
+            groups.get(
+                "strategy"
+            )
+            or {}
+        ),
+        "best_symbol": strategy_lab_best_group(
+            groups.get(
+                "symbol"
+            )
+            or {}
+        ),
+        "best_side": strategy_lab_best_group(
+            groups.get(
+                "side"
+            )
+            or {}
+        ),
+        "best_market_regime": strategy_lab_best_group(
+            groups.get(
+                "market_regime"
+            )
+            or {}
+        ),
+        "recommendations": (
+            report.get(
+                "recommendations"
+            )
+            or []
+        ),
+    })
+
+    return result
+
+
+def strategy_lab_group_line(
+    label: str,
+    group: Dict[str, Any],
+) -> str:
+    if not group:
+        return (
+            f"{label:<24}: nog geen gesloten trades"
+        )
+
+    return (
+        f"{label:<24}: "
+        f"{group.get('name', '-')} | "
+        f"trades={int(to_float(group.get('trades'), 0.0))} | "
+        f"winrate={to_float(group.get('winrate_pct'), 0.0):.1f}% | "
+        f"pnl=€{to_float(group.get('net_pnl_eur'), 0.0):+.4f}"
+    )
+
+
+def append_strategy_lab_status(
+    lines: List[str],
+    lab: Dict[str, Any],
+) -> None:
+    age_text = "-"
+
+    if lab.get(
+        "age_minutes"
+    ) is not None:
+        age_text = (
+            f"{to_float(lab.get('age_minutes'), 0.0):.1f} minuten"
+        )
+
+    progress = get_shadow_milestone_progress(
+        int(
+            to_float(
+                lab.get(
+                    "trades"
+                ),
+                0.0,
+            )
+        )
+    )
+
+    next_milestone = progress.get(
+        "next_milestone"
+    )
+
+    if next_milestone is None:
+        milestone_text = "20/20 bereikt"
+    else:
+        milestone_text = (
+            f"{progress.get('closed_trades', 0)}/"
+            f"{next_milestone} "
+            f"(nog {progress.get('remaining', 0)})"
+        )
+
+    lines.extend([
+        "",
+        "STRATEGY LAB",
+        f"Status                  : {lab.get('status', '-')}",
+        f"Versie                  : {lab.get('version', '-')}",
+        f"Laatste verwerking      : {lab.get('generated_text', '-')}",
+        f"Leeftijd rapport        : {age_text}",
+        f"Datastatus              : {lab.get('data_status', '-')}",
+        f"Gesloten schaduwtrades  : {int(to_float(lab.get('trades'), 0.0))}",
+        f"Volgende mijlpaal       : {milestone_text}",
+        (
+            "Winst/verlies/neutraal  : "
+            f"{int(to_float(lab.get('wins'), 0.0))}/"
+            f"{int(to_float(lab.get('losses'), 0.0))}/"
+            f"{int(to_float(lab.get('neutral'), 0.0))}"
+        ),
+        f"Winrate                 : {to_float(lab.get('winrate_pct'), 0.0):.2f}%",
+        f"Nettoresultaat          : €{to_float(lab.get('net_pnl_eur'), 0.0):+.4f}",
+        f"Totale kosten           : €{to_float(lab.get('total_fees_eur'), 0.0):.4f}",
+        f"Profit factor           : {format_strategy_lab_profit_factor(lab.get('profit_factor'))}",
+        f"Gemiddeld rendement     : {to_float(lab.get('average_return_pct'), 0.0):+.4f}%",
+        strategy_lab_group_line(
+            "Beste strategie",
+            lab.get(
+                "best_strategy"
+            )
+            or {},
+        ),
+        strategy_lab_group_line(
+            "Beste munt",
+            lab.get(
+                "best_symbol"
+            )
+            or {},
+        ),
+    ])
+
+
+def append_strategy_lab_weekly(
+    lines: List[str],
+    lab: Dict[str, Any],
+) -> None:
+    lines.extend([
+        "",
+        "STRATEGY LAB - ACTUELE TOTAALANALYSE",
+        f"Labstatus               : {lab.get('status', '-')}",
+        f"Datastatus              : {lab.get('data_status', '-')}",
+        f"Gesloten schaduwtrades  : {int(to_float(lab.get('trades'), 0.0))}",
+        (
+            "Winst/verlies/neutraal  : "
+            f"{int(to_float(lab.get('wins'), 0.0))}/"
+            f"{int(to_float(lab.get('losses'), 0.0))}/"
+            f"{int(to_float(lab.get('neutral'), 0.0))}"
+        ),
+        f"Winrate                 : {to_float(lab.get('winrate_pct'), 0.0):.2f}%",
+        f"Nettoresultaat          : €{to_float(lab.get('net_pnl_eur'), 0.0):+.4f}",
+        f"Totale kosten           : €{to_float(lab.get('total_fees_eur'), 0.0):.4f}",
+        f"Profit factor           : {format_strategy_lab_profit_factor(lab.get('profit_factor'))}",
+        f"Gemiddelde per trade    : €{to_float(lab.get('average_pnl_eur'), 0.0):+.4f}",
+        f"Gemiddeld rendement     : {to_float(lab.get('average_return_pct'), 0.0):+.4f}%",
+        f"Gemiddelde looptijd     : {to_float(lab.get('average_duration_minutes'), 0.0):.1f} minuten",
+        f"Max. verliesreeks       : {int(to_float(lab.get('maximum_loss_streak'), 0.0))}",
+        "",
+        "STRATEGY LAB - BESTE GROEPEN",
+        strategy_lab_group_line(
+            "Beste strategie",
+            lab.get(
+                "best_strategy"
+            )
+            or {},
+        ),
+        strategy_lab_group_line(
+            "Beste munt",
+            lab.get(
+                "best_symbol"
+            )
+            or {},
+        ),
+        strategy_lab_group_line(
+            "Beste richting",
+            lab.get(
+                "best_side"
+            )
+            or {},
+        ),
+        strategy_lab_group_line(
+            "Beste marktregime",
+            lab.get(
+                "best_market_regime"
+            )
+            or {},
+        ),
+        "",
+        "STRATEGY LAB - INZETVERGELIJKING",
+    ])
+
+    scenarios = (
+        lab.get(
+            "stake_scenarios"
+        )
+        or {}
+    )
+
+    for stake in (
+        120,
+        125,
+        130,
+        135,
+    ):
+        lines.append(
+            f"€{stake:>3} per trade          : "
+            f"€{to_float(scenarios.get(str(stake)), 0.0):+.4f}"
+        )
+
+    recommendations = (
+        lab.get(
+            "recommendations"
+        )
+        or []
+    )
+
+    if recommendations:
+        lines.extend([
+            "",
+            "STRATEGY LAB - BEOORDELING",
+        ])
+
+        for recommendation in recommendations[
+            :3
+        ]:
+            lines.append(
+                f"- {recommendation}"
+            )
+
+
 def build_report(
     exchange: ccxt.Exchange,
 ) -> str:
@@ -3400,6 +3989,7 @@ def build_report(
     control = load_control()
     trades = load_trades()
     scanner = load_market_scanner_summary()
+    strategy_lab = load_strategy_lab_email_summary()
 
     spot_sells = [
         row
@@ -3558,6 +4148,11 @@ def build_report(
         scanner,
     )
 
+    append_strategy_lab_status(
+        lines,
+        strategy_lab,
+    )
+
     lines.extend([
         "",
         "=" * 60,
@@ -3580,6 +4175,7 @@ def build_weekly_report(
     trades = load_trades()
     scanner = load_market_scanner_summary()
     scanner_week = load_market_scanner_week_activity()
+    strategy_lab = load_strategy_lab_email_summary()
 
     week_trades = get_week_trades(
         trades
@@ -3702,11 +4298,17 @@ def build_weekly_report(
             ),
         ])
 
+    append_strategy_lab_weekly(
+        lines,
+        strategy_lab,
+    )
+
     lines.extend([
         "",
-        "LET OP",
-        "De automatische wekelijkse verhoging van de inzet",
-        "wordt in de volgende stap toegevoegd.",
+        "TESTBELEID",
+        "De inzet blijft tijdens de lopende long-, short- en",
+        "schaduwtests ongewijzigd, zodat resultaten vergelijkbaar blijven.",
+        "Er worden geen instellingen automatisch aangepast.",
         "=" * 60,
     ])
 
@@ -7241,7 +7843,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v7.2 gestart"
+        "Diamond Agent v7.3 gestart"
     )
 
     LOG.info(
@@ -7310,6 +7912,10 @@ def main() -> None:
 
     LOG.info(
         "Strategy Lab directe verversing: bij openen en sluiten"
+    )
+
+    LOG.info(
+        "Strategy Lab e-mailintegratie: statusmail en weekrapport"
     )
 
     LOG.info(

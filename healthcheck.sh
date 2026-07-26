@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.5
+# Diamond Trader Healthcheck v7.6
 # Alleen lezen: wijzigt geen bot-, test-, scanner- of Strategy Lab-bestanden.
 
 set -u
@@ -813,6 +813,14 @@ if [ -f "$PROJECT_DIR/strategy_lab.py" ]; then
         echo "[FOUT]  Strategy Lab Pythoncontrole mislukt"
         ERRORS=$((ERRORS + 1))
     fi
+fi
+
+if     grep -q "def append_strategy_lab_status" "$PROJECT_DIR/agent.py"     && grep -q "def append_strategy_lab_weekly" "$PROJECT_DIR/agent.py"     && grep -q "Strategy Lab e-mailintegratie: statusmail en weekrapport" "$PROJECT_DIR/agent.py"
+then
+    echo "[OK]    Strategy Lab is gekoppeld aan statusmail en weekrapport"
+else
+    echo "[FOUT]  Strategy Lab e-mailintegratie ontbreekt of is onvolledig"
+    ERRORS=$((ERRORS + 1))
 fi
 
 if [ -f "$STRATEGY_LAB_JSON_FILE" ]; then
