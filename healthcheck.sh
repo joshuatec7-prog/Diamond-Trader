@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.6
+# Diamond Trader Healthcheck v7.7
 # Alleen lezen: wijzigt geen bot-, test-, scanner- of Strategy Lab-bestanden.
 
 set -u
@@ -296,6 +296,59 @@ print(
     "        Lab-runfout      : "
     f"{data.get('last_strategy_lab_refresh_error') or '-'}"
 )
+print(
+    "        Scannerwatch     : "
+    f"{data.get('scanner_watch_last_status') or '-'}"
+)
+print(
+    "        Watch-controles  : "
+    f"{int(data.get('scanner_watch_checks', 0) or 0)}"
+)
+print(
+    "        Laatste watch    : "
+    f"{data.get('scanner_watch_last_check_at') or '-'}"
+)
+print(
+    "        Laatste geschikt : "
+    f"{data.get('scanner_watch_last_suitable_at') or '-'}"
+)
+print(
+    "        Uren zonder      : "
+    f"{float(data.get('scanner_watch_hours_without_suitable', 0) or 0):.1f}"
+)
+print(
+    "        Signalen 24 uur  : "
+    f"{int(data.get('scanner_watch_signals_window', 0) or 0)}"
+)
+print(
+    "        Geschikt 24 uur  : "
+    f"{int(data.get('scanner_watch_eligible_window', 0) or 0)}"
+)
+print(
+    "        Afgewezen 24 uur : "
+    f"{int(data.get('scanner_watch_rejected_window', 0) or 0)}"
+)
+print(
+    "        Dominant filter  : "
+    f"{data.get('scanner_watch_dominant_filter') or '-'} | "
+    f"{float(data.get('scanner_watch_dominant_share_pct', 0) or 0):.1f}%"
+)
+print(
+    "        Watchmail actief : "
+    f"{'JA' if data.get('scanner_watch_alert_active') else 'NEE'}"
+)
+print(
+    "        Waarschuwingen   : "
+    f"{int(data.get('scanner_watch_alert_count', 0) or 0)}"
+)
+print(
+    "        Herstelmails     : "
+    f"{int(data.get('scanner_watch_recovery_count', 0) or 0)}"
+)
+print(
+    "        Watchfout        : "
+    f"{data.get('scanner_watch_last_error') or '-'}"
+)
 print(f"        Laatste back-up   : {data.get('last_backup_at') or '-'}")
 print(f"        Back-upstatus     : {data.get('last_backup_status') or '-'}")
 
@@ -308,6 +361,17 @@ lab_status = str(
 
 if lab_status == "failed":
     print("        [FOUT] Laatste directe Strategy Lab-verversing is mislukt")
+    raise SystemExit(1)
+
+watch_status = str(
+    data.get(
+        "scanner_watch_last_status"
+    )
+    or ""
+).strip().upper()
+
+if watch_status == "FOUT":
+    print("        [FOUT] Laatste Scannerwatch-controle is mislukt")
     raise SystemExit(1)
 PY
     then
@@ -820,6 +884,14 @@ then
     echo "[OK]    Strategy Lab is gekoppeld aan statusmail en weekrapport"
 else
     echo "[FOUT]  Strategy Lab e-mailintegratie ontbreekt of is onvolledig"
+    ERRORS=$((ERRORS + 1))
+fi
+
+if     grep -q "def handle_scanner_watch_alerts" "$PROJECT_DIR/agent.py"     && grep -q "def analyse_scanner_watch" "$PROJECT_DIR/agent.py"     && grep -q "Scannerbewaking: 24 uur stilte en dominant afwijzingsfilter" "$PROJECT_DIR/agent.py"
+then
+    echo "[OK]    Scannerbewaking en waarschuwingse-mails zijn actief"
+else
+    echo "[FOUT]  Scannerbewaking ontbreekt of is onvolledig"
     ERRORS=$((ERRORS + 1))
 fi
 

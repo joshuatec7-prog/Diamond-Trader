@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v7.3
+Diamond Agent v7.4
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -22,6 +22,7 @@ Functies:
 - Maakt en mailt vaste schaduwmijlpaalrapporten na 5, 10 en 20 gesloten trades.
 - Ververst Strategy Lab direct zodra een schaduwpositie opent of sluit.
 - Neemt Strategy Lab-resultaten op in statusmails en weekrapporten.
+- Waarschuwt bij langdurig geen geschikte schaduwtrade of een dominant afwijzingsfilter.
 - Neemt de Strategy Lab- en schaduwmijlpaalrapporten mee in de dagelijkse back-up.
 - Bewaart dagelijkse back-ups 30 dagen en verwijdert alleen oude back-upmappen.
 """
@@ -249,6 +250,17 @@ SHADOW_MILESTONE_STAKES = (
 # Directe Strategy Lab-verversing bij een gewijzigde schaduwstand.
 STRATEGY_LAB_REFRESH_TIMEOUT_SECONDS = 120
 STRATEGY_LAB_REFRESH_RETRY_MINUTES = 15
+
+# Market Scanner-bewaking.
+# De bewaking is uitsluitend adviserend en wijzigt geen filters.
+SCANNER_WATCH_CHECK_INTERVAL_SECONDS = 15 * 60
+SCANNER_WATCH_ANALYSIS_HOURS = 24
+SCANNER_WATCH_STAGNATION_HOURS = 24
+SCANNER_WATCH_ALERT_COOLDOWN_HOURS = 24
+SCANNER_WATCH_RETRY_MINUTES = 15
+SCANNER_WATCH_MIN_REJECTED_SIGNALS = 10
+SCANNER_WATCH_DOMINANT_MIN_COUNT = 8
+SCANNER_WATCH_DOMINANT_SHARE_PCT = 60.0
 
 
 # ============================================================
@@ -751,6 +763,28 @@ def default_agent_state() -> Dict[str, Any]:
         "last_strategy_lab_refresh_status": "",
         "last_strategy_lab_refresh_error": "",
         "strategy_lab_refresh_count": 0,
+        "last_scanner_watch_ts": 0.0,
+        "scanner_watch_checks": 0,
+        "scanner_watch_last_check_at": "",
+        "scanner_watch_last_status": "",
+        "scanner_watch_last_suitable_at": "",
+        "scanner_watch_hours_without_suitable": 0.0,
+        "scanner_watch_signals_window": 0,
+        "scanner_watch_eligible_window": 0,
+        "scanner_watch_rejected_window": 0,
+        "scanner_watch_dominant_filter": "",
+        "scanner_watch_dominant_count": 0,
+        "scanner_watch_dominant_share_pct": 0.0,
+        "scanner_watch_active_conditions": [],
+        "scanner_watch_alert_active": False,
+        "scanner_watch_alert_fingerprint": "",
+        "scanner_watch_last_alert_at": "",
+        "scanner_watch_last_attempt_fingerprint": "",
+        "scanner_watch_last_attempt_at": "",
+        "scanner_watch_alert_count": 0,
+        "scanner_watch_last_recovery_at": "",
+        "scanner_watch_recovery_count": 0,
+        "scanner_watch_last_error": "",
         "last_backup_date": "",
         "last_backup_at": "",
         "last_backup_path": "",
@@ -862,6 +896,12 @@ def load_agent_state() -> Dict[str, Any]:
         list,
     ):
         state["notified_shadow_close_keys"] = []
+
+    if not isinstance(
+        state.get("scanner_watch_active_conditions"),
+        list,
+    ):
+        state["scanner_watch_active_conditions"] = []
 
     defaults = default_agent_state()
 
@@ -3990,6 +4030,7 @@ def build_report(
     trades = load_trades()
     scanner = load_market_scanner_summary()
     strategy_lab = load_strategy_lab_email_summary()
+    scanner_watch = scanner_watch_summary_from_state()
 
     spot_sells = [
         row
@@ -4153,6 +4194,11 @@ def build_report(
         strategy_lab,
     )
 
+    append_scanner_watch_status(
+        lines,
+        scanner_watch,
+    )
+
     lines.extend([
         "",
         "=" * 60,
@@ -4176,6 +4222,7 @@ def build_weekly_report(
     scanner = load_market_scanner_summary()
     scanner_week = load_market_scanner_week_activity()
     strategy_lab = load_strategy_lab_email_summary()
+    scanner_watch = scanner_watch_summary_from_state()
 
     week_trades = get_week_trades(
         trades
@@ -4301,6 +4348,11 @@ def build_weekly_report(
     append_strategy_lab_weekly(
         lines,
         strategy_lab,
+    )
+
+    append_scanner_watch_status(
+        lines,
+        scanner_watch,
     )
 
     lines.extend([
@@ -7300,6 +7352,1145 @@ def refresh_strategy_lab_if_needed(
     return True
 
 
+# ============================================================
+# Market Scanner-bewaking
+# ============================================================
+
+def scanner_rejection_category(
+    reason: Any,
+) -> str:
+    text = str(
+        reason
+        or ""
+    ).strip()
+
+    lowered = text.lower()
+
+    if not lowered:
+        return "onbekend"
+
+    if "spread" in lowered:
+        return "spread"
+
+    if (
+        "risico/winst" in lowered
+        or "reward/risk" in lowered
+        or "reward risk" in lowered
+        or "rr " in lowered
+    ):
+        return "risico/winst"
+
+    if (
+        "verwachte winst" in lowered
+        or "expected profit" in lowered
+        or "min_profit" in lowered
+    ):
+        return "verwachte winst"
+
+    if "atr" in lowered:
+        return "ATR"
+
+    if "rsi" in lowered:
+        return "RSI"
+
+    if "score" in lowered:
+        return "score"
+
+    if (
+        "volume" in lowered
+        or "liquiditeit" in lowered
+        or "liquidity" in lowered
+    ):
+        return "liquiditeit"
+
+    if (
+        "trend" in lowered
+        or "marktregime" in lowered
+        or "market regime" in lowered
+    ):
+        return "trend/marktregime"
+
+    return text[
+        :80
+    ]
+
+
+def split_scanner_rejection_reasons(
+    raw: Any,
+) -> List[str]:
+    text = str(
+        raw
+        or ""
+    ).strip()
+
+    if not text:
+        return []
+
+    return [
+        item.strip()
+        for item in text.split(
+            "|"
+        )
+        if item.strip()
+    ]
+
+
+def load_scanner_signal_rows() -> List[Dict[str, str]]:
+    path = Path(
+        MARKET_SIGNALS_CSV_FILE
+    )
+
+    if not path.is_file():
+        return []
+
+    try:
+        with path.open(
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as file:
+            return list(
+                csv.DictReader(
+                    file
+                )
+            )
+
+    except Exception as exc:
+        LOG.warning(
+            "Scanner-signalen voor bewaking lezen mislukt: %s",
+            exc,
+        )
+
+        return []
+
+
+def latest_shadow_suitable_time(
+    signal_rows: List[Dict[str, str]],
+    scanner_state: Dict[str, Any],
+) -> Optional[datetime]:
+    candidates: List[
+        datetime
+    ] = []
+
+    started = parse_iso_datetime(
+        scanner_state.get(
+            "started_at"
+        )
+    )
+
+    if started is not None:
+        candidates.append(
+            started
+        )
+
+    for row in signal_rows:
+        if not to_bool(
+            row.get(
+                "shadow_eligible"
+            ),
+            False,
+        ):
+            continue
+
+        detected = parse_iso_datetime(
+            row.get(
+                "detected_at"
+            )
+        )
+
+        if detected is not None:
+            candidates.append(
+                detected
+            )
+
+    for position in load_shadow_open_positions():
+        opened = parse_iso_datetime(
+            position.get(
+                "opened_at"
+            )
+        )
+
+        if opened is not None:
+            candidates.append(
+                opened
+            )
+
+    for trade in load_shadow_closed_trades():
+        opened = parse_iso_datetime(
+            trade.get(
+                "opened_at"
+            )
+        )
+
+        if opened is not None:
+            candidates.append(
+                opened
+            )
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates
+    )
+
+
+def analyse_scanner_watch() -> Dict[str, Any]:
+    now_value = now_local()
+    cutoff = (
+        now_value
+        - timedelta(
+            hours=(
+                SCANNER_WATCH_ANALYSIS_HOURS
+            )
+        )
+    )
+
+    scanner = load_market_scanner_summary()
+    scanner_state = load_json(
+        MARKET_SCANNER_STATE_FILE,
+        {},
+    )
+
+    rows = load_scanner_signal_rows()
+
+    signals_window = 0
+    eligible_window = 0
+    rejected_window = 0
+
+    category_counts: Dict[
+        str,
+        int
+    ] = {}
+
+    category_examples: Dict[
+        str,
+        List[str]
+    ] = {}
+
+    for row in rows:
+        detected = parse_iso_datetime(
+            row.get(
+                "detected_at"
+            )
+        )
+
+        if (
+            detected is None
+            or detected < cutoff
+        ):
+            continue
+
+        signals_window += 1
+
+        eligible = to_bool(
+            row.get(
+                "shadow_eligible"
+            ),
+            False,
+        )
+
+        if eligible:
+            eligible_window += 1
+            continue
+
+        rejected_window += 1
+
+        raw_reasons = (
+            row.get(
+                "shadow_rejection_reasons"
+            )
+            or row.get(
+                "rejection_reasons"
+            )
+            or ""
+        )
+
+        reasons = split_scanner_rejection_reasons(
+            raw_reasons
+        )
+
+        categories_for_signal = set()
+
+        for reason in reasons:
+            category = scanner_rejection_category(
+                reason
+            )
+
+            categories_for_signal.add(
+                category
+            )
+
+            examples = category_examples.setdefault(
+                category,
+                [],
+            )
+
+            if (
+                reason not in examples
+                and len(
+                    examples
+                ) < 3
+            ):
+                examples.append(
+                    reason
+                )
+
+        for category in categories_for_signal:
+            category_counts[
+                category
+            ] = (
+                category_counts.get(
+                    category,
+                    0,
+                )
+                + 1
+            )
+
+    dominant_filter = ""
+    dominant_count = 0
+    dominant_share_pct = 0.0
+    dominant_examples: List[
+        str
+    ] = []
+
+    if category_counts:
+        dominant_filter, dominant_count = max(
+            category_counts.items(),
+            key=lambda item: (
+                item[1],
+                item[0],
+            ),
+        )
+
+        dominant_share_pct = (
+            100.0
+            * dominant_count
+            / rejected_window
+            if rejected_window
+            else 0.0
+        )
+
+        dominant_examples = (
+            category_examples.get(
+                dominant_filter,
+                [],
+            )
+        )
+
+    started_at = parse_iso_datetime(
+        scanner_state.get(
+            "started_at"
+        )
+    )
+
+    running_hours = (
+        max(
+            0.0,
+            (
+                now_value
+                - started_at
+            ).total_seconds()
+            / 3600.0,
+        )
+        if started_at is not None
+        else 0.0
+    )
+
+    last_suitable = latest_shadow_suitable_time(
+        rows,
+        scanner_state,
+    )
+
+    hours_without_suitable = (
+        max(
+            0.0,
+            (
+                now_value
+                - last_suitable
+            ).total_seconds()
+            / 3600.0,
+        )
+        if last_suitable is not None
+        else running_hours
+    )
+
+    open_positions = int(
+        to_float(
+            scanner.get(
+                "open_positions_count"
+            ),
+            0.0,
+        )
+    )
+
+    scanner_healthy = bool(
+        scanner.get(
+            "healthy"
+        )
+    )
+
+    stagnation = (
+        scanner_healthy
+        and open_positions == 0
+        and running_hours
+        >= SCANNER_WATCH_STAGNATION_HOURS
+        and hours_without_suitable
+        >= SCANNER_WATCH_STAGNATION_HOURS
+    )
+
+    dominant_rejection = (
+        scanner_healthy
+        and rejected_window
+        >= SCANNER_WATCH_MIN_REJECTED_SIGNALS
+        and dominant_count
+        >= SCANNER_WATCH_DOMINANT_MIN_COUNT
+        and dominant_share_pct
+        >= SCANNER_WATCH_DOMINANT_SHARE_PCT
+    )
+
+    conditions: List[
+        str
+    ] = []
+
+    if stagnation:
+        conditions.append(
+            "LANG GEEN GESCHIKTE SCHADUWTRADE"
+        )
+
+    if dominant_rejection:
+        conditions.append(
+            (
+                "DOMINANT AFWIJZINGSFILTER: "
+                f"{dominant_filter}"
+            )
+        )
+
+    if not scanner.get(
+        "available"
+    ):
+        status = "SCANNER NIET BESCHIKBAAR"
+    elif not scanner_healthy:
+        status = "SCANNER NIET ACTUEEL"
+    elif conditions:
+        status = "WAARSCHUWING"
+    elif rejected_window < (
+        SCANNER_WATCH_MIN_REJECTED_SIGNALS
+    ):
+        status = "NORMAAL - NOG WEINIG AFWIJZINGSDATA"
+    else:
+        status = "NORMAAL"
+
+    fingerprint_source = "|".join(
+        conditions
+    )
+
+    fingerprint = (
+        hashlib.sha256(
+            fingerprint_source.encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        if fingerprint_source
+        else ""
+    )
+
+    return {
+        "checked_at": now_value.isoformat(),
+        "status": status,
+        "scanner_healthy": scanner_healthy,
+        "scanner_status": scanner.get(
+            "status"
+        )
+        or "-",
+        "running_hours": round(
+            running_hours,
+            2,
+        ),
+        "last_suitable_at": (
+            last_suitable.isoformat()
+            if last_suitable is not None
+            else ""
+        ),
+        "hours_without_suitable": round(
+            hours_without_suitable,
+            2,
+        ),
+        "open_positions": open_positions,
+        "signals_window": signals_window,
+        "eligible_window": eligible_window,
+        "rejected_window": rejected_window,
+        "dominant_filter": dominant_filter,
+        "dominant_count": dominant_count,
+        "dominant_share_pct": round(
+            dominant_share_pct,
+            2,
+        ),
+        "dominant_examples": dominant_examples,
+        "stagnation": stagnation,
+        "dominant_rejection": (
+            dominant_rejection
+        ),
+        "conditions": conditions,
+        "fingerprint": fingerprint,
+    }
+
+
+def format_scanner_watch_email(
+    analysis: Dict[str, Any],
+) -> str:
+    lines = [
+        "=" * 68,
+        "DIAMOND MARKET SCANNER - BEWAKINGSWAARSCHUWING",
+        "=" * 68,
+        "",
+        f"Controle uitgevoerd      : {analysis.get('checked_at') or '-'}",
+        f"Scannerstatus            : {analysis.get('scanner_status') or '-'}",
+        f"Scanner actief           : {to_float(analysis.get('running_hours'), 0.0):.1f} uur",
+        f"Open schaduwposities     : {int(to_float(analysis.get('open_positions'), 0.0))}",
+        f"Laatste geschikt moment  : {analysis.get('last_suitable_at') or '-'}",
+        f"Uren zonder geschikt     : {to_float(analysis.get('hours_without_suitable'), 0.0):.1f}",
+        "",
+        f"ANALYSE AFGELOPEN {SCANNER_WATCH_ANALYSIS_HOURS} UUR",
+        f"Signalen                 : {int(to_float(analysis.get('signals_window'), 0.0))}",
+        f"Geschikt voor schaduw    : {int(to_float(analysis.get('eligible_window'), 0.0))}",
+        f"Afgewezen                : {int(to_float(analysis.get('rejected_window'), 0.0))}",
+        "",
+        "VASTGESTELDE WAARSCHUWINGEN",
+    ]
+
+    conditions = (
+        analysis.get(
+            "conditions"
+        )
+        or []
+    )
+
+    for condition in conditions:
+        lines.append(
+            f"- {condition}"
+        )
+
+    if analysis.get(
+        "dominant_rejection"
+    ):
+        lines.extend([
+            "",
+            "DOMINANT FILTER",
+            f"Filter                   : {analysis.get('dominant_filter') or '-'}",
+            f"Aantal getroffen signalen: {int(to_float(analysis.get('dominant_count'), 0.0))}",
+            f"Aandeel afwijzingen      : {to_float(analysis.get('dominant_share_pct'), 0.0):.1f}%",
+        ])
+
+        examples = (
+            analysis.get(
+                "dominant_examples"
+            )
+            or []
+        )
+
+        if examples:
+            lines.append(
+                "Voorbeelden:"
+            )
+
+            for example in examples:
+                lines.append(
+                    f"- {example}"
+                )
+
+    lines.extend([
+        "",
+        "ACTIE",
+        "Dit bericht is uitsluitend adviserend.",
+        "Er zijn geen filters, inzetten, stops of strategieën gewijzigd.",
+        "De Market Scanner blijft virtueel en kan geen echte orders plaatsen.",
+        "Beoordeling gebeurt pas op basis van voldoende gesloten schaduwtrades.",
+        "=" * 68,
+    ])
+
+    return "\n".join(
+        lines
+    )
+
+
+def format_scanner_watch_recovery_email(
+    analysis: Dict[str, Any],
+) -> str:
+    return "\n".join([
+        "=" * 68,
+        "DIAMOND MARKET SCANNER - BEWAKING HERSTELD",
+        "=" * 68,
+        "",
+        f"Controle uitgevoerd      : {analysis.get('checked_at') or '-'}",
+        f"Scannerstatus            : {analysis.get('scanner_status') or '-'}",
+        f"Laatste geschikt moment  : {analysis.get('last_suitable_at') or '-'}",
+        f"Uren zonder geschikt     : {to_float(analysis.get('hours_without_suitable'), 0.0):.1f}",
+        f"Signalen laatste 24 uur  : {int(to_float(analysis.get('signals_window'), 0.0))}",
+        f"Afgewezen laatste 24 uur : {int(to_float(analysis.get('rejected_window'), 0.0))}",
+        "",
+        "De eerdere waarschuwingssituatie is niet meer actief.",
+        "Er zijn geen instellingen automatisch gewijzigd.",
+        "=" * 68,
+    ])
+
+
+def scanner_watch_retry_allowed(
+    agent_state: Dict[str, Any],
+    fingerprint: str,
+) -> bool:
+    if (
+        agent_state.get(
+            "scanner_watch_last_attempt_fingerprint"
+        )
+        != fingerprint
+    ):
+        return True
+
+    attempted = parse_iso_datetime(
+        agent_state.get(
+            "scanner_watch_last_attempt_at"
+        )
+    )
+
+    if attempted is None:
+        return True
+
+    return (
+        now_local()
+        - attempted
+    ).total_seconds() >= (
+        SCANNER_WATCH_RETRY_MINUTES
+        * 60
+    )
+
+
+def scanner_watch_cooldown_elapsed(
+    agent_state: Dict[str, Any],
+) -> bool:
+    sent_at = parse_iso_datetime(
+        agent_state.get(
+            "scanner_watch_last_alert_at"
+        )
+    )
+
+    if sent_at is None:
+        return True
+
+    return (
+        now_local()
+        - sent_at
+    ).total_seconds() >= (
+        SCANNER_WATCH_ALERT_COOLDOWN_HOURS
+        * 3600
+    )
+
+
+def save_scanner_watch_analysis(
+    agent_state: Dict[str, Any],
+    analysis: Dict[str, Any],
+) -> None:
+    agent_state[
+        "last_scanner_watch_ts"
+    ] = time.time()
+
+    agent_state[
+        "scanner_watch_checks"
+    ] = int(
+        to_float(
+            agent_state.get(
+                "scanner_watch_checks"
+            ),
+            0.0,
+        )
+    ) + 1
+
+    agent_state[
+        "scanner_watch_last_check_at"
+    ] = analysis.get(
+        "checked_at"
+    ) or now_local().isoformat()
+
+    agent_state[
+        "scanner_watch_last_status"
+    ] = analysis.get(
+        "status"
+    ) or "-"
+
+    agent_state[
+        "scanner_watch_last_suitable_at"
+    ] = analysis.get(
+        "last_suitable_at"
+    ) or ""
+
+    agent_state[
+        "scanner_watch_hours_without_suitable"
+    ] = to_float(
+        analysis.get(
+            "hours_without_suitable"
+        ),
+        0.0,
+    )
+
+    agent_state[
+        "scanner_watch_signals_window"
+    ] = int(
+        to_float(
+            analysis.get(
+                "signals_window"
+            ),
+            0.0,
+        )
+    )
+
+    agent_state[
+        "scanner_watch_eligible_window"
+    ] = int(
+        to_float(
+            analysis.get(
+                "eligible_window"
+            ),
+            0.0,
+        )
+    )
+
+    agent_state[
+        "scanner_watch_rejected_window"
+    ] = int(
+        to_float(
+            analysis.get(
+                "rejected_window"
+            ),
+            0.0,
+        )
+    )
+
+    agent_state[
+        "scanner_watch_dominant_filter"
+    ] = analysis.get(
+        "dominant_filter"
+    ) or ""
+
+    agent_state[
+        "scanner_watch_dominant_count"
+    ] = int(
+        to_float(
+            analysis.get(
+                "dominant_count"
+            ),
+            0.0,
+        )
+    )
+
+    agent_state[
+        "scanner_watch_dominant_share_pct"
+    ] = to_float(
+        analysis.get(
+            "dominant_share_pct"
+        ),
+        0.0,
+    )
+
+    agent_state[
+        "scanner_watch_active_conditions"
+    ] = list(
+        analysis.get(
+            "conditions"
+        )
+        or []
+    )
+
+    agent_state[
+        "scanner_watch_last_error"
+    ] = ""
+
+    save_agent_state(
+        agent_state
+    )
+
+
+def handle_scanner_watch_alerts(
+    agent_state: Dict[str, Any],
+    force: bool = False,
+) -> int:
+    """
+    Controleert scannerstilte en dominante afwijzingsfilters.
+
+    Er wordt maximaal één gecombineerde waarschuwingsmail per controle
+    verstuurd. Dezelfde situatie wordt pas na 24 uur opnieuw gemeld.
+    """
+    last_check_ts = to_float(
+        agent_state.get(
+            "last_scanner_watch_ts"
+        ),
+        0.0,
+    )
+
+    if (
+        not force
+        and time.time()
+        - last_check_ts
+        < SCANNER_WATCH_CHECK_INTERVAL_SECONDS
+    ):
+        return 0
+
+    try:
+        analysis = analyse_scanner_watch()
+
+    except Exception as exc:
+        agent_state[
+            "last_scanner_watch_ts"
+        ] = time.time()
+
+        agent_state[
+            "scanner_watch_last_check_at"
+        ] = now_local().isoformat()
+
+        agent_state[
+            "scanner_watch_last_status"
+        ] = "FOUT"
+
+        agent_state[
+            "scanner_watch_last_error"
+        ] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.exception(
+            "Scannerbewaking mislukt: %s",
+            exc,
+        )
+
+        return 0
+
+    save_scanner_watch_analysis(
+        agent_state,
+        analysis,
+    )
+
+    fingerprint = str(
+        analysis.get(
+            "fingerprint"
+        )
+        or ""
+    )
+
+    conditions = (
+        analysis.get(
+            "conditions"
+        )
+        or []
+    )
+
+    sent_count = 0
+
+    if conditions:
+        same_successful_alert = (
+            agent_state.get(
+                "scanner_watch_alert_fingerprint"
+            )
+            == fingerprint
+        )
+
+        should_send = (
+            not same_successful_alert
+            or scanner_watch_cooldown_elapsed(
+                agent_state
+            )
+        )
+
+        if not should_send:
+            agent_state[
+                "scanner_watch_alert_active"
+            ] = True
+
+            save_agent_state(
+                agent_state
+            )
+
+            return 0
+
+        if not scanner_watch_retry_allowed(
+            agent_state,
+            fingerprint,
+        ):
+            return 0
+
+        agent_state[
+            "scanner_watch_last_attempt_fingerprint"
+        ] = fingerprint
+
+        agent_state[
+            "scanner_watch_last_attempt_at"
+        ] = now_local().isoformat()
+
+        save_agent_state(
+            agent_state
+        )
+
+        sent = send_email(
+            "Diamond Scanner BEWAKINGSWAARSCHUWING",
+            format_scanner_watch_email(
+                analysis
+            ),
+        )
+
+        if not sent:
+            return 0
+
+        agent_state[
+            "scanner_watch_alert_active"
+        ] = True
+
+        agent_state[
+            "scanner_watch_alert_fingerprint"
+        ] = fingerprint
+
+        agent_state[
+            "scanner_watch_last_alert_at"
+        ] = now_local().isoformat()
+
+        agent_state[
+            "scanner_watch_alert_count"
+        ] = int(
+            to_float(
+                agent_state.get(
+                    "scanner_watch_alert_count"
+                ),
+                0.0,
+            )
+        ) + 1
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.warning(
+            "Scannerbewakingswaarschuwing verstuurd | %s",
+            " | ".join(
+                conditions
+            ),
+        )
+
+        return 1
+
+    if to_bool(
+        agent_state.get(
+            "scanner_watch_alert_active"
+        ),
+        False,
+    ):
+        recovery_fingerprint = (
+            "RECOVERY:"
+            + str(
+                agent_state.get(
+                    "scanner_watch_alert_fingerprint"
+                )
+                or "unknown"
+            )
+        )
+
+        if not scanner_watch_retry_allowed(
+            agent_state,
+            recovery_fingerprint,
+        ):
+            return 0
+
+        agent_state[
+            "scanner_watch_last_attempt_fingerprint"
+        ] = recovery_fingerprint
+
+        agent_state[
+            "scanner_watch_last_attempt_at"
+        ] = now_local().isoformat()
+
+        save_agent_state(
+            agent_state
+        )
+
+        sent = send_email(
+            "Diamond Scanner BEWAKING HERSTELD",
+            format_scanner_watch_recovery_email(
+                analysis
+            ),
+        )
+
+        if not sent:
+            return 0
+
+        agent_state[
+            "scanner_watch_alert_active"
+        ] = False
+
+        agent_state[
+            "scanner_watch_alert_fingerprint"
+        ] = ""
+
+        agent_state[
+            "scanner_watch_last_recovery_at"
+        ] = now_local().isoformat()
+
+        agent_state[
+            "scanner_watch_recovery_count"
+        ] = int(
+            to_float(
+                agent_state.get(
+                    "scanner_watch_recovery_count"
+                ),
+                0.0,
+            )
+        ) + 1
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.info(
+            "Scannerbewaking hersteld; herstelmail verstuurd"
+        )
+
+        sent_count += 1
+
+    return sent_count
+
+
+def scanner_watch_summary_from_state(
+    agent_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    state = (
+        agent_state
+        if isinstance(
+            agent_state,
+            dict,
+        )
+        else load_agent_state()
+    )
+
+    return {
+        "status": state.get(
+            "scanner_watch_last_status"
+        )
+        or "NOG NIET GECONTROLEERD",
+        "last_check_at": state.get(
+            "scanner_watch_last_check_at"
+        )
+        or "-",
+        "last_suitable_at": state.get(
+            "scanner_watch_last_suitable_at"
+        )
+        or "-",
+        "hours_without_suitable": to_float(
+            state.get(
+                "scanner_watch_hours_without_suitable"
+            ),
+            0.0,
+        ),
+        "signals_window": int(
+            to_float(
+                state.get(
+                    "scanner_watch_signals_window"
+                ),
+                0.0,
+            )
+        ),
+        "eligible_window": int(
+            to_float(
+                state.get(
+                    "scanner_watch_eligible_window"
+                ),
+                0.0,
+            )
+        ),
+        "rejected_window": int(
+            to_float(
+                state.get(
+                    "scanner_watch_rejected_window"
+                ),
+                0.0,
+            )
+        ),
+        "dominant_filter": state.get(
+            "scanner_watch_dominant_filter"
+        )
+        or "-",
+        "dominant_count": int(
+            to_float(
+                state.get(
+                    "scanner_watch_dominant_count"
+                ),
+                0.0,
+            )
+        ),
+        "dominant_share_pct": to_float(
+            state.get(
+                "scanner_watch_dominant_share_pct"
+            ),
+            0.0,
+        ),
+        "conditions": list(
+            state.get(
+                "scanner_watch_active_conditions"
+            )
+            or []
+        ),
+        "alert_active": to_bool(
+            state.get(
+                "scanner_watch_alert_active"
+            ),
+            False,
+        ),
+        "alert_count": int(
+            to_float(
+                state.get(
+                    "scanner_watch_alert_count"
+                ),
+                0.0,
+            )
+        ),
+        "recovery_count": int(
+            to_float(
+                state.get(
+                    "scanner_watch_recovery_count"
+                ),
+                0.0,
+            )
+        ),
+        "last_error": state.get(
+            "scanner_watch_last_error"
+        )
+        or "-",
+    }
+
+
+def append_scanner_watch_status(
+    lines: List[str],
+    watch: Dict[str, Any],
+) -> None:
+    lines.extend([
+        "",
+        "SCANNERBEWAKING",
+        f"Status                  : {watch.get('status') or '-'}",
+        f"Laatste controle        : {watch.get('last_check_at') or '-'}",
+        f"Laatste geschikt moment : {watch.get('last_suitable_at') or '-'}",
+        f"Uren zonder geschikt    : {to_float(watch.get('hours_without_suitable'), 0.0):.1f}",
+        f"Signalen laatste 24 uur : {int(to_float(watch.get('signals_window'), 0.0))}",
+        f"Geschikt laatste 24 uur : {int(to_float(watch.get('eligible_window'), 0.0))}",
+        f"Afgewezen laatste 24 uur: {int(to_float(watch.get('rejected_window'), 0.0))}",
+        (
+            "Dominant filter         : "
+            f"{watch.get('dominant_filter') or '-'} | "
+            f"{to_float(watch.get('dominant_share_pct'), 0.0):.1f}%"
+        ),
+        f"Waarschuwing actief     : {'JA' if watch.get('alert_active') else 'NEE'}",
+        f"Waarschuwingsmails      : {int(to_float(watch.get('alert_count'), 0.0))}",
+        f"Herstelmails            : {int(to_float(watch.get('recovery_count'), 0.0))}",
+    ])
+
+
 def trim_shadow_notification_history(
     agent_state: Dict[str, Any],
 ) -> None:
@@ -7843,7 +9034,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v7.3 gestart"
+        "Diamond Agent v7.4 gestart"
     )
 
     LOG.info(
@@ -7919,6 +9110,10 @@ def main() -> None:
     )
 
     LOG.info(
+        "Scannerbewaking: 24 uur stilte en dominant afwijzingsfilter"
+    )
+
+    LOG.info(
         "Rapporttijden: 06:00, 10:00, 14:00, 18:00 en 22:00"
     )
 
@@ -7933,6 +9128,10 @@ def main() -> None:
             )
 
             refresh_strategy_lab_if_needed(
+                agent_state
+            )
+
+            handle_scanner_watch_alerts(
                 agent_state
             )
 
