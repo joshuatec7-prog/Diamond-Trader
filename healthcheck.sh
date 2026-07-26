@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.3
+# Diamond Trader Healthcheck v7.4
 # Alleen lezen: wijzigt geen bot-, test-, scanner- of Strategy Lab-bestanden.
 
 set -u
@@ -26,6 +26,13 @@ STRATEGY_LAB_JSON_FILE="$DATA_DIR/diamond_strategy_lab.json"
 STRATEGY_LAB_TEXT_FILE="$DATA_DIR/diamond_strategy_lab.txt"
 STRATEGY_LAB_GROUPS_FILE="$DATA_DIR/diamond_strategy_lab_groups.csv"
 STRATEGY_LAB_RUNNER_LOG="$DATA_DIR/diamond_strategy_lab_runner.log"
+
+SHADOW_MILESTONE_5_JSON="$DATA_DIR/diamond_market_shadow_milestone_5.json"
+SHADOW_MILESTONE_5_TEXT="$DATA_DIR/diamond_market_shadow_milestone_5.txt"
+SHADOW_MILESTONE_10_JSON="$DATA_DIR/diamond_market_shadow_milestone_10.json"
+SHADOW_MILESTONE_10_TEXT="$DATA_DIR/diamond_market_shadow_milestone_10.txt"
+SHADOW_MILESTONE_20_JSON="$DATA_DIR/diamond_market_shadow_milestone_20.json"
+SHADOW_MILESTONE_20_TEXT="$DATA_DIR/diamond_market_shadow_milestone_20.txt"
 
 BACKUP_DIR="$DATA_DIR/backups"
 
@@ -857,7 +864,25 @@ print(f"        Open schaduw       : {len(open_positions)}")
 print(f"        Gesloten schaduw   : {int(shadow.get('trades', 0) or 0)}")
 print(f"        Winrate            : {float(shadow.get('winrate_pct', 0) or 0):.2f}%")
 print(f"        Nettoresultaat     : €{float(shadow.get('net_pnl_eur', 0) or 0):+.4f}")
+closed_count = int(shadow.get("trades", 0) or 0)
+
+next_milestone = None
+
+for milestone in (5, 10, 20):
+    if closed_count < milestone:
+        next_milestone = milestone
+        break
+
+if next_milestone is None:
+    milestone_text = "20/20 bereikt"
+    remaining = 0
+else:
+    remaining = max(0, next_milestone - closed_count)
+    milestone_text = f"{closed_count}/{next_milestone}"
+
 print(f"        Datastatus         : {shadow.get('data_status') or '-'}")
+print(f"        Volgende mijlpaal  : {milestone_text}")
+print(f"        Nog nodig          : {remaining}")
 print(f"        Rapportfouten      : {len(errors)}")
 print(f"        Alleen-lezen       : {'JA' if safe else 'NEE'}")
 
@@ -887,13 +912,153 @@ PY
 fi
 
 echo
-echo "13. SCHIJFRUIMTE"
+echo "13. SCHADUWMIJLPAALRAPPORTEN"
+echo "------------------------------------------------------------"
+
+python3 - \
+    "$STRATEGY_LAB_JSON_FILE" \
+    "$SHADOW_MILESTONE_5_JSON" \
+    "$SHADOW_MILESTONE_10_JSON" \
+    "$SHADOW_MILESTONE_20_JSON" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+strategy_path = Path(sys.argv[1])
+report_paths = {
+    5: Path(sys.argv[2]),
+    10: Path(sys.argv[3]),
+    20: Path(sys.argv[4]),
+}
+
+closed = 0
+
+if strategy_path.is_file():
+    try:
+        strategy = json.loads(
+            strategy_path.read_text(
+                encoding="utf-8"
+            )
+        )
+        shadow = strategy.get("shadow_trades") or {}
+        closed = int(
+            shadow.get("trades", 0)
+            or 0
+        )
+    except Exception:
+        closed = 0
+
+next_milestone = None
+
+for milestone in (5, 10, 20):
+    if closed < milestone:
+        next_milestone = milestone
+        break
+
+if next_milestone is None:
+    print("[OK]    Alle vaste mijlpalen 5/10/20 zijn bereikt")
+else:
+    print(
+        f"[INFO]  Voortgang: {closed}/{next_milestone} "
+        f"| nog {next_milestone - closed} gesloten trades nodig"
+    )
+
+for milestone, path in report_paths.items():
+    if not path.is_file():
+        if closed >= milestone:
+            print(
+                f"[FOUT]  Mijlpaalrapport {milestone}/20 ontbreekt "
+                f"terwijl {closed} trades zijn gesloten"
+            )
+        else:
+            print(
+                f"[INFO]  Mijlpaalrapport {milestone}/20 nog niet verwacht"
+            )
+        continue
+
+    try:
+        report = json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception as exc:
+        print(
+            f"[FOUT]  Mijlpaalrapport {milestone}/20 onleesbaar: {exc}"
+        )
+        continue
+
+    summary = report.get("summary") or {}
+
+    print(
+        f"[OK]    Mijlpaalrapport {milestone}/20 aanwezig | "
+        f"trades={summary.get('trades', 0)} | "
+        f"winrate={float(summary.get('winrate_pct', 0) or 0):.2f}% | "
+        f"pnl=€{float(summary.get('net_pnl_eur', 0) or 0):+.4f} | "
+        f"mail={'JA' if report.get('email_sent_at') else 'NEE'}"
+    )
+PY
+
+closed_shadow_count=0
+
+if [ -f "$STRATEGY_LAB_JSON_FILE" ]; then
+    closed_shadow_count=$(
+        python3 - "$STRATEGY_LAB_JSON_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    data = json.loads(
+        Path(sys.argv[1]).read_text(
+            encoding="utf-8"
+        )
+    )
+    print(
+        int(
+            (
+                data.get("shadow_trades")
+                or {}
+            ).get("trades", 0)
+            or 0
+        )
+    )
+except Exception:
+    print(0)
+PY
+    )
+fi
+
+if [ "$closed_shadow_count" -ge 5 ] && [ ! -f "$SHADOW_MILESTONE_5_JSON" ]; then
+    ERRORS=$((ERRORS + 1))
+fi
+
+if [ "$closed_shadow_count" -ge 10 ] && [ ! -f "$SHADOW_MILESTONE_10_JSON" ]; then
+    ERRORS=$((ERRORS + 1))
+fi
+
+if [ "$closed_shadow_count" -ge 20 ] && [ ! -f "$SHADOW_MILESTONE_20_JSON" ]; then
+    ERRORS=$((ERRORS + 1))
+fi
+
+for report_file in \
+    "$SHADOW_MILESTONE_5_TEXT" \
+    "$SHADOW_MILESTONE_10_TEXT" \
+    "$SHADOW_MILESTONE_20_TEXT"
+do
+    if [ -f "$report_file" ]; then
+        echo "[OK]    Tekstrapport aanwezig: $report_file"
+    fi
+done
+
+echo
+echo "14. SCHIJFRUIMTE"
 echo "------------------------------------------------------------"
 
 df -h "$DATA_DIR" 2>/dev/null || df -h
 
 echo
-echo "14. EINDCONTROLE"
+echo "15. EINDCONTROLE"
 echo "------------------------------------------------------------"
 
 if [ "$ERRORS" -eq 0 ]; then

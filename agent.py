@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Agent v7.0
+Diamond Agent v7.1
 
 Functies:
 - Stuurt statusmails om 06:00, 10:00, 14:00, 18:00 en 22:00.
@@ -19,7 +19,8 @@ Functies:
 - Neemt de Market Scanner-signalen, scanner-state en schaduwtrades mee in de back-up.
 - Neemt Market Scanner-status en schaduwresultaten op in status- en weekmails.
 - Stuurt direct een e-mail wanneer een Market Scanner-schaduwtrade opent of sluit.
-- Neemt de Strategy Lab-rapporten mee in de dagelijkse back-up.
+- Maakt en mailt vaste schaduwmijlpaalrapporten na 5, 10 en 20 gesloten trades.
+- Neemt de Strategy Lab- en schaduwmijlpaalrapporten mee in de dagelijkse back-up.
 - Bewaart dagelijkse back-ups 30 dagen en verwijdert alleen oude back-upmappen.
 """
 
@@ -223,6 +224,20 @@ DEFAULT_TOTAL_CAPITAL = 3000.0
 SHADOW_NOTIFICATION_HISTORY_LIMIT = 250
 SHADOW_NOTIFICATION_RETRY_MINUTES = 15
 
+# Vaste evaluatiemomenten van de Market Scanner-schaduwtest.
+SHADOW_MILESTONE_REPORTS = (
+    5,
+    10,
+    20,
+)
+
+SHADOW_MILESTONE_STAKES = (
+    120.0,
+    125.0,
+    130.0,
+    135.0,
+)
+
 
 # ============================================================
 # Algemene hulpfuncties
@@ -382,6 +397,41 @@ def save_json_atomic(
         )
 
         temporary_name = temporary.name
+
+    os.replace(
+        temporary_name,
+        target,
+    )
+
+
+def save_text_atomic(
+    path_str: str,
+    text: str,
+) -> None:
+    ensure_parent(
+        path_str
+    )
+
+    target = Path(
+        path_str
+    )
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=str(
+            target.parent
+        ),
+        delete=False,
+        newline="\n",
+    ) as temporary:
+        temporary.write(
+            text
+        )
+
+        temporary_name = (
+            temporary.name
+        )
 
     os.replace(
         temporary_name,
@@ -3223,6 +3273,30 @@ def append_market_scanner_status(
             f"{to_float(scanner.get('age_minutes'), 0.0):.1f} minuten"
         )
 
+    milestone_progress = get_shadow_milestone_progress(
+        int(
+            to_float(
+                scanner.get(
+                    "closed"
+                ),
+                0.0,
+            )
+        )
+    )
+
+    next_milestone = milestone_progress.get(
+        "next_milestone"
+    )
+
+    if next_milestone is None:
+        milestone_text = "20/20 bereikt"
+    else:
+        milestone_text = (
+            f"{milestone_progress.get('closed_trades', 0)}/"
+            f"{next_milestone} "
+            f"(nog {milestone_progress.get('remaining', 0)})"
+        )
+
     lines.extend([
         "",
         "MARKET SCANNER",
@@ -3238,6 +3312,7 @@ def append_market_scanner_status(
         f"Unieke signalen totaal  : {int(to_float(scanner.get('total_unique_signals'), 0.0))}",
         f"Open schaduwposities    : {int(to_float(scanner.get('open_positions_count'), 0.0))}",
         f"Gesloten schaduwtrades  : {int(to_float(scanner.get('closed'), 0.0))}",
+        f"Volgende mijlpaal       : {milestone_text}",
         (
             "Winst/verlies/neutraal  : "
             f"{int(to_float(scanner.get('wins'), 0.0))}/"
@@ -4401,6 +4476,1045 @@ def analyze_and_act(
 
 
 # ============================================================
+# Market Scanner-schaduwmijlpaalrapporten
+# ============================================================
+
+def shadow_milestone_report_file(
+    milestone: int,
+    extension: str = "json",
+) -> str:
+    extension = str(
+        extension
+        or "json"
+    ).strip().lower().lstrip(
+        "."
+    )
+
+    if extension not in {
+        "json",
+        "txt",
+    }:
+        raise ValueError(
+            "Alleen json en txt zijn geldige rapportformaten"
+        )
+
+    return str(
+        Path(
+            SHADOW_TRADES_FILE
+        ).with_name(
+            (
+                "diamond_market_shadow_milestone_"
+                f"{int(milestone)}.{extension}"
+            )
+        )
+    )
+
+
+def get_shadow_milestone_progress(
+    closed_trades: int,
+) -> Dict[str, Any]:
+    closed = max(
+        0,
+        int(
+            closed_trades
+        ),
+    )
+
+    next_milestone: Optional[
+        int
+    ] = None
+
+    for milestone in SHADOW_MILESTONE_REPORTS:
+        if closed < milestone:
+            next_milestone = milestone
+            break
+
+    return {
+        "closed_trades": closed,
+        "next_milestone": next_milestone,
+        "remaining": (
+            max(
+                0,
+                next_milestone - closed,
+            )
+            if next_milestone is not None
+            else 0
+        ),
+        "all_milestones_reached": (
+            next_milestone is None
+        ),
+    }
+
+
+def shadow_trade_result(
+    row: Dict[str, Any],
+) -> float:
+    return to_float(
+        row.get(
+            "net_pnl_eur"
+        ),
+        0.0,
+    )
+
+
+def shadow_group_summary(
+    rows: List[Dict[str, Any]],
+    key_name: str,
+) -> Dict[str, Dict[str, Any]]:
+    groups: Dict[
+        str,
+        List[
+            Dict[str, Any]
+        ]
+    ] = {}
+
+    for row in rows:
+        key = str(
+            row.get(
+                key_name
+            )
+            or "ONBEKEND"
+        )
+
+        groups.setdefault(
+            key,
+            [],
+        ).append(
+            row
+        )
+
+    result: Dict[
+        str,
+        Dict[str, Any]
+    ] = {}
+
+    for key, items in groups.items():
+        pnl_values = [
+            shadow_trade_result(
+                item
+            )
+            for item in items
+        ]
+
+        wins = sum(
+            1
+            for value in pnl_values
+            if value > 0.000001
+        )
+
+        losses = sum(
+            1
+            for value in pnl_values
+            if value < -0.000001
+        )
+
+        total = sum(
+            pnl_values
+        )
+
+        fees = sum(
+            max(
+                0.0,
+                to_float(
+                    item.get(
+                        "total_fees_eur"
+                    ),
+                    0.0,
+                ),
+            )
+            for item in items
+        )
+
+        result[key] = {
+            "trades": len(
+                items
+            ),
+            "wins": wins,
+            "losses": losses,
+            "neutral": (
+                len(
+                    items
+                )
+                - wins
+                - losses
+            ),
+            "winrate_pct": round(
+                (
+                    100.0
+                    * wins
+                    / len(
+                        items
+                    )
+                )
+                if items
+                else 0.0,
+                2,
+            ),
+            "net_pnl_eur": round(
+                total,
+                8,
+            ),
+            "average_pnl_eur": round(
+                (
+                    total
+                    / len(
+                        items
+                    )
+                )
+                if items
+                else 0.0,
+                8,
+            ),
+            "total_fees_eur": round(
+                fees,
+                8,
+            ),
+        }
+
+    return dict(
+        sorted(
+            result.items(),
+            key=lambda item: (
+                -int(
+                    item[1].get(
+                        "trades",
+                        0,
+                    )
+                ),
+                -to_float(
+                    item[1].get(
+                        "net_pnl_eur"
+                    ),
+                    0.0,
+                ),
+                item[0],
+            ),
+        )
+    )
+
+
+def shadow_maximum_loss_streak(
+    rows: List[Dict[str, Any]],
+) -> int:
+    current = 0
+    maximum = 0
+
+    for row in rows:
+        pnl = shadow_trade_result(
+            row
+        )
+
+        if pnl < -0.000001:
+            current += 1
+            maximum = max(
+                maximum,
+                current,
+            )
+        else:
+            current = 0
+
+    return maximum
+
+
+def public_shadow_trade(
+    row: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+
+    return {
+        "opened_at": row.get(
+            "opened_at"
+        ),
+        "closed_at": row.get(
+            "closed_at"
+        ),
+        "symbol": row.get(
+            "symbol"
+        ),
+        "strategy": row.get(
+            "strategy"
+        ),
+        "side": row.get(
+            "side"
+        ),
+        "market_regime": row.get(
+            "market_regime"
+        ),
+        "signal_score": round(
+            to_float(
+                row.get(
+                    "signal_score"
+                ),
+                0.0,
+            ),
+            2,
+        ),
+        "stake_eur": round(
+            to_float(
+                row.get(
+                    "stake_eur"
+                ),
+                0.0,
+            ),
+            2,
+        ),
+        "exit_reason": row.get(
+            "exit_reason"
+        ),
+        "gross_pnl_eur": round(
+            to_float(
+                row.get(
+                    "gross_pnl_eur"
+                ),
+                0.0,
+            ),
+            8,
+        ),
+        "total_fees_eur": round(
+            to_float(
+                row.get(
+                    "total_fees_eur"
+                ),
+                0.0,
+            ),
+            8,
+        ),
+        "net_pnl_eur": round(
+            shadow_trade_result(
+                row
+            ),
+            8,
+        ),
+        "return_pct": round(
+            to_float(
+                row.get(
+                    "return_pct"
+                ),
+                0.0,
+            ),
+            8,
+        ),
+        "duration_minutes": round(
+            to_float(
+                row.get(
+                    "duration_minutes"
+                ),
+                0.0,
+            ),
+            2,
+        ),
+    }
+
+
+def build_shadow_milestone_report(
+    milestone: int,
+) -> Dict[str, Any]:
+    target = int(
+        milestone
+    )
+
+    if target not in SHADOW_MILESTONE_REPORTS:
+        raise ValueError(
+            f"Onbekende schaduwmijlpaal: {target}"
+        )
+
+    all_rows = load_shadow_closed_trades()
+
+    if len(
+        all_rows
+    ) < target:
+        raise RuntimeError(
+            (
+                "Nog maar "
+                f"{len(all_rows)} van {target} "
+                "gesloten schaduwtrades beschikbaar"
+            )
+        )
+
+    selected = all_rows[
+        :target
+    ]
+
+    pnl_values = [
+        shadow_trade_result(
+            row
+        )
+        for row in selected
+    ]
+
+    wins_values = [
+        value
+        for value in pnl_values
+        if value > 0.000001
+    ]
+
+    losses_values = [
+        value
+        for value in pnl_values
+        if value < -0.000001
+    ]
+
+    trade_count = len(
+        selected
+    )
+
+    wins = len(
+        wins_values
+    )
+
+    losses = len(
+        losses_values
+    )
+
+    gross_profit = sum(
+        wins_values
+    )
+
+    gross_loss = sum(
+        losses_values
+    )
+
+    net_pnl = sum(
+        pnl_values
+    )
+
+    total_fees = sum(
+        max(
+            0.0,
+            to_float(
+                row.get(
+                    "total_fees_eur"
+                ),
+                0.0,
+            ),
+        )
+        for row in selected
+    )
+
+    durations = [
+        max(
+            0.0,
+            to_float(
+                row.get(
+                    "duration_minutes"
+                ),
+                0.0,
+            ),
+        )
+        for row in selected
+    ]
+
+    returns = [
+        to_float(
+            row.get(
+                "return_pct"
+            ),
+            0.0,
+        )
+        for row in selected
+    ]
+
+    scanner_state = load_json(
+        MARKET_SCANNER_STATE_FILE,
+        {},
+    )
+
+    scanner_started_at = (
+        scanner_state.get(
+            "started_at"
+        )
+        or (
+            selected[0].get(
+                "opened_at"
+            )
+            if selected
+            else None
+        )
+    )
+
+    best_trade = max(
+        selected,
+        key=shadow_trade_result,
+        default=None,
+    )
+
+    worst_trade = min(
+        selected,
+        key=shadow_trade_result,
+        default=None,
+    )
+
+    stake_scenarios = {
+        str(
+            int(
+                stake
+            )
+        ): round(
+            sum(
+                stake
+                * value
+                / 100.0
+                for value in returns
+            ),
+            8,
+        )
+        for stake in SHADOW_MILESTONE_STAKES
+    }
+
+    if gross_loss < -0.000001:
+        profit_factor: Optional[
+            float
+        ] = (
+            gross_profit
+            / abs(
+                gross_loss
+            )
+        )
+    elif gross_profit > 0.000001:
+        profit_factor = None
+    else:
+        profit_factor = 0.0
+
+    report = {
+        "report_version": 1,
+        "report_type": "market_shadow_milestone",
+        "generated_at": now_utc().isoformat(),
+        "scanner_started_at": scanner_started_at,
+        "milestone": target,
+        "maximum_milestone": max(
+            SHADOW_MILESTONE_REPORTS
+        ),
+        "included_closed_trades": trade_count,
+        "summary": {
+            "trades": trade_count,
+            "wins": wins,
+            "losses": losses,
+            "neutral": (
+                trade_count
+                - wins
+                - losses
+            ),
+            "winrate_pct": round(
+                (
+                    100.0
+                    * wins
+                    / trade_count
+                )
+                if trade_count
+                else 0.0,
+                2,
+            ),
+            "net_pnl_eur": round(
+                net_pnl,
+                8,
+            ),
+            "gross_profit_eur": round(
+                gross_profit,
+                8,
+            ),
+            "gross_loss_eur": round(
+                gross_loss,
+                8,
+            ),
+            "profit_factor": (
+                round(
+                    profit_factor,
+                    4,
+                )
+                if profit_factor is not None
+                else None
+            ),
+            "average_pnl_eur": round(
+                (
+                    net_pnl
+                    / trade_count
+                )
+                if trade_count
+                else 0.0,
+                8,
+            ),
+            "average_win_eur": round(
+                (
+                    gross_profit
+                    / wins
+                )
+                if wins
+                else 0.0,
+                8,
+            ),
+            "average_loss_eur": round(
+                (
+                    gross_loss
+                    / losses
+                )
+                if losses
+                else 0.0,
+                8,
+            ),
+            "total_fees_eur": round(
+                total_fees,
+                8,
+            ),
+            "average_return_pct": round(
+                (
+                    sum(
+                        returns
+                    )
+                    / trade_count
+                )
+                if trade_count
+                else 0.0,
+                8,
+            ),
+            "average_duration_minutes": round(
+                (
+                    sum(
+                        durations
+                    )
+                    / trade_count
+                )
+                if trade_count
+                else 0.0,
+                2,
+            ),
+            "maximum_loss_streak": shadow_maximum_loss_streak(
+                selected
+            ),
+            "stake_scenarios": stake_scenarios,
+        },
+        "best_trade": public_shadow_trade(
+            best_trade
+        ),
+        "worst_trade": public_shadow_trade(
+            worst_trade
+        ),
+        "by_strategy": shadow_group_summary(
+            selected,
+            "strategy",
+        ),
+        "by_symbol": shadow_group_summary(
+            selected,
+            "symbol",
+        ),
+        "by_side": shadow_group_summary(
+            selected,
+            "side",
+        ),
+        "by_market_regime": shadow_group_summary(
+            selected,
+            "market_regime",
+        ),
+        "by_exit_reason": shadow_group_summary(
+            selected,
+            "exit_reason",
+        ),
+        "trades": [
+            public_shadow_trade(
+                row
+            )
+            for row in selected
+        ],
+        "email_sent_at": None,
+        "last_email_attempt_at": None,
+    }
+
+    return report
+
+
+def format_shadow_milestone_report(
+    report: Dict[str, Any],
+) -> str:
+    summary = (
+        report.get(
+            "summary"
+        )
+        or {}
+    )
+
+    best = (
+        report.get(
+            "best_trade"
+        )
+        or {}
+    )
+
+    worst = (
+        report.get(
+            "worst_trade"
+        )
+        or {}
+    )
+
+    milestone = int(
+        to_float(
+            report.get(
+                "milestone"
+            ),
+            0.0,
+        )
+    )
+
+    maximum = int(
+        to_float(
+            report.get(
+                "maximum_milestone"
+            ),
+            20.0,
+        )
+    )
+
+    lines = [
+        "=" * 72,
+        (
+            "DIAMOND MARKET SCANNER "
+            f"SCHADUWRAPPORT {milestone}/{maximum}"
+        ),
+        "=" * 72,
+        f"Gegenereerd             : {report.get('generated_at')}",
+        f"Scanner gestart         : {report.get('scanner_started_at')}",
+        "",
+        "RESULTATEN",
+        f"Gesloten schaduwtrades  : {summary.get('trades', 0)}",
+        f"Winst/verlies/neutraal  : "
+        f"{summary.get('wins', 0)}/"
+        f"{summary.get('losses', 0)}/"
+        f"{summary.get('neutral', 0)}",
+        f"Winrate                 : {to_float(summary.get('winrate_pct'), 0.0):.2f}%",
+        f"Nettoresultaat          : €{to_float(summary.get('net_pnl_eur'), 0.0):+.4f}",
+        f"Brutowinst              : €{to_float(summary.get('gross_profit_eur'), 0.0):+.4f}",
+        f"Brutoverlies            : €{to_float(summary.get('gross_loss_eur'), 0.0):+.4f}",
+        f"Totale kosten           : €{to_float(summary.get('total_fees_eur'), 0.0):.4f}",
+        f"Profit factor           : {summary.get('profit_factor')}",
+        f"Gemiddelde per trade    : €{to_float(summary.get('average_pnl_eur'), 0.0):+.4f}",
+        f"Gemiddelde winst        : €{to_float(summary.get('average_win_eur'), 0.0):+.4f}",
+        f"Gemiddeld verlies       : €{to_float(summary.get('average_loss_eur'), 0.0):+.4f}",
+        f"Gemiddeld rendement     : {to_float(summary.get('average_return_pct'), 0.0):+.4f}%",
+        f"Gemiddelde looptijd     : {to_float(summary.get('average_duration_minutes'), 0.0):.1f} minuten",
+        f"Max. verliesreeks       : {int(to_float(summary.get('maximum_loss_streak'), 0.0))}",
+        "",
+        "BESTE EN SLECHTSTE SCHADUWTRADE",
+        (
+            f"Beste                   : "
+            f"{best.get('symbol', '-')} "
+            f"{best.get('side', '-')} "
+            f"{best.get('strategy', '-')} | "
+            f"€{to_float(best.get('net_pnl_eur'), 0.0):+.4f} | "
+            f"{best.get('exit_reason', '-')}"
+        ),
+        (
+            f"Slechtste               : "
+            f"{worst.get('symbol', '-')} "
+            f"{worst.get('side', '-')} "
+            f"{worst.get('strategy', '-')} | "
+            f"€{to_float(worst.get('net_pnl_eur'), 0.0):+.4f} | "
+            f"{worst.get('exit_reason', '-')}"
+        ),
+        "",
+        "INZETSCENARIO'S MET DEZELFDE RETURNS",
+    ]
+
+    scenarios = (
+        summary.get(
+            "stake_scenarios"
+        )
+        or {}
+    )
+
+    for stake in SHADOW_MILESTONE_STAKES:
+        key = str(
+            int(
+                stake
+            )
+        )
+
+        lines.append(
+            f"€{stake:>6.0f} per trade       : "
+            f"€{to_float(scenarios.get(key), 0.0):+.4f}"
+        )
+
+    for title, group_key in (
+        (
+            "RESULTAAT PER STRATEGIE",
+            "by_strategy",
+        ),
+        (
+            "RESULTAAT PER MUNT",
+            "by_symbol",
+        ),
+        (
+            "RESULTAAT PER RICHTING",
+            "by_side",
+        ),
+        (
+            "RESULTAAT PER MARKTREGIME",
+            "by_market_regime",
+        ),
+        (
+            "RESULTAAT PER SLUITREDEN",
+            "by_exit_reason",
+        ),
+    ):
+        lines.extend([
+            "",
+            title,
+        ])
+
+        groups = (
+            report.get(
+                group_key
+            )
+            or {}
+        )
+
+        if not groups:
+            lines.append(
+                "Geen gegevens"
+            )
+
+            continue
+
+        for name, item in groups.items():
+            lines.append(
+                f"{name:<28} "
+                f"trades={int(to_float(item.get('trades'), 0.0)):>2} | "
+                f"winrate={to_float(item.get('winrate_pct'), 0.0):>6.1f}% | "
+                f"pnl=€{to_float(item.get('net_pnl_eur'), 0.0):+8.4f}"
+            )
+
+    if milestone < 10:
+        conclusion = (
+            "Eerste indicatie. Nog geen instellingen aanpassen."
+        )
+    elif milestone < 20:
+        conclusion = (
+            "Voorlopige vergelijking. Wacht op 20 trades voor de eerste beoordeling."
+        )
+    else:
+        conclusion = (
+            "Eerste volledige evaluatiemijlpaal bereikt. Wijzigingen alleen na handmatige beoordeling."
+        )
+
+    lines.extend([
+        "",
+        "BEOORDELING",
+        conclusion,
+        "Geen instellingen zijn automatisch gewijzigd.",
+        "De scanner blijft virtueel en plaatst geen echte orders.",
+        "",
+        f"JSON-rapport            : {shadow_milestone_report_file(milestone, 'json')}",
+        f"Tekstrapport            : {shadow_milestone_report_file(milestone, 'txt')}",
+        "=" * 72,
+    ])
+
+    return "\n".join(
+        lines
+    )
+
+
+def load_existing_shadow_milestone_report(
+    milestone: int,
+) -> Dict[str, Any]:
+    report = load_json(
+        shadow_milestone_report_file(
+            milestone,
+            "json",
+        ),
+        {},
+    )
+
+    if not isinstance(
+        report,
+        dict,
+    ):
+        return {}
+
+    return report
+
+
+def save_shadow_milestone_report(
+    milestone: int,
+    report: Dict[str, Any],
+) -> None:
+    save_json_atomic(
+        shadow_milestone_report_file(
+            milestone,
+            "json",
+        ),
+        report,
+    )
+
+    save_text_atomic(
+        shadow_milestone_report_file(
+            milestone,
+            "txt",
+        ),
+        format_shadow_milestone_report(
+            report
+        )
+        + "\n",
+    )
+
+
+def check_shadow_milestone_reports() -> int:
+    """
+    Maakt en mailt exact één rapport na 5, 10 en 20 gesloten
+    Market Scanner-schaduwtrades.
+    """
+    closed_rows = load_shadow_closed_trades()
+    closed_count = len(
+        closed_rows
+    )
+
+    if closed_count < min(
+        SHADOW_MILESTONE_REPORTS
+    ):
+        return 0
+
+    scanner_state = load_json(
+        MARKET_SCANNER_STATE_FILE,
+        {},
+    )
+
+    scanner_started_at = (
+        scanner_state.get(
+            "started_at"
+        )
+        or (
+            closed_rows[0].get(
+                "opened_at"
+            )
+            if closed_rows
+            else None
+        )
+    )
+
+    sent_count = 0
+
+    for milestone in SHADOW_MILESTONE_REPORTS:
+        if closed_count < milestone:
+            continue
+
+        existing = load_existing_shadow_milestone_report(
+            milestone
+        )
+
+        same_test = (
+            existing.get(
+                "scanner_started_at"
+            )
+            == scanner_started_at
+        )
+
+        if (
+            same_test
+            and existing.get(
+                "email_sent_at"
+            )
+        ):
+            continue
+
+        try:
+            report = build_shadow_milestone_report(
+                milestone
+            )
+
+        except Exception as exc:
+            LOG.warning(
+                "Schaduwmijlpaalrapport %d nog niet beschikbaar: %s",
+                milestone,
+                exc,
+            )
+
+            continue
+
+        if same_test:
+            report[
+                "email_sent_at"
+            ] = existing.get(
+                "email_sent_at"
+            )
+
+            report[
+                "last_email_attempt_at"
+            ] = existing.get(
+                "last_email_attempt_at"
+            )
+
+        save_shadow_milestone_report(
+            milestone,
+            report,
+        )
+
+        if not email_retry_allowed(
+            report
+        ):
+            continue
+
+        report[
+            "last_email_attempt_at"
+        ] = now_utc().isoformat()
+
+        save_shadow_milestone_report(
+            milestone,
+            report,
+        )
+
+        maximum = max(
+            SHADOW_MILESTONE_REPORTS
+        )
+
+        subject_prefix = (
+            "EINDRAPPORT"
+            if milestone == maximum
+            else "MIJLPAALRAPPORT"
+        )
+
+        sent = send_email(
+            (
+                "Diamond Scanner "
+                f"{subject_prefix} {milestone}/{maximum}"
+            ),
+            format_shadow_milestone_report(
+                report
+            ),
+        )
+
+        if not sent:
+            continue
+
+        report[
+            "email_sent_at"
+        ] = now_utc().isoformat()
+
+        save_shadow_milestone_report(
+            milestone,
+            report,
+        )
+
+        sent_count += 1
+
+        LOG.info(
+            "Schaduwmijlpaalrapport verstuurd | %d/%d | pnl=%+.4f EUR",
+            milestone,
+            maximum,
+            to_float(
+                (
+                    report.get(
+                        "summary"
+                    )
+                    or {}
+                ).get(
+                    "net_pnl_eur"
+                ),
+                0.0,
+            ),
+        )
+
+    return sent_count
+
+
+# ============================================================
 # Dagelijkse back-up
 # ============================================================
 
@@ -4490,6 +5604,36 @@ def backup_source_files() -> List[Dict[str, Any]]:
         {
             "source": STRATEGY_LAB_GROUPS_FILE,
             "name": "diamond_strategy_lab_groups.csv",
+            "required": False,
+        },
+        {
+            "source": shadow_milestone_report_file(5, "json"),
+            "name": "diamond_market_shadow_milestone_5.json",
+            "required": False,
+        },
+        {
+            "source": shadow_milestone_report_file(5, "txt"),
+            "name": "diamond_market_shadow_milestone_5.txt",
+            "required": False,
+        },
+        {
+            "source": shadow_milestone_report_file(10, "json"),
+            "name": "diamond_market_shadow_milestone_10.json",
+            "required": False,
+        },
+        {
+            "source": shadow_milestone_report_file(10, "txt"),
+            "name": "diamond_market_shadow_milestone_10.txt",
+            "required": False,
+        },
+        {
+            "source": shadow_milestone_report_file(20, "json"),
+            "name": "diamond_market_shadow_milestone_20.json",
+            "required": False,
+        },
+        {
+            "source": shadow_milestone_report_file(20, "txt"),
+            "name": "diamond_market_shadow_milestone_20.txt",
             "required": False,
         },
         {
@@ -5759,7 +6903,7 @@ def main() -> None:
     agent_state = load_agent_state()
 
     LOG.info(
-        "Diamond Agent v7.0 gestart"
+        "Diamond Agent v7.1 gestart"
     )
 
     LOG.info(
@@ -5823,6 +6967,10 @@ def main() -> None:
     )
 
     LOG.info(
+        "Schaduwmijlpaalrapporten: 5, 10 en 20 gesloten trades"
+    )
+
+    LOG.info(
         "Rapporttijden: 06:00, 10:00, 14:00, 18:00 en 22:00"
     )
 
@@ -5835,6 +6983,8 @@ def main() -> None:
             handle_shadow_trade_notifications(
                 agent_state
             )
+
+            check_shadow_milestone_reports()
 
             check_short_test_interim_reports(
                 exchange
