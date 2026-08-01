@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Readiness Gate v1.1
+Diamond Readiness Gate v1.2
 
 Centrale, uitsluitend lezende gereedheidscontrole voor Diamond Trader.
 
@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 
-VERSION = "1.1"
+VERSION = "1.2"
 MODE = "READ_ONLY_READINESS_GATE"
 
 DATA_DIR = Path(
@@ -130,6 +130,13 @@ SCANNER_REPORT_FILE = Path(
     ).strip()
 )
 
+PERIODIC_ANALYSIS_STATE_FILE = Path(
+    os.getenv(
+        "PERIODIC_ANALYSIS_STATE_FILE",
+        str(DATA_DIR / "diamond_periodic_analysis_state.json"),
+    ).strip()
+)
+
 STRATEGY_LAB_FILE = Path(
     os.getenv(
         "STRATEGY_LAB_JSON_FILE",
@@ -190,10 +197,6 @@ PROCESS_PATTERNS = (
         "python3 agent.py",
     ),
     (
-        "Diamond Diagnose",
-        "python3 closed_candle_runner.py diagnose",
-    ),
-    (
         "Diamond Supervisor",
         "python3 supervisor_agent.py",
     ),
@@ -202,12 +205,12 @@ PROCESS_PATTERNS = (
         "python3 closed_candle_runner.py bot",
     ),
     (
-        "Diamond Market Scanner",
-        "python3 market_scanner.py --loop",
-    ),
-    (
         "Diamond Strategy Lab",
         "python3 strategy_lab.py --loop",
+    ),
+    (
+        "Diamond Periodieke Analyse",
+        "python3 periodic_analysis_runner.py",
     ),
 )
 
@@ -903,6 +906,10 @@ def build_report() -> Dict[str, Any]:
         SCANNER_REPORT_FILE
     )
 
+    periodic_analysis, periodic_analysis_error = load_json(
+        PERIODIC_ANALYSIS_STATE_FILE
+    )
+
     strategy_lab, lab_error = load_json(
         STRATEGY_LAB_FILE
     )
@@ -940,6 +947,15 @@ def build_report() -> Dict[str, Any]:
         "critical",
         agent_error is None,
         agent_error or "agent-state leesbaar",
+    )
+
+    add_check(
+        checks,
+        "periodic_analysis_state_readable",
+        "systeem",
+        "critical",
+        periodic_analysis_error is None,
+        periodic_analysis_error or "periodieke analyse-state leesbaar",
     )
 
     risk = (
@@ -1159,6 +1175,124 @@ def build_report() -> Dict[str, Any]:
                 "proces actief"
                 if running
                 else f"proces ontbreekt: {pattern}"
+            ),
+        )
+
+    periodic_tasks = (
+        periodic_analysis.get(
+            "tasks"
+        )
+        or {}
+    )
+
+    periodic_diagnose = (
+        periodic_tasks.get(
+            "diagnose"
+        )
+        or {}
+    )
+
+    periodic_scanner = (
+        periodic_tasks.get(
+            "scanner"
+        )
+        or {}
+    )
+
+    periodic_mode_safe = (
+        periodic_analysis_error is None
+        and periodic_analysis.get(
+            "mode"
+        )
+        == "SEQUENTIAL_PERIODIC_ANALYSIS"
+        and periodic_analysis.get(
+            "sequential"
+        )
+        is True
+    )
+
+    add_check(
+        checks,
+        "periodic_analysis_sequential",
+        "processen",
+        "critical",
+        periodic_mode_safe,
+        (
+            "periodieke Diagnose en Scanner zijn sequentieel"
+            if periodic_mode_safe
+            else (
+                periodic_analysis_error
+                or "periodieke analyse is niet aantoonbaar sequentieel"
+            )
+        ),
+    )
+
+    periodic_task_ages: Dict[
+        str,
+        Optional[float]
+    ] = {}
+
+    for task_name, task_data, maximum in (
+        (
+            "diagnose",
+            periodic_diagnose,
+            MAX_DIAGNOSE_AGE_MINUTES,
+        ),
+        (
+            "scanner",
+            periodic_scanner,
+            MAX_SCANNER_AGE_MINUTES,
+        ),
+    ):
+        task_age = age_minutes(
+            task_data.get(
+                "last_completed_at"
+            )
+        )
+
+        periodic_task_ages[
+            task_name
+        ] = task_age
+
+        task_ok = (
+            periodic_analysis_error is None
+            and task_data.get(
+                "last_status"
+            )
+            == "OK"
+            and to_int(
+                task_data.get(
+                    "last_exit_code"
+                ),
+                -1,
+            )
+            == 0
+            and task_age is not None
+            and task_age <= maximum
+        )
+
+        add_check(
+            checks,
+            f"periodic_{task_name}_ok_recent",
+            "actualiteit",
+            "critical",
+            task_ok,
+            (
+                f"status=OK; exit=0; leeftijd {task_age:.1f} minuten; "
+                f"maximum {maximum:.1f}"
+                if task_ok and task_age is not None
+                else (
+                    periodic_analysis_error
+                    or (
+                        f"status={task_data.get('last_status') or '-'}; "
+                        f"exit={task_data.get('last_exit_code')}; "
+                        + (
+                            f"leeftijd {task_age:.1f} minuten; maximum {maximum:.1f}"
+                            if task_age is not None
+                            else "geen geldige voltooiingstijd"
+                        )
+                    )
+                )
             ),
         )
 
@@ -1722,6 +1856,18 @@ def build_report() -> Dict[str, Any]:
             "pause_reason": pause_reason,
             "scanner_warning_active": scanner_warning_active,
             "processes": process_results,
+            "periodic_analysis": {
+                "mode": periodic_analysis.get("mode"),
+                "sequential": periodic_analysis.get("sequential"),
+                "active_task": periodic_analysis.get("active_task"),
+                "cycle_count": to_int(periodic_analysis.get("cycle_count"), 0),
+                "diagnose_last_status": periodic_diagnose.get("last_status"),
+                "diagnose_last_exit_code": periodic_diagnose.get("last_exit_code"),
+                "diagnose_age_minutes": periodic_task_ages.get("diagnose"),
+                "scanner_last_status": periodic_scanner.get("last_status"),
+                "scanner_last_exit_code": periodic_scanner.get("last_exit_code"),
+                "scanner_age_minutes": periodic_task_ages.get("scanner"),
+            },
             "freshness_minutes": freshness,
             "backup_age_hours": (
                 round(

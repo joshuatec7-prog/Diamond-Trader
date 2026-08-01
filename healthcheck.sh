@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.11
+# Diamond Trader Healthcheck v7.12
 # Geheugenarme controle: wijzigt geen bot-, test-, scanner-, Strategy Lab- of Readiness-bestanden.
 
 set -u
@@ -793,7 +793,7 @@ if long_base is None:
     print(f"        Bestand           : {long_baseline_file}")
     raise SystemExit(1)
 
-long_start = as_int(long_base.get("start_trades"), 0)
+long_start = as_int(long_base.get("start_spot_trades"), 0)
 long_target_total = as_int(long_base.get("target_total_trades"), 0)
 
 if long_target_total <= long_start:
@@ -1514,7 +1514,7 @@ print(f"        Volgende stap      : {report.get('next_step') or '-'}")
 print(f"        Alleen-lezen       : {'JA' if safe else 'NEE'}")
 print("        Automatisch live   : NEE")
 
-if str(report.get("version") or "") != "1.1":
+if str(report.get("version") or "") != "1.2":
     print("[FOUT]  Onverwachte Readiness Gate-versie")
     raise SystemExit(1)
 
