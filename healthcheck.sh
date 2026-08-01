@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.10
-# Alleen lezen: wijzigt geen bot-, test-, scanner-, Strategy Lab- of Readiness-bestanden.
+# Diamond Trader Healthcheck v7.11
+# Geheugenarme controle: wijzigt geen bot-, test-, scanner-, Strategy Lab- of Readiness-bestanden.
 
 set -u
 
@@ -26,6 +26,11 @@ STRATEGY_LAB_JSON_FILE="$DATA_DIR/diamond_strategy_lab.json"
 STRATEGY_LAB_TEXT_FILE="$DATA_DIR/diamond_strategy_lab.txt"
 STRATEGY_LAB_GROUPS_FILE="$DATA_DIR/diamond_strategy_lab_groups.csv"
 STRATEGY_LAB_RUNNER_LOG="$DATA_DIR/diamond_strategy_lab_runner.log"
+
+PERIODIC_ANALYSIS_STATE_FILE="$DATA_DIR/diamond_periodic_analysis_state.json"
+PERIODIC_ANALYSIS_RUNNER_LOG="$DATA_DIR/diamond_periodic_analysis_runner.log"
+DIAG_RUNNER_LOG="$DATA_DIR/diamond_diagnose_runner.log"
+SCANNER_RUNNER_LOG="$DATA_DIR/diamond_market_scanner_runner.log"
 
 SHADOW_MILESTONE_5_JSON="$DATA_DIR/diamond_market_shadow_milestone_5.json"
 SHADOW_MILESTONE_5_TEXT="$DATA_DIR/diamond_market_shadow_milestone_5.txt"
@@ -104,10 +109,6 @@ check_process \
     "Diamond Agent"
 
 check_process \
-    'python3[[:space:]]+closed_candle_runner\.py[[:space:]]+diagnose([[:space:]]|$)' \
-    "Diamond Diagnose"
-
-check_process \
     'python3[[:space:]]+supervisor_agent\.py([[:space:]]|$)' \
     "Diamond Supervisor"
 
@@ -116,12 +117,117 @@ check_process \
     "Diamond Bot"
 
 check_process \
-    'python3[[:space:]]+market_scanner\.py[[:space:]]+--loop[[:space:]]+--top[[:space:]]+20([[:space:]]|$)' \
-    "Diamond Market Scanner"
-
-check_process \
     'python3[[:space:]]+strategy_lab\.py[[:space:]]+--loop[[:space:]]+--interval-minutes[[:space:]]+360[[:space:]]+--no-print([[:space:]]|$)' \
     "Diamond Strategy Lab"
+
+check_process \
+    'python3[[:space:]]+periodic_analysis_runner\.py([[:space:]]|$)' \
+    "Diamond Periodieke Analyse"
+
+echo
+echo "1A. PERIODIEKE DIAGNOSE EN MARKET SCANNER"
+echo "------------------------------------------------------------"
+
+file_info "$PERIODIC_ANALYSIS_STATE_FILE" "Periodieke analyse-state" "true"
+file_info "$PERIODIC_ANALYSIS_RUNNER_LOG" "Periodieke analyse-runnerlog"
+file_info "$DIAG_RUNNER_LOG" "Diagnose-runnerlog"
+file_info "$SCANNER_RUNNER_LOG" "Market Scanner-runnerlog"
+
+if [ -f "$PERIODIC_ANALYSIS_STATE_FILE" ]; then
+    if ! python3 - "$PERIODIC_ANALYSIS_STATE_FILE" "$NOW_EPOCH" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+now_epoch = int(sys.argv[2])
+
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"[FOUT]  Periodieke analyse-state lezen mislukt: {exc}")
+    raise SystemExit(1)
+
+if not isinstance(data, dict):
+    print("[FOUT]  Periodieke analyse-state bevat geen object")
+    raise SystemExit(1)
+
+
+def age_minutes(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.fromtimestamp(now_epoch, tz=timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 60.0)
+    except Exception:
+        return None
+
+mode = data.get("mode")
+interval = int(data.get("interval_seconds", 0) or 0)
+sequential = data.get("sequential") is True
+active = data.get("active_task") or "geen"
+tasks = data.get("tasks") or {}
+
+print(f"[OK]    Modus              : {mode or '-'}")
+print(f"        Interval           : {interval} seconden")
+print(f"        Sequentieel        : {'JA' if sequential else 'NEE'}")
+print(f"        Actieve taak       : {active}")
+print(f"        Cycli              : {int(data.get('cycle_count', 0) or 0)}")
+
+if mode != "SEQUENTIAL_PERIODIC_ANALYSIS":
+    print("[FOUT]  Onverwachte modus voor periodieke analyse")
+    raise SystemExit(1)
+
+if interval != 900:
+    print("[FOUT]  Periodieke analyse gebruikt niet het verwachte interval van 900 seconden")
+    raise SystemExit(1)
+
+if not sequential:
+    print("[FOUT]  Diagnose en Scanner zijn niet als sequentieel gemarkeerd")
+    raise SystemExit(1)
+
+errors = 0
+
+for key, label in (("diagnose", "Diamond Diagnose"), ("scanner", "Diamond Market Scanner")):
+    task = tasks.get(key) or {}
+    status = task.get("last_status") or "NOG_NIET_GEDRAAID"
+    completed = task.get("last_completed_at")
+    age = age_minutes(completed)
+    exit_code = task.get("last_exit_code")
+    runs = int(task.get("run_count", 0) or 0)
+    duration = task.get("last_duration_seconds")
+
+    if status in {"NOG_NIET_GEDRAAID", "BEZIG"} and active == key:
+        print(f"[INFO]  {label}: periodieke run is bezig")
+        continue
+
+    age_text = f"{age:.1f} min" if age is not None else "-"
+    print(
+        f"[{'OK' if status == 'OK' else 'FOUT'}]    {label}: "
+        f"status={status} | runs={runs} | leeftijd={age_text} | "
+        f"duur={duration if duration is not None else '-'}s | exit={exit_code}"
+    )
+
+    if status != "OK":
+        errors += 1
+        continue
+
+    if age is None or age > 35.0:
+        print(f"[FOUT]  {label} is ouder dan 35 minuten")
+        errors += 1
+
+if errors:
+    raise SystemExit(1)
+
+print("[OK]    Diagnose en Market Scanner draaien geheugenarm en nooit tegelijk")
+PY
+    then
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
 
 echo
 echo "2. PROJECTBESTANDEN"
@@ -141,7 +247,8 @@ for file_name in \
     requirements.txt \
     start.sh \
     healthcheck.sh \
-    scanner_healthcheck.sh
+    scanner_healthcheck.sh \
+    periodic_analysis_runner.py
 do
     if [ -f "$PROJECT_DIR/$file_name" ]; then
         echo "[OK]    $file_name"
@@ -446,12 +553,14 @@ echo "------------------------------------------------------------"
 file_info "$DIAG_STATS_FILE" "Diagnosestatistieken"
 
 if [ -f "$DIAG_STATS_FILE" ]; then
-    if ! python3 - "$DIAG_STATS_FILE" <<'PY'
+    if ! python3 - "$DIAG_STATS_FILE" "$NOW_EPOCH" <<'PY'
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 path = Path(sys.argv[1])
+now_epoch = int(sys.argv[2])
 
 try:
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -459,8 +568,29 @@ except Exception as exc:
     print(f"        [FOUT] JSON lezen mislukt: {exc}")
     raise SystemExit(1)
 
+last_round_at = data.get("last_round_at")
+age_minutes = None
+
+try:
+    dt = datetime.fromisoformat(str(last_round_at).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    age_minutes = max(
+        0.0,
+        (
+            datetime.fromtimestamp(now_epoch, tz=timezone.utc)
+            - dt.astimezone(timezone.utc)
+        ).total_seconds() / 60.0,
+    )
+except Exception:
+    pass
+
 print(f"        Diagnoserondes    : {int(data.get('total_rounds', 0) or 0)}")
-print(f"        Laatste ronde     : {data.get('last_round_at') or '-'}")
+print(f"        Laatste ronde     : {last_round_at or '-'}")
+print(
+    "        Leeftijd ronde   : "
+    + (f"{age_minutes:.1f} minuten" if age_minutes is not None else "-")
+)
 
 for symbol, stats in sorted((data.get("symbols") or {}).items()):
     print(
@@ -470,6 +600,16 @@ for symbol, stats in sorted((data.get("symbols") or {}).items()):
         f"signalen={int(stats.get('technical_signals', 0) or 0)}, "
         f"laatste score={float(stats.get('last_score_pct', 0) or 0):.0f}%"
     )
+
+if age_minutes is None:
+    print("[FOUT]  Laatste diagnoseronde heeft geen geldige tijd")
+    raise SystemExit(1)
+
+if age_minutes > 35.0:
+    print("[FOUT]  Laatste diagnoseronde is ouder dan 35 minuten")
+    raise SystemExit(1)
+
+print("[OK]    Periodieke Diagnose is actueel")
 PY
     then
         ERRORS=$((ERRORS + 1))
@@ -547,55 +687,76 @@ echo "9. TESTVOORTGANG"
 echo "------------------------------------------------------------"
 
 if ! python3 - \
-    "$PROJECT_DIR" \
+    "$STATE_FILE" \
+    "$PROJECT_DIR/config.yaml" \
     "$LONG_BASELINE_FILE" \
     "$LONG_REPORT_FILE" \
     "$SHORT_BASELINE_FILE" \
     "$SHORT_REPORT_FILE" \
     "$SHORT_INTERIM_5_FILE" \
     "$SHORT_INTERIM_10_FILE" <<'PY'
-import importlib.util
+import json
 import sys
 from pathlib import Path
 
+try:
+    import yaml
+except Exception as exc:
+    print(f"[FOUT]  PyYAML laden mislukt: {exc}")
+    raise SystemExit(1)
+
 (
-    project_dir,
+    state_file,
+    config_file,
     long_baseline_file,
     long_report_file,
     short_baseline_file,
     short_report_file,
     short_interim_5_file,
     short_interim_10_file,
-) = [
-    Path(value)
-    for value in sys.argv[1:]
-]
-
-agent_file = project_dir / "agent.py"
-
-if not agent_file.exists():
-    print(f"[FOUT]  agent.py ontbreekt: {agent_file}")
-    raise SystemExit(1)
-
-spec = importlib.util.spec_from_file_location(
-    "diamond_healthcheck_agent",
-    agent_file,
-)
-
-if spec is None or spec.loader is None:
-    print("[FOUT]  agent.py kon niet worden geladen")
-    raise SystemExit(1)
-
-agent = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(agent)
+) = [Path(value) for value in sys.argv[1:]]
 
 
-def report_status(
-    report_file,
-    reached,
-    target_total,
-    display_name,
-):
+def load_json(path):
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[FOUT]  JSON lezen mislukt ({path}): {exc}")
+        raise SystemExit(1)
+    if not isinstance(data, dict):
+        print(f"[FOUT]  JSON bevat geen object: {path}")
+        raise SystemExit(1)
+    return data
+
+
+def find_key(obj, key):
+    if isinstance(obj, dict):
+        if key in obj:
+            yield obj[key]
+        for value in obj.values():
+            yield from find_key(value, key)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from find_key(value, key)
+
+
+def first_bool(obj, key):
+    for value in find_key(obj, key):
+        if isinstance(value, bool):
+            return value
+    return None
+
+
+def as_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def report_status(report_file, reached, target_total, display_name):
     if report_file.exists():
         print(f"[OK]    {display_name}rapport aanwezig")
         print(f"        Bestand           : {report_file}")
@@ -611,82 +772,61 @@ def report_status(
         )
 
 
+state = load_json(state_file)
+long_base = load_json(long_baseline_file)
+short_base = load_json(short_baseline_file)
+
+if state is None:
+    print(f"[FOUT]  Bot-state ontbreekt: {state_file}")
+    raise SystemExit(1)
+
 try:
-    long_status = agent.get_test_target_status()
+    config = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
 except Exception as exc:
-    print(
-        f"[FOUT]  Longteststatus opvragen mislukt: {exc}"
-    )
+    print(f"[FOUT]  Configuratie lezen mislukt: {exc}")
     raise SystemExit(1)
 
 print("LONGTEST")
 
-if not long_status.get("enabled", False):
-    print(
-        "[FOUT]  Longtestbaseline is niet geldig of niet actief"
-    )
-    print(
-        f"        Bestand           : {long_baseline_file}"
-    )
-    print(
-        f"        Reden             : "
-        f"{long_status.get('reason') or 'onbekend'}"
-    )
+if long_base is None:
+    print("[FOUT]  Longtestbaseline ontbreekt")
+    print(f"        Bestand           : {long_baseline_file}")
     raise SystemExit(1)
 
-long_start = int(
-    long_status.get("start_trades", 0)
-    or 0
-)
-long_target_total = int(
-    long_status.get("target_total_trades", 0)
-    or 0
-)
-long_current = int(
-    long_status.get("current_trades", 0)
-    or 0
-)
-long_new = int(
-    long_status.get("new_trades", 0)
-    or 0
-)
-long_remaining = int(
-    long_status.get("remaining_trades", 0)
-    or 0
-)
-long_target_new = max(
-    0,
-    long_target_total - long_start,
-)
-long_dry_run = bool(
-    long_status.get("dry_run", False)
-)
-long_reached = bool(
-    long_status.get("target_reached", False)
-)
+long_start = as_int(long_base.get("start_trades"), 0)
+long_target_total = as_int(long_base.get("target_total_trades"), 0)
+
+if long_target_total <= long_start:
+    target_new = as_int(long_base.get("target_new_trades"), 20)
+    long_target_total = long_start + max(0, target_new)
+
+long_current = as_int(state.get("trades"), 0)
+long_new = max(0, long_current - long_start)
+long_target_new = max(0, long_target_total - long_start)
+long_remaining = max(0, long_target_total - long_current)
+long_reached = long_current >= long_target_total and long_target_total > 0
+long_dry_run = first_bool(config, "dry_run")
 
 print("[OK]    Longtestbaseline actief")
 print(f"        Bestand           : {long_baseline_file}")
 print(f"        Start trades      : {long_start}")
 print(f"        Huidige trades    : {long_current}")
-print(
-    f"        Nieuwe testtrades : "
-    f"{long_new}/{long_target_new}"
-)
+print(f"        Nieuwe testtrades : {long_new}/{long_target_new}")
 print(f"        Nog nodig         : {long_remaining}")
 print(f"        Doel totaal       : {long_target_total}")
 print(
     f"        Dry-run           : "
-    f"{'JA' if long_dry_run else 'NEE'}"
+    f"{'JA' if long_dry_run is True else 'NEE' if long_dry_run is False else '-'}"
 )
 print(
     f"        Teststop actief   : "
-    f"{'JA' if long_dry_run else 'NEE'}"
+    f"{'JA' if long_dry_run is True else 'NEE' if long_dry_run is False else '-'}"
 )
-print(
-    f"        Doel bereikt      : "
-    f"{'JA' if long_reached else 'NEE'}"
-)
+print(f"        Doel bereikt      : {'JA' if long_reached else 'NEE'}")
+
+if long_dry_run is not True:
+    print("[FOUT]  Longtest staat niet aantoonbaar in dry-run")
+    raise SystemExit(1)
 
 report_status(
     long_report_file,
@@ -698,94 +838,62 @@ report_status(
 print()
 print("PAPER-SHORTTEST")
 
-try:
-    short_status = agent.get_short_test_target_status()
-except Exception as exc:
-    print(
-        f"[FOUT]  Paper-shortstatus opvragen mislukt: {exc}"
-    )
+if short_base is None:
+    print("[FOUT]  Paper-shortbaseline ontbreekt")
+    print(f"        Bestand           : {short_baseline_file}")
     raise SystemExit(1)
 
-if not short_status.get("enabled", False):
-    print(
-        "[FOUT]  Paper-shorttest is niet geldig of niet actief"
-    )
-    print(
-        f"        Bestand           : {short_baseline_file}"
-    )
-    print(
-        f"        Reden             : "
-        f"{short_status.get('reason') or 'onbekend'}"
-    )
-    raise SystemExit(1)
+short_start = as_int(short_base.get("start_short_trades"), 0)
+short_target_total = as_int(short_base.get("target_total_short_trades"), 0)
 
-short_start = int(
-    short_status.get("start_short_trades", 0)
-    or 0
-)
-short_target_total = int(
-    short_status.get(
-        "target_total_short_trades",
-        0,
-    )
-    or 0
-)
-short_current = int(
-    short_status.get("current_short_trades", 0)
-    or 0
-)
-short_new = int(
-    short_status.get("new_short_trades", 0)
-    or 0
-)
-short_remaining = int(
-    short_status.get(
-        "remaining_short_trades",
-        0,
-    )
-    or 0
-)
-short_target_new = max(
-    0,
-    short_target_total - short_start,
-)
-short_reached = bool(
-    short_status.get("target_reached", False)
-)
+if short_target_total <= short_start:
+    target_new = as_int(short_base.get("target_new_short_trades"), 20)
+    short_target_total = short_start + max(0, target_new)
+
+short_current = as_int(state.get("short_trades"), 0)
+short_new = max(0, short_current - short_start)
+short_target_new = max(0, short_target_total - short_start)
+short_remaining = max(0, short_target_total - short_current)
+short_reached = short_current >= short_target_total and short_target_total > 0
+short_settings = short_base.get("settings") or {}
+short_paper_only = short_settings.get("paper_only")
+
+if not isinstance(short_paper_only, bool):
+    short_paper_only = first_bool(config, "paper_only")
+
+max_open = short_settings.get("max_open_positions", 1)
+leverage = short_settings.get("leverage", 1)
+strategy_version = short_settings.get("strategy_version") or "-"
 
 print("[OK]    Paper-shortbaseline actief")
 print(f"        Bestand           : {short_baseline_file}")
+print(f"        Strategie         : {strategy_version}")
 print(f"        Start shorts      : {short_start}")
 print(f"        Huidige shorts    : {short_current}")
-print(
-    f"        Nieuwe shorts     : "
-    f"{short_new}/{short_target_new}"
-)
+print(f"        Nieuwe shorts     : {short_new}/{short_target_new}")
 print(f"        Nog nodig         : {short_remaining}")
 print(f"        Doel totaal       : {short_target_total}")
-print("        Paper only        : JA")
-print("        Maximaal open     : 1")
-print("        Hefboom           : 1x")
 print(
-    f"        Doel bereikt      : "
-    f"{'JA' if short_reached else 'NEE'}"
+    f"        Paper only        : "
+    f"{'JA' if short_paper_only is True else 'NEE' if short_paper_only is False else '-'}"
 )
+print(f"        Maximaal open     : {max_open}")
+print(f"        Hefboom           : {leverage}x")
+print(f"        Doel bereikt      : {'JA' if short_reached else 'NEE'}")
+
+if short_paper_only is not True:
+    print("[FOUT]  Paper-shorttest staat niet aantoonbaar op paper-only")
+    raise SystemExit(1)
 
 if short_interim_5_file.exists():
     print("[OK]    Tussenrapport 5/20 aanwezig")
-    print(
-        f"        Bestand           : "
-        f"{short_interim_5_file}"
-    )
+    print(f"        Bestand           : {short_interim_5_file}")
 else:
     print("[INFO]  Tussenrapport 5/20 nog niet aanwezig")
 
 if short_interim_10_file.exists():
     print("[OK]    Tussenrapport 10/20 aanwezig")
-    print(
-        f"        Bestand           : "
-        f"{short_interim_10_file}"
-    )
+    print(f"        Bestand           : {short_interim_10_file}")
 else:
     print("[INFO]  Tussenrapport 10/20 nog niet aanwezig")
 
@@ -805,19 +913,13 @@ echo "10. PAPER-SHORTDIAGNOSE"
 echo "------------------------------------------------------------"
 
 if [ -f "$PROJECT_DIR/short_diagnose.py" ]; then
-    echo "[INFO]  Veilige paper-shortdiagnose wordt uitgevoerd"
-    echo "        Alleen lezen: geen orders en geen bestanden gewijzigd"
-    echo
-
-    if (
-        cd "$PROJECT_DIR"
-        python3 short_diagnose.py
-    ); then
-        echo
-        echo "[OK]    Paper-shortdiagnose succesvol afgerond"
+    if python3 -m py_compile "$PROJECT_DIR/short_diagnose.py" 2>/dev/null; then
+        echo "[OK]    short_diagnose.py Pythoncontrole geslaagd"
+        echo "[INFO]  Volledige paper-shortdiagnose wordt hier bewust niet gestart"
+        echo "        Reden: geheugenarme healthcheck voorkomt een extra RAM-piek."
+        echo "        De paper-shortveiligheid en testvoortgang zijn hierboven gecontroleerd."
     else
-        echo
-        echo "[FOUT]  Paper-shortdiagnose mislukt"
+        echo "[FOUT]  short_diagnose.py Pythoncontrole mislukt"
         ERRORS=$((ERRORS + 1))
     fi
 else

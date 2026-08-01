@@ -334,9 +334,13 @@ def run_bot() -> None:
     bot.run_forever()
 
 
-def run_diagnose() -> None:
+def run_diagnose(once: bool = False) -> None:
     """
     Start Diamond Diagnose met dezelfde afgesloten-candlecorrectie.
+
+    Bij once=True wordt exact één diagnoseronde uitgevoerd en sluit
+    het proces daarna af. Dit maakt geheugenarme periodieke uitvoering
+    mogelijk zonder de diagnose-inhoud te veranderen.
     """
     diagnose.fetch_dataframe = (
         fetch_closed_diagnose_dataframe
@@ -372,7 +376,8 @@ def run_diagnose() -> None:
 
     diagnose.LOG.info(
         "Diamond Diagnose v4.2 gestart | "
-        "closed_candles=True"
+        "closed_candles=True | one_shot=%s",
+        once,
     )
 
     diagnose.LOG.info(
@@ -415,6 +420,12 @@ def run_diagnose() -> None:
                 exc,
             )
 
+            if once:
+                raise
+
+        if once:
+            return
+
         time.sleep(
             diagnose.LOOP_SLEEP_SECONDS
         )
@@ -426,19 +437,25 @@ def main() -> None:
         or sys.argv[1] not in {
             "bot",
             "diagnose",
+            "diagnose-once",
         }
     ):
         raise SystemExit(
             "Gebruik: python3 "
             "closed_candle_runner.py "
-            "bot|diagnose"
+            "bot|diagnose|diagnose-once"
         )
 
     if sys.argv[1] == "bot":
         run_bot()
 
-    else:
+    elif sys.argv[1] == "diagnose":
         run_diagnose()
+
+    else:
+        run_diagnose(
+            once=True,
+        )
 
 
 if __name__ == "__main__":
