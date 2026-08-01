@@ -316,10 +316,15 @@ def run_bot() -> None:
     )
 
     diamond_bot.LOG.info(
-        "Diamond Bot v6.4 gestart | "
-        "closed_candles=True | "
+        "Diamond Bot v6.5 gestart | "
+        "closed_candles=True | short_strategy=%s | "
         "dry_run=%s | state=%s | "
         "trades=%s | control=%s",
+        diamond_bot.get_cfg(
+            config,
+            "short.strategy_version",
+            "-",
+        ),
         bot.dry_run,
         bot.state_file,
         bot.trades_file,

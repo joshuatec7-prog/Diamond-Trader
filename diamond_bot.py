@@ -3,6 +3,7 @@ import csv
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 import urllib.parse
@@ -21,6 +22,39 @@ LOG = logging.getLogger("diamond_trader")
 TRADE_CSV_COLUMNS = [
     "ts", "market", "side", "price", "base_amount", "quote_amount",
     "fees_quote", "spread_pct", "net_pnl_quote", "holding_time_min", "reason", "dry_run",
+]
+
+SHORT_EXECUTION_CSV_COLUMNS = [
+    "ts",
+    "event",
+    "strategy_version",
+    "market",
+    "entry_trigger",
+    "entry_price",
+    "signal_close",
+    "atr",
+    "atr_pct",
+    "spread_pct",
+    "planned_stop_loss",
+    "planned_take_profit",
+    "base_take_profit",
+    "planned_tp_atr_mult",
+    "expected_net_reward",
+    "expected_net_risk",
+    "expected_net_rr",
+    "exit_reason",
+    "exit_price",
+    "market_ask_at_close",
+    "exit_candle_open",
+    "exit_candle_high",
+    "exit_candle_low",
+    "exit_candle_close",
+    "stop_overshoot_pct",
+    "take_profit_overshoot_pct",
+    "net_pnl_quote",
+    "holding_time_min",
+    "paper_only",
+    "dry_run",
 ]
 
 ALIASES = {
@@ -194,6 +228,25 @@ def append_trade_csv(path_str: str, row: Dict[str, Any]) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow({k: row.get(k, "") for k in TRADE_CSV_COLUMNS})
+
+
+def append_short_execution_csv(path_str: str, row: Dict[str, Any]) -> None:
+    """Schrijft uitsluitend uitgebreide paper-shortdiagnostiek."""
+    ensure_parent(path_str)
+    exists = Path(path_str).exists()
+    with open(path_str, "a", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=SHORT_EXECUTION_CSV_COLUMNS,
+        )
+        if not exists:
+            writer.writeheader()
+        writer.writerow(
+            {
+                key: row.get(key, "")
+                for key in SHORT_EXECUTION_CSV_COLUMNS
+            }
+        )
 
 def load_yaml(path_str: str) -> Dict[str, Any]:
     with open(path_str, "r", encoding="utf-8") as f:
@@ -453,6 +506,27 @@ class Bot:
                 cfg,
                 "files.short_test_baseline_file",
                 "/var/data/diamond_short_test_baseline.json",
+            )
+        )
+        self.short_test_report_file = str(
+            get_cfg(
+                cfg,
+                "files.short_test_report_file",
+                "/var/data/diamond_short_test_report.json",
+            )
+        )
+        self.short_execution_file = str(
+            get_cfg(
+                cfg,
+                "files.short_execution_file",
+                "/var/data/diamond_short_execution.csv",
+            )
+        )
+        self.short_test_archive_dir = str(
+            get_cfg(
+                cfg,
+                "files.short_test_archive_dir",
+                "/var/data/short_test_archive",
             )
         )
 
@@ -785,14 +859,146 @@ class Bot:
             ),
         )
 
+    def configured_short_strategy_version(self) -> str:
+        return str(
+            get_cfg(
+                self.cfg,
+                "short.strategy_version",
+                "short_breakout_v3",
+            )
+            or "short_breakout_v3"
+        ).strip()
+
+    def archive_completed_short_test_artifacts(
+        self,
+        existing_version: str,
+    ) -> List[Path]:
+        """
+        Kopieert een afgeronde shorttest naar een archiefmap.
+
+        Pas nadat de nieuwe baseline veilig is geschreven, worden de oude
+        rapportbestanden uit hun actieve locatie verwijderd. De historische
+        transacties en bot-state blijven altijd onaangeraakt.
+        """
+        archive_root = Path(
+            self.short_test_archive_dir
+        )
+        archive_root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        version_slug = "".join(
+            character
+            if character.isalnum() or character in {"-", "_"}
+            else "_"
+            for character in (existing_version or "onbekend")
+        )
+        timestamp = datetime.now(
+            timezone.utc
+        ).strftime("%Y%m%dT%H%M%SZ")
+        archive_dir = archive_root / (
+            f"{timestamp}_{version_slug}"
+        )
+        archive_dir.mkdir(
+            parents=True,
+            exist_ok=False,
+        )
+
+        baseline_path = Path(
+            self.short_test_baseline_file
+        )
+        report_path = Path(
+            self.short_test_report_file
+        )
+        execution_path = Path(
+            self.short_execution_file
+        )
+
+        candidates: List[Path] = [
+            baseline_path,
+            report_path,
+            report_path.with_suffix(".txt"),
+            execution_path,
+        ]
+
+        parent = baseline_path.parent
+        candidates.extend(
+            sorted(
+                parent.glob(
+                    "diamond_short_test_interim_*.json"
+                )
+            )
+        )
+        candidates.extend(
+            sorted(
+                parent.glob(
+                    "diamond_short_test_interim_*.txt"
+                )
+            )
+        )
+
+        copied: List[Path] = []
+        stale_active_files: List[Path] = []
+        seen: set[str] = set()
+
+        for source in candidates:
+            key = str(source)
+            if key in seen or not source.exists():
+                continue
+            seen.add(key)
+
+            destination = archive_dir / source.name
+            shutil.copy2(
+                source,
+                destination,
+            )
+            copied.append(source)
+
+            if source != baseline_path:
+                stale_active_files.append(source)
+
+        manifest = {
+            "archived_at": now_iso(),
+            "strategy_version": existing_version or "onbekend",
+            "files": [
+                source.name
+                for source in copied
+            ],
+            "source_baseline": str(baseline_path),
+            "current_short_trades": int(
+                self.state.get("short_trades", 0)
+                or 0
+            ),
+        }
+        with (archive_dir / "manifest.json").open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                manifest,
+                file,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        LOG.info(
+            "PAPER-SHORTTEST GEARCHIVEERD | strategie=%s | map=%s | bestanden=%d",
+            existing_version or "onbekend",
+            archive_dir,
+            len(copied),
+        )
+
+        return stale_active_files
+
     def ensure_short_test_baseline(self) -> None:
         """
         Legt vóór de eerste paper-short automatisch de nulmeting vast.
 
-        Wanneer de shortstrategie wijzigt en er nog geen shorttrade of
-        open shortpositie bestaat, wordt de nulmeting veilig vernieuwd.
-        Een reeds gestarte shorttest wordt nooit stilzwijgend gemengd met
-        een andere strategie.
+        Een afgeronde test mag veilig worden opgevolgd door een nieuwe
+        strategieversie. De oude baseline en rapporten worden eerst gekopieerd
+        naar het archief. Een lopende test of open short wordt nooit gemengd
+        met een andere strategie.
         """
         self.short_strategy_baseline_mismatch = False
 
@@ -820,13 +1026,9 @@ class Bot:
             or 0
         )
 
-        strategy_version = str(
-            get_cfg(
-                self.cfg,
-                "short.strategy_version",
-                "short_breakout_v2",
-            )
-        ).strip() or "short_breakout_v2"
+        strategy_version = (
+            self.configured_short_strategy_version()
+        )
 
         settings = {
             "strategy_version": strategy_version,
@@ -938,9 +1140,42 @@ class Bot:
                 ),
                 1.2,
             ),
+            "min_net_reward_risk": to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.min_net_reward_risk",
+                    1.0,
+                ),
+                1.0,
+            ),
+            "max_cost_adjusted_tp_atr_mult": to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.max_cost_adjusted_tp_atr_mult",
+                    4.0,
+                ),
+                4.0,
+            ),
+            "use_intrabar_thresholds": to_bool(
+                get_cfg(
+                    self.cfg,
+                    "short.use_intrabar_thresholds",
+                    True,
+                ),
+                True,
+            ),
+            "simulate_threshold_execution": to_bool(
+                get_cfg(
+                    self.cfg,
+                    "short.simulate_threshold_execution",
+                    True,
+                ),
+                True,
+            ),
         }
 
         replace_existing = False
+        stale_active_files: List[Path] = []
 
         if path.exists():
             try:
@@ -969,16 +1204,38 @@ class Bot:
                     )
                     or 0
                 )
+                existing_target_total = int(
+                    existing.get(
+                        "target_total_short_trades",
+                        0,
+                    )
+                    or 0
+                )
 
                 test_has_started = (
                     start_short_trades > existing_start
                     or self.short_positions_count() > 0
                 )
+                previous_test_complete = bool(
+                    existing_target_total > existing_start
+                    and start_short_trades >= existing_target_total
+                )
 
                 if existing_version == strategy_version:
                     return
 
-                if test_has_started:
+                if (
+                    previous_test_complete
+                    and self.short_positions_count() == 0
+                ):
+                    stale_active_files = (
+                        self.archive_completed_short_test_artifacts(
+                            existing_version
+                        )
+                    )
+                    replace_existing = True
+
+                elif test_has_started:
                     self.short_strategy_baseline_mismatch = True
 
                     LOG.error(
@@ -993,7 +1250,8 @@ class Bot:
 
                     return
 
-                replace_existing = True
+                else:
+                    replace_existing = True
 
             except Exception as exc:
                 self.short_strategy_baseline_mismatch = True
@@ -1037,6 +1295,18 @@ class Bot:
                     temporary_name,
                     path,
                 )
+
+                for stale_path in stale_active_files:
+                    try:
+                        stale_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        LOG.warning(
+                            "Oud shorttestrapport kon niet worden verwijderd: %s | %s",
+                            stale_path,
+                            exc,
+                        )
 
                 LOG.info(
                     "PAPER-SHORT NULMETING %s | "
@@ -1945,26 +2215,394 @@ class Bot:
             ),
         }
 
-    def short_exit_signal(self, symbol: str, position: Dict[str, Any]) -> Optional[str]:
+    def short_trade_plan(
+        self,
+        symbol: str,
+        signal: Dict[str, Any],
+        ticker: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Bouwt een kostenbewust paper-shortplan op basis van de echte biedprijs.
+
+        De stopafstand blijft ATR-gebaseerd. Het take-profitdoel wordt zo nodig
+        verder gezet totdat de verwachte nettowinst minimaal gelijk is aan de
+        ingestelde netto risico/winstverhouding. Wanneer daarvoor een onredelijk
+        groot ATR-doel nodig is, wordt de instap afgewezen.
+        """
+        ticker = ticker or self.get_ticker(symbol)
+        bid = to_float(ticker.get("bid"), 0.0)
+        ask = to_float(ticker.get("ask"), 0.0)
+        atr_now = to_float(signal.get("atr"), 0.0)
+        signal_close = to_float(signal.get("close"), 0.0)
+        spread_pct = self.estimate_spread_pct(ticker)
+
+        blockers: List[str] = []
+
+        if bid <= 0 or ask <= 0:
+            blockers.append("geldige bied- of laatprijs ontbreekt")
+
+        if atr_now <= 0:
+            blockers.append("ATR is ongeldig")
+
+        leverage = max(
+            1.0,
+            to_float(
+                get_cfg(self.cfg, "short.leverage", 1),
+                1.0,
+            ),
+        )
+        margin_per_trade = max(
+            0.0,
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.margin_per_trade",
+                    30,
+                ),
+                30.0,
+            ),
+        )
+        notional = margin_per_trade * leverage
+
+        amount = 0.0
+        if bid > 0 and notional > 0:
+            amount = self.amount_to_precision_safe(
+                symbol,
+                notional / bid,
+            )
+
+        if amount <= 0:
+            blockers.append("berekende shortomvang is ongeldig")
+
+        entry_quote = amount * bid
+        fee_rate = max(
+            0.0,
+            to_float(
+                get_cfg(self.cfg, "taker_fee_pct", 0.25),
+                0.25,
+            )
+            / 100.0,
+        )
+        fee_open_quote = entry_quote * fee_rate
+
+        tp_mult = max(
+            0.0,
+            to_float(
+                get_cfg(self.cfg, "short.atr_tp_mult", 2.4),
+                2.4,
+            ),
+        )
+        sl_mult = max(
+            0.0,
+            to_float(
+                get_cfg(self.cfg, "short.atr_sl_mult", 1.2),
+                1.2,
+            ),
+        )
+        min_net_rr = max(
+            0.0,
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.min_net_reward_risk",
+                    1.0,
+                ),
+                1.0,
+            ),
+        )
+        min_profit_quote = max(
+            0.0,
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.min_profit_eur",
+                    0.05,
+                ),
+                0.05,
+            ),
+        )
+        max_tp_atr_mult = max(
+            tp_mult,
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.max_cost_adjusted_tp_atr_mult",
+                    4.0,
+                ),
+                4.0,
+            ),
+        )
+
+        stop_loss = bid + atr_now * sl_mult
+        base_take_profit = bid - atr_now * tp_mult
+        cover_markup = (
+            max(1.0, ask / bid)
+            if bid > 0 and ask > 0
+            else 1.0
+        )
+
+        expected_stop_ask = stop_loss * cover_markup
+        expected_stop_quote = amount * expected_stop_ask
+        expected_stop_fee = expected_stop_quote * fee_rate
+        expected_stop_pnl = (
+            entry_quote
+            - fee_open_quote
+            - expected_stop_quote
+            - expected_stop_fee
+        )
+        expected_net_risk = max(
+            0.0,
+            -expected_stop_pnl,
+        )
+
+        desired_net_reward = max(
+            min_profit_quote,
+            expected_net_risk * min_net_rr,
+        )
+
+        required_cover_ask = 0.0
+        required_take_profit = 0.0
+        if amount > 0 and (1.0 + fee_rate) > 0:
+            required_cover_ask = (
+                entry_quote
+                - fee_open_quote
+                - desired_net_reward
+            ) / (amount * (1.0 + fee_rate))
+            required_take_profit = (
+                required_cover_ask / cover_markup
+                if cover_markup > 0
+                else 0.0
+            )
+
+        take_profit = min(
+            base_take_profit,
+            required_take_profit,
+        )
+        planned_tp_atr_mult = (
+            (bid - take_profit) / atr_now
+            if atr_now > 0 and take_profit > 0
+            else 0.0
+        )
+
+        expected_tp_ask = take_profit * cover_markup
+        expected_tp_quote = amount * expected_tp_ask
+        expected_tp_fee = expected_tp_quote * fee_rate
+        expected_net_reward = (
+            entry_quote
+            - fee_open_quote
+            - expected_tp_quote
+            - expected_tp_fee
+        )
+        expected_net_rr = (
+            expected_net_reward / expected_net_risk
+            if expected_net_risk > 0
+            else 0.0
+        )
+
+        if stop_loss <= bid:
+            blockers.append("geplande stop-loss ligt niet boven de instap")
+
+        if take_profit <= 0 or take_profit >= bid:
+            blockers.append("gepland take-profitdoel is ongeldig")
+
+        if expected_net_risk <= 0:
+            blockers.append("verwacht nettoverlies bij stop-loss is ongeldig")
+
+        if planned_tp_atr_mult > max_tp_atr_mult + 1e-9:
+            blockers.append(
+                "kostenbewust take-profitdoel vereist "
+                f"{planned_tp_atr_mult:.2f} ATR; maximum is "
+                f"{max_tp_atr_mult:.2f} ATR"
+            )
+
+        if expected_net_reward + 1e-9 < min_profit_quote:
+            blockers.append(
+                "verwachte nettowinst is lager dan "
+                f"{min_profit_quote:.4f} {self.quote}"
+            )
+
+        if expected_net_rr + 1e-9 < min_net_rr:
+            blockers.append(
+                "verwachte netto risico/winst is "
+                f"{expected_net_rr:.2f}; minimum is {min_net_rr:.2f}"
+            )
+
+        return {
+            "allowed": not blockers,
+            "blockers": blockers,
+            "strategy_version": self.configured_short_strategy_version(),
+            "bid": bid,
+            "ask": ask,
+            "signal_close": signal_close,
+            "spread_pct": spread_pct,
+            "cover_markup": cover_markup,
+            "atr": atr_now,
+            "atr_pct": to_float(signal.get("atr_pct"), 0.0),
+            "amount": amount,
+            "margin_quote": margin_per_trade,
+            "leverage": leverage,
+            "quote_amount": entry_quote,
+            "fee_open_quote": fee_open_quote,
+            "stop_loss": stop_loss,
+            "base_take_profit": base_take_profit,
+            "take_profit": take_profit,
+            "planned_tp_atr_mult": planned_tp_atr_mult,
+            "expected_net_reward": expected_net_reward,
+            "expected_net_risk": expected_net_risk,
+            "expected_net_rr": expected_net_rr,
+            "min_net_reward_risk": min_net_rr,
+            "max_cost_adjusted_tp_atr_mult": max_tp_atr_mult,
+        }
+
+    def short_exit_diagnostics(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+    ) -> Dict[str, Any]:
         df = self.fetch_ohlcv_df(symbol)
-        sma_fast = int(to_float(get_cfg(self.cfg, "short.sma_fast", 20), 20))
-        sma_slow = int(to_float(get_cfg(self.cfg, "short.sma_slow", 60), 60))
-        rsi_len = int(to_float(get_cfg(self.cfg, "short.rsi_len", 14), 14))
-        atr_len = int(to_float(get_cfg(self.cfg, "short.atr_len", 14), 14))
-        df = enrich_indicators(df, sma_fast, sma_slow, rsi_len, atr_len)
+        sma_fast = int(
+            to_float(
+                get_cfg(self.cfg, "short.sma_fast", 20),
+                20,
+            )
+        )
+        sma_slow = int(
+            to_float(
+                get_cfg(self.cfg, "short.sma_slow", 60),
+                60,
+            )
+        )
+        rsi_len = int(
+            to_float(
+                get_cfg(self.cfg, "short.rsi_len", 14),
+                14,
+            )
+        )
+        atr_len = int(
+            to_float(
+                get_cfg(self.cfg, "short.atr_len", 14),
+                14,
+            )
+        )
+        df = enrich_indicators(
+            df,
+            sma_fast,
+            sma_slow,
+            rsi_len,
+            atr_len,
+        )
         last = df.iloc[-1]
-        price = to_float(last["close"], 0.0)
-        fast = to_float(last["sma_fast"], 0.0)
-        slow = to_float(last["sma_slow"], 0.0)
+
+        candle_open = to_float(last.get("open"), 0.0)
+        candle_high = to_float(last.get("high"), 0.0)
+        candle_low = to_float(last.get("low"), 0.0)
+        candle_close = to_float(last.get("close"), 0.0)
+        fast = to_float(last.get("sma_fast"), 0.0)
+        slow = to_float(last.get("sma_slow"), 0.0)
         stop_loss = to_float(position.get("stop_loss"), 0.0)
         take_profit = to_float(position.get("take_profit"), 0.0)
-        if stop_loss > 0 and price >= stop_loss:
-            return "short_stop_loss"
-        if take_profit > 0 and price <= take_profit:
-            return "short_take_profit"
-        if to_bool(get_cfg(self.cfg, "signals.exit_on_trend_break", False), False) and fast > slow:
-            return "short_trend_break"
-        return None
+        entry_price = to_float(position.get("entry_price"), 0.0)
+
+        use_intrabar = to_bool(
+            position.get(
+                "use_intrabar_thresholds",
+                get_cfg(
+                    self.cfg,
+                    "short.use_intrabar_thresholds",
+                    False,
+                ),
+            ),
+            False,
+        )
+
+        stop_hit = bool(
+            stop_loss > 0
+            and (
+                candle_high >= stop_loss
+                if use_intrabar
+                else candle_close >= stop_loss
+            )
+        )
+        take_profit_hit = bool(
+            take_profit > 0
+            and (
+                candle_low <= take_profit
+                if use_intrabar
+                else candle_close <= take_profit
+            )
+        )
+        both_thresholds_hit = bool(
+            stop_hit and take_profit_hit
+        )
+
+        reason: Optional[str] = None
+        execution_reference_price = candle_close
+
+        # Wanneer beide niveaus binnen dezelfde afgesloten candle zijn geraakt,
+        # kiest de papersimulatie conservatief de stop-loss.
+        if stop_hit:
+            reason = "short_stop_loss"
+            execution_reference_price = max(
+                stop_loss,
+                candle_open,
+            )
+        elif take_profit_hit:
+            reason = "short_take_profit"
+            execution_reference_price = take_profit
+        elif (
+            to_bool(
+                get_cfg(
+                    self.cfg,
+                    "signals.exit_on_trend_break",
+                    False,
+                ),
+                False,
+            )
+            and fast > slow
+        ):
+            reason = "short_trend_break"
+            execution_reference_price = candle_close
+
+        stop_overshoot_pct = (
+            max(0.0, candle_high - stop_loss)
+            / entry_price
+            * 100.0
+            if entry_price > 0 and stop_loss > 0
+            else 0.0
+        )
+        take_profit_overshoot_pct = (
+            max(0.0, take_profit - candle_low)
+            / entry_price
+            * 100.0
+            if entry_price > 0 and take_profit > 0
+            else 0.0
+        )
+
+        return {
+            "reason": reason,
+            "execution_reference_price": execution_reference_price,
+            "use_intrabar_thresholds": use_intrabar,
+            "both_thresholds_hit": both_thresholds_hit,
+            "candle_ts": str(last.get("ts", "")),
+            "candle_open": candle_open,
+            "candle_high": candle_high,
+            "candle_low": candle_low,
+            "candle_close": candle_close,
+            "stop_hit": stop_hit,
+            "take_profit_hit": take_profit_hit,
+            "stop_overshoot_pct": stop_overshoot_pct,
+            "take_profit_overshoot_pct": take_profit_overshoot_pct,
+        }
+
+    def short_exit_signal(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+    ) -> Optional[str]:
+        return self.short_exit_diagnostics(
+            symbol,
+            position,
+        ).get("reason")
 
     def order_fee_quote(
         self,
@@ -2091,6 +2729,82 @@ class Bot:
         fee_open_quote = to_float(position.get("fees_open_quote"), 0.0)
         return entry_quote - fee_open_quote - cover_quote - est_cover_fee
 
+    def simulated_short_exit_ask(
+        self,
+        position: Dict[str, Any],
+        reason: str,
+        ticker: Dict[str, Any],
+        exit_diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        """Bepaalt de conservatieve paper-uitvoeringsprijs voor shortsluiting."""
+        market_ask = to_float(ticker.get("ask"), 0.0)
+        market_bid = to_float(ticker.get("bid"), 0.0)
+
+        simulate_threshold = to_bool(
+            position.get(
+                "simulate_threshold_execution",
+                get_cfg(
+                    self.cfg,
+                    "short.simulate_threshold_execution",
+                    False,
+                ),
+            ),
+            False,
+        )
+
+        if (
+            not simulate_threshold
+            or reason not in {
+                "short_stop_loss",
+                "short_take_profit",
+            }
+            or not exit_diagnostics
+        ):
+            return market_ask
+
+        reference_price = to_float(
+            exit_diagnostics.get(
+                "execution_reference_price"
+            ),
+            0.0,
+        )
+        if reference_price <= 0:
+            return market_ask
+
+        current_markup = (
+            max(1.0, market_ask / market_bid)
+            if market_bid > 0 and market_ask > 0
+            else 1.0
+        )
+        entry_markup = max(
+            1.0,
+            to_float(
+                position.get("entry_cover_markup"),
+                1.0,
+            ),
+        )
+        cover_markup = max(
+            current_markup,
+            entry_markup,
+        )
+        slippage_pct = max(
+            0.0,
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "short.paper_slippage_pct",
+                    0.0,
+                ),
+                0.0,
+            ),
+        )
+
+        return (
+            reference_price
+            * cover_markup
+            * (1.0 + slippage_pct / 100.0)
+        )
+
     def rate_limited_hold_log(self, key: str, message: str, *args) -> None:
         now_ts = utc_now_ts()
         last_ts = float(self.last_hold_log_ts.get(key, 0.0))
@@ -2136,14 +2850,31 @@ class Bot:
         )
         return False
 
-    def close_short_allowed_by_profit(self, symbol: str, position: Dict[str, Any], reason: str) -> bool:
+    def close_short_allowed_by_profit(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+        reason: str,
+        exit_diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         ticker = self.get_ticker(symbol)
-        ask = to_float(ticker.get("ask"), 0.0)
+        ask = self.simulated_short_exit_ask(
+            position,
+            reason,
+            ticker,
+            exit_diagnostics,
+        )
         if ask <= 0:
             return False
-        est_pnl = self.estimated_short_exit_pnl_quote(symbol, position, ask)
+
+        est_pnl = self.estimated_short_exit_pnl_quote(
+            symbol,
+            position,
+            ask,
+        )
         if reason == "short_stop_loss":
             return True
+
         min_profit_eur = to_float(
             get_cfg(
                 self.cfg,
@@ -2156,10 +2887,16 @@ class Bot:
             return True
         if est_pnl >= min_profit_eur:
             return True
+
         self.rate_limited_hold_log(
             f"short:{symbol}:{reason}",
             "HOLD SHORT %s | reason=%s | est_pnl=%.4f %s < min_profit=%.4f %s",
-            symbol, reason, est_pnl, self.quote, min_profit_eur, self.quote,
+            symbol,
+            reason,
+            est_pnl,
+            self.quote,
+            min_profit_eur,
+            self.quote,
         )
         return False
 
@@ -2580,7 +3317,11 @@ class Bot:
             except Exception as e:
                 LOG.warning("Positiebeheer overgeslagen voor %s door marktdatafout: %s", symbol, e)
 
-    def open_paper_short(self, symbol: str, signal: Dict[str, Any]) -> None:
+    def open_paper_short(
+        self,
+        symbol: str,
+        signal: Dict[str, Any],
+    ) -> None:
         if not self.short_enabled():
             return
 
@@ -2632,45 +3373,195 @@ class Bot:
 
             return
 
-        leverage = max(1.0, to_float(get_cfg(self.cfg, "short.leverage", 2), 2.0))
-        margin_per_trade = to_float(get_cfg(self.cfg, "short.margin_per_trade", 30), 30.0)
-        quote_amount = margin_per_trade * leverage
-        amount = self.amount_to_precision_safe(symbol, quote_amount / bid)
-        quote_amount = amount * bid
-        fee_open_quote = quote_amount * (to_float(get_cfg(self.cfg, "taker_fee_pct", 0.25), 0.25) / 100.0)
+        plan = self.short_trade_plan(
+            symbol,
+            signal,
+            ticker,
+        )
+
+        if not plan.get("allowed", False):
+            blockers = list(
+                plan.get("blockers", [])
+                or []
+            )
+            self.rate_limited_info(
+                self.last_skip_log_ts,
+                f"short_cost_plan:{symbol}",
+                600,
+                "PAPER SHORT V3 OVERSLAAN %s | %s",
+                symbol,
+                "; ".join(blockers) or "kostenplan afgewezen",
+            )
+            append_short_execution_csv(
+                self.short_execution_file,
+                {
+                    "ts": now_iso(),
+                    "event": "PLAN_REJECT",
+                    "strategy_version": plan.get("strategy_version"),
+                    "market": symbol,
+                    "entry_trigger": signal.get("entry_trigger"),
+                    "entry_price": plan.get("bid"),
+                    "signal_close": plan.get("signal_close"),
+                    "atr": plan.get("atr"),
+                    "atr_pct": plan.get("atr_pct"),
+                    "spread_pct": plan.get("spread_pct"),
+                    "planned_stop_loss": plan.get("stop_loss"),
+                    "planned_take_profit": plan.get("take_profit"),
+                    "base_take_profit": plan.get("base_take_profit"),
+                    "planned_tp_atr_mult": plan.get("planned_tp_atr_mult"),
+                    "expected_net_reward": plan.get("expected_net_reward"),
+                    "expected_net_risk": plan.get("expected_net_risk"),
+                    "expected_net_rr": plan.get("expected_net_rr"),
+                    "exit_reason": "; ".join(blockers),
+                    "paper_only": True,
+                    "dry_run": True,
+                },
+            )
+            return
+
+        amount = to_float(plan.get("amount"), 0.0)
+        quote_amount = to_float(
+            plan.get("quote_amount"),
+            0.0,
+        )
+        fee_open_quote = to_float(
+            plan.get("fee_open_quote"),
+            0.0,
+        )
+        leverage = to_float(
+            plan.get("leverage"),
+            1.0,
+        )
+        margin_per_trade = to_float(
+            plan.get("margin_quote"),
+            30.0,
+        )
+        strategy_version = str(
+            plan.get("strategy_version")
+            or self.configured_short_strategy_version()
+        )
 
         self.state["short_positions"][symbol] = {
-            "paper_only": True, "opened_at": utc_now_ts(), "entry_price": bid,
-            "amount": amount, "margin_quote": margin_per_trade, "leverage": leverage,
-            "quote_amount": quote_amount, "fees_open_quote": fee_open_quote,
-            "stop_loss": signal["stop_loss"], "take_profit": signal["take_profit"],
-            "entry_trigger": signal.get("entry_trigger", "paper_short_entry"),
+            "paper_only": True,
+            "strategy_version": strategy_version,
+            "opened_at": utc_now_ts(),
+            "entry_price": bid,
+            "signal_close": to_float(plan.get("signal_close"), 0.0),
+            "amount": amount,
+            "margin_quote": margin_per_trade,
+            "leverage": leverage,
+            "quote_amount": quote_amount,
+            "fees_open_quote": fee_open_quote,
+            "stop_loss": to_float(plan.get("stop_loss"), 0.0),
+            "take_profit": to_float(plan.get("take_profit"), 0.0),
+            "base_take_profit": to_float(
+                plan.get("base_take_profit"),
+                0.0,
+            ),
+            "planned_tp_atr_mult": to_float(
+                plan.get("planned_tp_atr_mult"),
+                0.0,
+            ),
+            "expected_net_reward": to_float(
+                plan.get("expected_net_reward"),
+                0.0,
+            ),
+            "expected_net_risk": to_float(
+                plan.get("expected_net_risk"),
+                0.0,
+            ),
+            "expected_net_rr": to_float(
+                plan.get("expected_net_rr"),
+                0.0,
+            ),
+            "entry_cover_markup": to_float(
+                plan.get("cover_markup"),
+                1.0,
+            ),
+            "entry_spread_pct": spread_pct,
+            "entry_trigger": signal.get(
+                "entry_trigger",
+                "paper_short_entry",
+            ),
             "entry_rsi": signal.get("rsi"),
+            "entry_atr": signal.get("atr"),
             "entry_atr_pct": signal.get("atr_pct"),
             "breakout_level": signal.get("breakout_level"),
+            "use_intrabar_thresholds": to_bool(
+                get_cfg(
+                    self.cfg,
+                    "short.use_intrabar_thresholds",
+                    True,
+                ),
+                True,
+            ),
+            "simulate_threshold_execution": to_bool(
+                get_cfg(
+                    self.cfg,
+                    "short.simulate_threshold_execution",
+                    True,
+                ),
+                True,
+            ),
         }
         save_state(self.state_file, self.state)
-        append_trade_csv(self.trades_file, {
-            "ts": now_iso(), "market": symbol, "side": "SHORT_OPEN",
-            "price": round(bid, 12), "base_amount": amount,
-            "quote_amount": round(quote_amount, 8), "fees_quote": round(fee_open_quote, 8),
-            "spread_pct": round(self.estimate_spread_pct(ticker), 6),
-            "net_pnl_quote": "", "holding_time_min": "",
-            "reason": (
-                "paper_short_"
-                + str(
-                    signal.get(
-                        "entry_trigger",
-                        "entry",
+
+        append_trade_csv(
+            self.trades_file,
+            {
+                "ts": now_iso(),
+                "market": symbol,
+                "side": "SHORT_OPEN",
+                "price": round(bid, 12),
+                "base_amount": amount,
+                "quote_amount": round(quote_amount, 8),
+                "fees_quote": round(fee_open_quote, 8),
+                "spread_pct": round(spread_pct, 6),
+                "net_pnl_quote": "",
+                "holding_time_min": "",
+                "reason": (
+                    "paper_short_"
+                    + str(
+                        signal.get(
+                            "entry_trigger",
+                            "entry",
+                        )
                     )
-                )
-            ),
-            "dry_run": True,
-        })
+                ),
+                "dry_run": True,
+            },
+        )
+
+        append_short_execution_csv(
+            self.short_execution_file,
+            {
+                "ts": now_iso(),
+                "event": "OPEN",
+                "strategy_version": strategy_version,
+                "market": symbol,
+                "entry_trigger": signal.get("entry_trigger"),
+                "entry_price": bid,
+                "signal_close": plan.get("signal_close"),
+                "atr": plan.get("atr"),
+                "atr_pct": plan.get("atr_pct"),
+                "spread_pct": spread_pct,
+                "planned_stop_loss": plan.get("stop_loss"),
+                "planned_take_profit": plan.get("take_profit"),
+                "base_take_profit": plan.get("base_take_profit"),
+                "planned_tp_atr_mult": plan.get("planned_tp_atr_mult"),
+                "expected_net_reward": plan.get("expected_net_reward"),
+                "expected_net_risk": plan.get("expected_net_risk"),
+                "expected_net_rr": plan.get("expected_net_rr"),
+                "paper_only": True,
+                "dry_run": True,
+            },
+        )
+
         LOG.info(
-            "PAPER SHORT OPEN %s | trigger=%s | prijs=%.8f | "
+            "PAPER SHORT V3 OPEN %s | trigger=%s | prijs=%.8f | "
             "amount=%s | notional=%.2f %s | lev=%.2f | "
-            "RSI=%.2f | ATR=%.3f%% | spread=%.4f%%",
+            "RSI=%.2f | ATR=%.3f%% | spread=%.4f%% | "
+            "SL=%.8f | TP=%.8f | net_rr=%.2f",
             symbol,
             signal.get("entry_trigger", "onbekend"),
             bid,
@@ -2681,40 +3572,159 @@ class Bot:
             to_float(signal.get("rsi"), 0.0),
             to_float(signal.get("atr_pct"), 0.0),
             spread_pct,
+            to_float(plan.get("stop_loss"), 0.0),
+            to_float(plan.get("take_profit"), 0.0),
+            to_float(plan.get("expected_net_rr"), 0.0),
         )
 
-    def close_paper_short(self, symbol: str, position: Dict[str, Any], reason: str) -> None:
+    def close_paper_short(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+        reason: str,
+        exit_diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> None:
         ticker = self.get_ticker(symbol)
-        ask = to_float(ticker.get("ask"), 0.0)
+        market_ask = to_float(ticker.get("ask"), 0.0)
+        if market_ask <= 0:
+            return
+
+        ask = self.simulated_short_exit_ask(
+            position,
+            reason,
+            ticker,
+            exit_diagnostics,
+        )
         if ask <= 0:
             return
+
         amount = to_float(position.get("amount"), 0.0)
         cover_quote = amount * ask
-        fee_close_quote = cover_quote * (to_float(get_cfg(self.cfg, "taker_fee_pct", 0.25), 0.25) / 100.0)
-        entry_quote = to_float(position.get("quote_amount"), 0.0)
-        fee_open_quote = to_float(position.get("fees_open_quote"), 0.0)
-        net_pnl_quote = entry_quote - fee_open_quote - cover_quote - fee_close_quote
-        holding_time_min = minutes_since(float(position.get("opened_at", utc_now_ts())))
+        fee_close_quote = cover_quote * (
+            to_float(
+                get_cfg(self.cfg, "taker_fee_pct", 0.25),
+                0.25,
+            )
+            / 100.0
+        )
+        entry_quote = to_float(
+            position.get("quote_amount"),
+            0.0,
+        )
+        fee_open_quote = to_float(
+            position.get("fees_open_quote"),
+            0.0,
+        )
+        net_pnl_quote = (
+            entry_quote
+            - fee_open_quote
+            - cover_quote
+            - fee_close_quote
+        )
+        holding_time_min = minutes_since(
+            float(
+                position.get(
+                    "opened_at",
+                    utc_now_ts(),
+                )
+            )
+        )
 
-        self.state["short_pnl_quote"] = to_float(self.state.get("short_pnl_quote", 0.0), 0.0) + net_pnl_quote
-        self.state["short_trades"] = int(self.state.get("short_trades", 0)) + 1
+        self.state["short_pnl_quote"] = (
+            to_float(
+                self.state.get("short_pnl_quote", 0.0),
+                0.0,
+            )
+            + net_pnl_quote
+        )
+        self.state["short_trades"] = int(
+            self.state.get("short_trades", 0)
+        ) + 1
         if net_pnl_quote > 0:
-            self.state["short_wins"] = int(self.state.get("short_wins", 0)) + 1
+            self.state["short_wins"] = int(
+                self.state.get("short_wins", 0)
+            ) + 1
 
-        self.state["short_positions"].pop(symbol, None)
-        self.state["short_cooldown"][symbol] = utc_now_ts()
+        self.state["short_positions"].pop(
+            symbol,
+            None,
+        )
+        self.state["short_cooldown"][symbol] = (
+            utc_now_ts()
+        )
         save_state(self.state_file, self.state)
-        append_trade_csv(self.trades_file, {
-            "ts": now_iso(), "market": symbol, "side": "SHORT_CLOSE",
-            "price": round(ask, 12), "base_amount": amount,
-            "quote_amount": round(cover_quote, 8), "fees_quote": round(fee_close_quote, 8),
-            "spread_pct": round(self.estimate_spread_pct(ticker), 6),
-            "net_pnl_quote": round(net_pnl_quote, 8),
-            "holding_time_min": round(holding_time_min, 2),
-            "reason": reason, "dry_run": True,
-        })
-        LOG.info("PAPER SHORT CLOSE %s | prijs=%.8f amount=%s pnl=%.4f %s reden=%s",
-                 symbol, ask, amount, net_pnl_quote, self.quote, reason)
+
+        append_trade_csv(
+            self.trades_file,
+            {
+                "ts": now_iso(),
+                "market": symbol,
+                "side": "SHORT_CLOSE",
+                "price": round(ask, 12),
+                "base_amount": amount,
+                "quote_amount": round(cover_quote, 8),
+                "fees_quote": round(fee_close_quote, 8),
+                "spread_pct": round(
+                    self.estimate_spread_pct(ticker),
+                    6,
+                ),
+                "net_pnl_quote": round(net_pnl_quote, 8),
+                "holding_time_min": round(holding_time_min, 2),
+                "reason": reason,
+                "dry_run": True,
+            },
+        )
+
+        details = exit_diagnostics or {}
+        append_short_execution_csv(
+            self.short_execution_file,
+            {
+                "ts": now_iso(),
+                "event": "CLOSE",
+                "strategy_version": position.get("strategy_version"),
+                "market": symbol,
+                "entry_trigger": position.get("entry_trigger"),
+                "entry_price": position.get("entry_price"),
+                "signal_close": position.get("signal_close"),
+                "atr": position.get("entry_atr"),
+                "atr_pct": position.get("entry_atr_pct"),
+                "spread_pct": self.estimate_spread_pct(ticker),
+                "planned_stop_loss": position.get("stop_loss"),
+                "planned_take_profit": position.get("take_profit"),
+                "base_take_profit": position.get("base_take_profit"),
+                "planned_tp_atr_mult": position.get("planned_tp_atr_mult"),
+                "expected_net_reward": position.get("expected_net_reward"),
+                "expected_net_risk": position.get("expected_net_risk"),
+                "expected_net_rr": position.get("expected_net_rr"),
+                "exit_reason": reason,
+                "exit_price": ask,
+                "market_ask_at_close": market_ask,
+                "exit_candle_open": details.get("candle_open"),
+                "exit_candle_high": details.get("candle_high"),
+                "exit_candle_low": details.get("candle_low"),
+                "exit_candle_close": details.get("candle_close"),
+                "stop_overshoot_pct": details.get("stop_overshoot_pct"),
+                "take_profit_overshoot_pct": details.get(
+                    "take_profit_overshoot_pct"
+                ),
+                "net_pnl_quote": net_pnl_quote,
+                "holding_time_min": holding_time_min,
+                "paper_only": True,
+                "dry_run": True,
+            },
+        )
+
+        LOG.info(
+            "PAPER SHORT V3 CLOSE %s | prijs=%.8f | markt_ask=%.8f | "
+            "amount=%s | pnl=%.4f %s | reden=%s",
+            symbol,
+            ask,
+            market_ask,
+            amount,
+            net_pnl_quote,
+            self.quote,
+            reason,
+        )
 
     def try_open_paper_short(self, symbol: str) -> None:
         if not self.short_enabled():
@@ -2766,14 +3776,34 @@ class Bot:
             LOG.exception("SHORT OPEN mislukt voor %s: %s", symbol, e)
 
     def manage_open_short_positions(self) -> None:
-        positions = list((self.state.get("short_positions") or {}).items())
+        positions = list(
+            (self.state.get("short_positions") or {}).items()
+        )
         for symbol, position in positions:
             try:
-                reason = self.short_exit_signal(symbol, position)
-                if reason and self.close_short_allowed_by_profit(symbol, position, reason):
-                    self.close_paper_short(symbol, position, reason)
-            except Exception as e:
-                LOG.warning("Short positiebeheer overgeslagen voor %s door marktdatafout: %s", symbol, e)
+                exit_diagnostics = self.short_exit_diagnostics(
+                    symbol,
+                    position,
+                )
+                reason = exit_diagnostics.get("reason")
+                if reason and self.close_short_allowed_by_profit(
+                    symbol,
+                    position,
+                    str(reason),
+                    exit_diagnostics,
+                ):
+                    self.close_paper_short(
+                        symbol,
+                        position,
+                        str(reason),
+                        exit_diagnostics,
+                    )
+            except Exception as exc:
+                LOG.warning(
+                    "Short positiebeheer overgeslagen voor %s door marktdatafout: %s",
+                    symbol,
+                    exc,
+                )
 
     def print_status(self, symbols: List[str]) -> None:
         every_seconds = int(to_float(get_cfg(self.cfg, "skip_log_every_seconds", 600), 600.0))
@@ -2955,7 +3985,7 @@ def main() -> None:
     cfg = load_yaml(cfg_path)
     setup_logging(str(get_cfg(cfg, "log_level", "INFO")))
     bot = Bot(cfg)
-    LOG.info("Diamond Bot v6.4 gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
+    LOG.info("Diamond Bot v6.5 gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
     bot.run_forever()
 
 

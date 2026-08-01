@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Trader - veilige paper-shortdiagnose.
+Diamond Trader - veilige paper-shortdiagnose v3.
 
 Dit programma:
 - gebruikt exact dezelfde shortsignaallogica als diamond_bot.py;
@@ -505,6 +505,54 @@ def inspect_symbol(
         and spread_pct <= max_spread_pct
     )
 
+    technical_signal = as_bool(
+        technical.get("signal"),
+        False,
+    )
+
+    cost_plan: Dict[str, Any] = {
+        "allowed": False,
+        "blockers": [],
+        "stop_loss": 0.0,
+        "take_profit": 0.0,
+        "base_take_profit": 0.0,
+        "planned_tp_atr_mult": 0.0,
+        "expected_net_reward": 0.0,
+        "expected_net_risk": 0.0,
+        "expected_net_rr": 0.0,
+        "min_net_reward_risk": as_float(
+            cfg_value(
+                bot.cfg,
+                "short.min_net_reward_risk",
+                1.0,
+            ),
+            1.0,
+        ),
+        "max_cost_adjusted_tp_atr_mult": as_float(
+            cfg_value(
+                bot.cfg,
+                "short.max_cost_adjusted_tp_atr_mult",
+                4.0,
+            ),
+            4.0,
+        ),
+    }
+
+    if technical_signal and spread_ok:
+        signal_for_plan = {
+            "close": technical.get("close"),
+            "atr": technical.get("atr"),
+            "atr_pct": technical.get("atr_pct"),
+            "rsi": technical.get("rsi"),
+            "entry_trigger": technical.get("entry_trigger"),
+            "breakout_level": technical.get("breakout_level"),
+        }
+        cost_plan = bot.short_trade_plan(
+            symbol,
+            signal_for_plan,
+            ticker,
+        )
+
     positions = (
         bot.state.get("positions", {})
         or {}
@@ -562,11 +610,6 @@ def inspect_symbol(
                 f"{max_spread_pct:.4f}%"
             )
         )
-
-    technical_signal = as_bool(
-        technical.get("signal"),
-        False,
-    )
 
     trigger_ok = bool(
         technical.get("entry_trigger")
@@ -631,6 +674,16 @@ def inspect_symbol(
             "spread niet akkoord"
         )
 
+    cost_plan_blockers = list(
+        cost_plan.get("blockers", [])
+        or []
+    )
+
+    if technical_signal and spread_ok and cost_plan_blockers:
+        logical_missing.append(
+            "netto risico/winstplan niet akkoord"
+        )
+
     logical_missing.extend(
         symbol_blockers
     )
@@ -644,6 +697,7 @@ def inspect_symbol(
         and not symbol_blockers
         and technical_signal
         and spread_ok
+        and as_bool(cost_plan.get("allowed"), False)
     )
 
     if global_blockers:
@@ -714,6 +768,47 @@ def inspect_symbol(
         "spread_pct": spread_pct,
         "max_spread_pct": max_spread_pct,
         "spread_ok": spread_ok,
+        "cost_plan_allowed": as_bool(
+            cost_plan.get("allowed"),
+            False,
+        ),
+        "planned_stop_loss": as_float(
+            cost_plan.get("stop_loss"),
+            0.0,
+        ),
+        "planned_take_profit": as_float(
+            cost_plan.get("take_profit"),
+            0.0,
+        ),
+        "base_take_profit": as_float(
+            cost_plan.get("base_take_profit"),
+            0.0,
+        ),
+        "planned_tp_atr_mult": as_float(
+            cost_plan.get("planned_tp_atr_mult"),
+            0.0,
+        ),
+        "expected_net_reward": as_float(
+            cost_plan.get("expected_net_reward"),
+            0.0,
+        ),
+        "expected_net_risk": as_float(
+            cost_plan.get("expected_net_risk"),
+            0.0,
+        ),
+        "expected_net_rr": as_float(
+            cost_plan.get("expected_net_rr"),
+            0.0,
+        ),
+        "min_net_reward_risk": as_float(
+            cost_plan.get("min_net_reward_risk"),
+            1.0,
+        ),
+        "max_cost_adjusted_tp_atr_mult": as_float(
+            cost_plan.get("max_cost_adjusted_tp_atr_mult"),
+            4.0,
+        ),
+        "cost_plan_blockers": cost_plan_blockers,
         "cooldown_remaining_minutes": (
             cooldown_remaining
         ),
@@ -779,6 +874,14 @@ def print_compact(
         blockers = (
             item["global_blockers"]
             + item["logical_missing"]
+            + item.get("cost_plan_blockers", [])
+        )
+
+        rr_text = (
+            f"{item['expected_net_rr']:.2f} "
+            f"{'OK' if item['cost_plan_allowed'] else 'NEE'}"
+            if item["technical_signal"] and item["spread_ok"]
+            else "n.v.t."
         )
 
         blocker_text = (
@@ -799,6 +902,7 @@ def print_compact(
             f"{'OK' if item['atr_ok'] else 'NEE'} | "
             f"spread={item['spread_pct']:.4f}% "
             f"{'OK' if item['spread_ok'] else 'NEE'} | "
+            f"net_rr={rr_text} | "
             f"blokkade={blocker_text}"
         )
 
@@ -944,11 +1048,39 @@ def print_detailed(
             f"Instaptrigger      : "
             f"{format_trigger(item['entry_trigger'])}"
         )
+        if item["technical_signal"] and item["spread_ok"]:
+            print(
+                f"Geplande stop     : "
+                f"{item['planned_stop_loss']:.8f}"
+            )
+            print(
+                f"Geplande TP       : "
+                f"{item['planned_take_profit']:.8f} "
+                f"({item['planned_tp_atr_mult']:.2f} ATR; "
+                f"max {item['max_cost_adjusted_tp_atr_mult']:.2f})"
+            )
+            print(
+                f"Verwachte netto   : "
+                f"winst €{item['expected_net_reward']:.4f} | "
+                f"risico €{item['expected_net_risk']:.4f}"
+            )
+            print(
+                f"Netto R/R         : "
+                f"{item['expected_net_rr']:.2f} "
+                f"[min {item['min_net_reward_risk']:.2f}] "
+                f"{'OK' if item['cost_plan_allowed'] else 'NIET OK'}"
+            )
+        else:
+            print(
+                "Kostenplan         : niet berekend; "
+                "technisch signaal of geldige spread ontbreekt"
+            )
 
         all_blockers = (
             item["global_blockers"]
             + item["technical_blockers"]
             + item["symbol_blockers"]
+            + item.get("cost_plan_blockers", [])
         )
 
         unique_blockers = list(

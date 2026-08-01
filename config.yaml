@@ -1,6 +1,6 @@
 # Diamond Trader configuratie
 # Nieuwe longposities staan tijdelijk uit.
-# De paper-shorttest gebruikt strategie short_breakout_v2.
+# De paper-shorttest gebruikt strategie short_breakout_v3.
 # Echte orders blijven volledig uitgeschakeld zolang risk.dry_run true is.
 
 quote: EUR
@@ -100,7 +100,7 @@ short:
   # Altijd uitsluitend een papieren simulatie.
   enabled: true
   paper_only: true
-  strategy_version: short_breakout_v2
+  strategy_version: short_breakout_v3
 
   # Eerste test: maximaal één short zonder hefboom.
   max_open_positions: 1
@@ -133,12 +133,27 @@ short:
   atr_tp_mult: 2.4
   atr_sl_mult: 1.2
 
+  # V3: kostenbewuste netto risico/winstcontrole.
+  # Het TP-doel wordt zo nodig verder gezet; is meer dan 4 ATR nodig,
+  # dan wordt de instap veilig overgeslagen.
+  min_net_reward_risk: 1.00
+  max_cost_adjusted_tp_atr_mult: 4.0
+
+  # V3: exits worden uitsluitend na een afgesloten candle beoordeeld,
+  # maar high/low bepalen of TP of SL binnen die candle is geraakt.
+  # Wanneer beide zijn geraakt, telt conservatief de stop-loss.
+  use_intrabar_thresholds: true
+  simulate_threshold_execution: true
+  paper_slippage_pct: 0.0
+
 files:
   state_file: /var/data/diamond_state.json
   trades_file: /var/data/diamond_transactions.csv
   control_file: /var/data/diamond_control.json
   short_test_baseline_file: /var/data/diamond_short_test_baseline.json
   short_test_report_file: /var/data/diamond_short_test_report.json
+  short_execution_file: /var/data/diamond_short_execution.csv
+  short_test_archive_dir: /var/data/short_test_archive
 
 logging:
   level: INFO
