@@ -15,7 +15,7 @@ symbols:
 
 trading:
   # Tijdelijk uitgeschakeld na de zwakke eerste longtest.
-  enable_spot: false
+  enable_spot: true
 
   # Alleen gesimuleerde shortposities.
   enable_short_signals: true
