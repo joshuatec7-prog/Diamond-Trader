@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Diamond Trader Periodic Analysis Runner v1.0
+Diamond Trader Periodic Analysis Runner v1.1
 
 Geheugenarme, sequentiële uitvoering van:
 1. Diamond Diagnose: exact één ronde met closed-candlecorrectie.
 2. Diamond Market Scanner: exact één virtuele scan.
+3. Shadow V2 Signal Lab: volgt daarna de nieuw geschreven scannersignalen virtueel.
 
 Belangrijk:
-- Diagnose en Scanner draaien nooit tegelijk.
+- Diagnose, Scanner en Shadow V2 draaien nooit tegelijk.
 - De handelsbot, Agent, Supervisor en Strategy Lab blijven ongemoeid.
 - Deze runner plaatst zelf geen orders en wijzigt geen strategie-instellingen.
 - Interval blijft 15 minuten, gelijk aan de bestaande diagnose/scanner-loop.
@@ -27,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-VERSION = "1.0"
+VERSION = "1.1"
 MODE = "SEQUENTIAL_PERIODIC_ANALYSIS"
 
 PROJECT_DIR = Path("/opt/render/project/src")
@@ -35,6 +36,7 @@ DATA_DIR = Path("/var/data")
 STATE_FILE = DATA_DIR / "diamond_periodic_analysis_state.json"
 DIAG_LOG = DATA_DIR / "diamond_diagnose_runner.log"
 SCANNER_LOG = DATA_DIR / "diamond_market_scanner_runner.log"
+SHADOW_V2_LOG = DATA_DIR / "diamond_shadow_v2_runner.log"
 
 INTERVAL_SECONDS = 15 * 60
 MAX_LOG_BYTES = 5_000_000
@@ -120,6 +122,14 @@ def default_state() -> Dict[str, Any]:
                     "20",
                 ]
             ),
+            "shadow_v2": default_task(
+                [
+                    sys.executable,
+                    "shadow_v2_filter.py",
+                    "--update",
+                    "--no-print",
+                ]
+            ),
         },
     }
 
@@ -158,6 +168,12 @@ def load_state() -> Dict[str, Any]:
             "market_scanner.py",
             "--top",
             "20",
+        ],
+        "shadow_v2": [
+            sys.executable,
+            "shadow_v2_filter.py",
+            "--update",
+            "--no-print",
         ],
     }.items():
         old = tasks.get(name)
@@ -270,7 +286,7 @@ def run_forever() -> None:
     save_json_atomic(STATE_FILE, state)
 
     print(
-        "Diamond Periodic Analysis Runner v1.0 gestart | "
+        "Diamond Periodic Analysis Runner v1.1 gestart | "
         "interval=900s | sequential=True",
         flush=True,
     )
@@ -311,6 +327,21 @@ def run_forever() -> None:
         if STOP_REQUESTED:
             break
 
+        run_task(
+            state,
+            "shadow_v2",
+            [
+                sys.executable,
+                "shadow_v2_filter.py",
+                "--update",
+                "--no-print",
+            ],
+            SHADOW_V2_LOG,
+        )
+
+        if STOP_REQUESTED:
+            break
+
         state["last_cycle_completed_at"] = now_iso()
 
         elapsed = max(0.0, time.monotonic() - cycle_started_monotonic)
@@ -345,6 +376,11 @@ def self_test() -> None:
     assert state["tasks"]["diagnose"]["command"][-1] == "diagnose-once"
     assert "--loop" not in state["tasks"]["scanner"]["command"]
     assert state["tasks"]["scanner"]["command"][-2:] == ["--top", "20"]
+    assert state["tasks"]["shadow_v2"]["command"][-3:] == [
+        "shadow_v2_filter.py",
+        "--update",
+        "--no-print",
+    ]
 
     print("PERIODIC_ANALYSIS_SELF_TEST_OK")
 
