@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Trader Periodic Analysis Runner v1.3
+Diamond Trader Periodic Analysis Runner v1.4
 
 Geheugenarme, sequentiële uitvoering van:
 1. Diamond Diagnose: exact één ronde met closed-candlecorrectie.
@@ -8,12 +8,13 @@ Geheugenarme, sequentiële uitvoering van:
 3. Shadow V2 Signal Lab: volgt daarna scannersignalen virtueel.
 4. LONG Entry Timing Shadow Lab: vergelijkt CURRENT / WAIT_15M / WAIT_30M.
 5. LONG Min-Profit Shadow Lab: vergelijkt €1.00 / €0.50 / €0.25 netto minimumwinst.
+6. LONG Combo Shadow Lab: vergelijkt CURRENT / WAIT30_100 / WAIT30_050.
 
 Belangrijk:
-- Alle vijf taken draaien strikt na elkaar en nooit tegelijk.
+- Alle zes taken draaien strikt na elkaar en nooit tegelijk.
 - De handelsbot, Agent, Supervisor en Strategy Lab blijven ongemoeid.
 - Deze runner plaatst zelf geen orders en wijzigt geen strategie-instellingen.
-- Beide LONG Shadow Labs gebruiken alleen publieke marktdata.
+- Alle drie LONG Shadow Labs gebruiken alleen publieke marktdata.
 - Interval blijft 15 minuten.
 """
 
@@ -31,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-VERSION = "1.3"
+VERSION = "1.4"
 MODE = "SEQUENTIAL_PERIODIC_ANALYSIS"
 
 PROJECT_DIR = Path("/opt/render/project/src")
@@ -44,6 +45,7 @@ SCANNER_LOG = DATA_DIR / "diamond_market_scanner_runner.log"
 SHADOW_V2_LOG = DATA_DIR / "diamond_shadow_v2_runner.log"
 LONG_ENTRY_SHADOW_LOG = DATA_DIR / "diamond_long_entry_shadow_runner.log"
 LONG_MIN_PROFIT_SHADOW_LOG = DATA_DIR / "diamond_long_min_profit_shadow_runner.log"
+LONG_COMBO_SHADOW_LOG = DATA_DIR / "diamond_long_combo_shadow_runner.log"
 
 INTERVAL_SECONDS = 15 * 60
 MAX_LOG_BYTES = 5_000_000
@@ -128,6 +130,12 @@ def task_commands() -> Dict[str, list[str]]:
         "long_min_profit_shadow": [
             sys.executable,
             "long_min_profit_shadow_lab.py",
+            "--update",
+            "--no-print",
+        ],
+        "long_combo_shadow": [
+            sys.executable,
+            "long_combo_shadow_lab.py",
             "--update",
             "--no-print",
         ],
@@ -315,9 +323,9 @@ def run_forever() -> None:
     )
 
     print(
-        "Diamond Periodic Analysis Runner v1.3 gestart | "
+        "Diamond Periodic Analysis Runner v1.4 gestart | "
         "interval=900s | sequential=True | "
-        "tasks=diagnose,scanner,shadow_v2,long_entry_shadow,long_min_profit_shadow",
+        "tasks=diagnose,scanner,shadow_v2,long_entry_shadow,long_min_profit_shadow,long_combo_shadow",
         flush=True,
     )
 
@@ -384,6 +392,16 @@ def run_forever() -> None:
         if STOP_REQUESTED:
             break
 
+        run_task(
+            state,
+            "long_combo_shadow",
+            task_commands()["long_combo_shadow"],
+            LONG_COMBO_SHADOW_LOG,
+        )
+
+        if STOP_REQUESTED:
+            break
+
         state["last_cycle_completed_at"] = now_iso()
 
         elapsed = max(
@@ -440,7 +458,7 @@ def self_test() -> None:
     state = default_state()
     commands = task_commands()
 
-    assert state["version"] == "1.3"
+    assert state["version"] == "1.4"
     assert state["mode"] == MODE
     assert state["interval_seconds"] == 900
     assert state["sequential"] is True
@@ -451,6 +469,7 @@ def self_test() -> None:
         "shadow_v2",
         "long_entry_shadow",
         "long_min_profit_shadow",
+        "long_combo_shadow",
     ]
 
     assert (
@@ -505,11 +524,25 @@ def self_test() -> None:
         == "diamond_long_min_profit_shadow_runner.log"
     )
 
+    assert (
+        state["tasks"]["long_combo_shadow"]["command"][-3:]
+        == [
+            "long_combo_shadow_lab.py",
+            "--update",
+            "--no-print",
+        ]
+    )
+
+    assert (
+        LONG_COMBO_SHADOW_LOG.name
+        == "diamond_long_combo_shadow_runner.log"
+    )
+
     print(
         "PERIODIC_ANALYSIS_SELF_TEST_OK"
     )
     print(
-        "Taken: diagnose -> scanner -> shadow_v2 -> long_entry_shadow -> long_min_profit_shadow"
+        "Taken: diagnose -> scanner -> shadow_v2 -> long_entry_shadow -> long_min_profit_shadow -> long_combo_shadow"
     )
     print(
         "Sequentieel: JA | Interval: 900 seconden"
