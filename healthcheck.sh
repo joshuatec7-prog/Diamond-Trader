@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.12
+# Diamond Trader Healthcheck v7.13
 # Geheugenarme controle: wijzigt geen bot-, test-, scanner-, Strategy Lab- of Readiness-bestanden.
 
 set -u
@@ -31,6 +31,8 @@ PERIODIC_ANALYSIS_STATE_FILE="$DATA_DIR/diamond_periodic_analysis_state.json"
 PERIODIC_ANALYSIS_RUNNER_LOG="$DATA_DIR/diamond_periodic_analysis_runner.log"
 DIAG_RUNNER_LOG="$DATA_DIR/diamond_diagnose_runner.log"
 SCANNER_RUNNER_LOG="$DATA_DIR/diamond_market_scanner_runner.log"
+LONG_COMBO_SHADOW_REPORT_FILE="$DATA_DIR/diamond_long_combo_shadow_report.json"
+LONG_COMBO_SHADOW_RUNNER_LOG="$DATA_DIR/diamond_long_combo_shadow_runner.log"
 
 SHADOW_MILESTONE_5_JSON="$DATA_DIR/diamond_market_shadow_milestone_5.json"
 SHADOW_MILESTONE_5_TEXT="$DATA_DIR/diamond_market_shadow_milestone_5.txt"
@@ -230,6 +232,141 @@ PY
 fi
 
 echo
+echo "1B. LONG COMBO SHADOW"
+echo "------------------------------------------------------------"
+
+file_info "$LONG_COMBO_SHADOW_REPORT_FILE" "LONG Combo Shadow rapport" "true"
+file_info "$LONG_COMBO_SHADOW_RUNNER_LOG" "LONG Combo Shadow runnerlog"
+
+if [ -f "$PROJECT_DIR/long_combo_shadow_lab.py" ]; then
+    if python3 -m py_compile "$PROJECT_DIR/long_combo_shadow_lab.py" 2>/dev/null; then
+        echo "[OK]    LONG Combo Shadow Pythoncontrole geslaagd"
+    else
+        echo "[FOUT]  LONG Combo Shadow Pythoncontrole mislukt"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+if [ -f "$LONG_COMBO_SHADOW_REPORT_FILE" ] && [ -f "$PERIODIC_ANALYSIS_STATE_FILE" ]; then
+    if ! python3 - "$LONG_COMBO_SHADOW_REPORT_FILE" "$PERIODIC_ANALYSIS_STATE_FILE" "$NOW_EPOCH" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+runner = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+now = datetime.fromtimestamp(int(sys.argv[3]), tz=timezone.utc)
+
+def age(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - dt.astimezone(timezone.utc)).total_seconds()/60.0)
+    except Exception:
+        return None
+
+def i(v):
+    try: return int(v)
+    except Exception: return 0
+
+def f(v):
+    try: return float(v)
+    except Exception: return 0.0
+
+progress = report.get("progress") or {}
+variants = report.get("variants") or {}
+safety = report.get("safety") or {}
+report_age = age(report.get("generated_at"))
+
+print("[OK]    LONG Combo Shadow rapport leesbaar")
+print(f"        Versie             : {report.get('version') or '-'}")
+print(f"        Modus              : {report.get('mode') or '-'}")
+print(f"        Nieuwe signalen    : {i(progress.get('signals_detected'))}/{i(progress.get('target_signals') or 20)}")
+print("        Leeftijd rapport   : " + (f"{report_age:.1f} minuten" if report_age is not None else "-"))
+
+for name in ("CURRENT", "WAIT30_100", "WAIT30_050"):
+    row = variants.get(name) or {}
+    print(
+        f"        {name:12s}       : "
+        f"closed={i(row.get('closed'))}, "
+        f"wins={i(row.get('wins'))}, "
+        f"losses={i(row.get('losses'))}, "
+        f"open={i(row.get('open'))}, "
+        f"pending={i(row.get('pending_entry'))}, "
+        f"pnl=€{f(row.get('net_pnl_eur')):+.4f}"
+    )
+
+errors = []
+
+if str(report.get("version") or "") != "1.0":
+    errors.append("onverwachte Combo Shadow-versie")
+if report.get("mode") != "READ_ONLY_LONG_COMBO_SHADOW":
+    errors.append("onverwachte Combo Shadow-modus")
+if report_age is None or report_age > 40:
+    errors.append("Combo Shadow-rapport is niet actueel")
+for name in ("CURRENT", "WAIT30_100", "WAIT30_050"):
+    if name not in variants:
+        errors.append("variant ontbreekt: " + name)
+for key in ("orders_possible","private_exchange_calls","api_keys_loaded","config_write","bot_state_write","transactions_write"):
+    if safety.get(key) is not False:
+        errors.append("veiligheidsveld niet False: " + key)
+if safety.get("own_files_only") is not True:
+    errors.append("own_files_only is niet True")
+
+tasks = runner.get("tasks") or {}
+task = tasks.get("long_combo_shadow") or {}
+active = str(runner.get("active_task") or "")
+status = str(task.get("last_status") or "NOG_NIET_GEDRAAID")
+runs = i(task.get("run_count"))
+exit_code = task.get("last_exit_code")
+completed_age = age(task.get("last_completed_at"))
+started_age = age(task.get("last_started_at"))
+
+print("[OK]    LONG Combo automatische runnerstatus")
+print(f"        Runner-versie      : {runner.get('version') or '-'}")
+print(f"        Actieve taak       : {active or 'geen'}")
+print(f"        Combo runs         : {runs}")
+print(f"        Combo status       : {status}")
+print(f"        Combo exitcode     : {exit_code}")
+
+if str(runner.get("version") or "") != "1.4":
+    errors.append("periodic runner is niet v1.4")
+if runner.get("mode") != "SEQUENTIAL_PERIODIC_ANALYSIS":
+    errors.append("periodic runner-modus klopt niet")
+if "long_combo_shadow" not in tasks:
+    errors.append("long_combo_shadow ontbreekt in runner-state")
+elif status == "BEZIG":
+    if active != "long_combo_shadow":
+        errors.append("Combo BEZIG maar niet active_task")
+    elif started_age is None or started_age > 35:
+        errors.append("actieve Combo-run duurt te lang")
+else:
+    if status != "OK":
+        errors.append("laatste Combo-status is " + status)
+    if exit_code != 0:
+        errors.append("laatste Combo-exitcode is niet 0")
+    if completed_age is None or completed_age > 35:
+        errors.append("laatste Combo-run is niet actueel")
+
+if runs < 1:
+    errors.append("Combo heeft nog geen automatische run")
+
+if errors:
+    for e in errors:
+        print("[FOUT]  " + e)
+    raise SystemExit(1)
+
+print("[OK]    LONG Combo Shadow is actueel, automatisch en alleen-lezen")
+PY
+    then
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+echo
 echo "2. PROJECTBESTANDEN"
 echo "------------------------------------------------------------"
 
@@ -248,7 +385,8 @@ for file_name in \
     start.sh \
     healthcheck.sh \
     scanner_healthcheck.sh \
-    periodic_analysis_runner.py
+    periodic_analysis_runner.py \
+    long_combo_shadow_lab.py
 do
     if [ -f "$PROJECT_DIR/$file_name" ]; then
         echo "[OK]    $file_name"
@@ -1514,7 +1652,7 @@ print(f"        Volgende stap      : {report.get('next_step') or '-'}")
 print(f"        Alleen-lezen       : {'JA' if safe else 'NEE'}")
 print("        Automatisch live   : NEE")
 
-if str(report.get("version") or "") != "1.2":
+if str(report.get("version") or "") != "1.3":
     print("[FOUT]  Onverwachte Readiness Gate-versie")
     raise SystemExit(1)
 

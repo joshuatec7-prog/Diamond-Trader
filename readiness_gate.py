@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Readiness Gate v1.2
+Diamond Readiness Gate v1.3
 
 Centrale, uitsluitend lezende gereedheidscontrole voor Diamond Trader.
 
@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 
-VERSION = "1.2"
+VERSION = "1.3"
 MODE = "READ_ONLY_READINESS_GATE"
 
 DATA_DIR = Path(
@@ -1232,6 +1232,13 @@ def build_report() -> Dict[str, Any]:
         Optional[float]
     ] = {}
 
+    active_periodic_task = str(
+        periodic_analysis.get(
+            "active_task"
+        )
+        or ""
+    ).strip()
+
     for task_name, task_data, maximum in (
         (
             "diagnose",
@@ -1244,32 +1251,91 @@ def build_report() -> Dict[str, Any]:
             MAX_SCANNER_AGE_MINUTES,
         ),
     ):
-        task_age = age_minutes(
+        status = str(
+            task_data.get(
+                "last_status"
+            )
+            or ""
+        ).strip().upper()
+
+        raw_exit = task_data.get(
+            "last_exit_code"
+        )
+
+        exit_code = (
+            None
+            if raw_exit is None
+            else to_int(
+                raw_exit,
+                -1,
+            )
+        )
+
+        completed_age = age_minutes(
             task_data.get(
                 "last_completed_at"
             )
         )
 
+        started_age = age_minutes(
+            task_data.get(
+                "last_started_at"
+            )
+        )
+
+        if status == "BEZIG":
+            task_age = started_age
+
+            task_ok = (
+                periodic_analysis_error is None
+                and active_periodic_task == task_name
+                and (
+                    exit_code is None
+                    or exit_code == 0
+                )
+                and started_age is not None
+                and started_age <= maximum
+            )
+
+            detail = (
+                f"status=BEZIG; active_task="
+                f"{active_periodic_task or '-'}; "
+                f"vorige exit={exit_code}; "
+                + (
+                    f"actief sinds {started_age:.1f} minuten; "
+                    f"maximum {maximum:.1f}"
+                    if started_age is not None
+                    else "geen geldige starttijd"
+                )
+            )
+
+        else:
+            task_age = completed_age
+
+            task_ok = (
+                periodic_analysis_error is None
+                and status == "OK"
+                and active_periodic_task != task_name
+                and exit_code == 0
+                and completed_age is not None
+                and completed_age <= maximum
+            )
+
+            detail = (
+                f"status={status or '-'}; "
+                f"active_task={active_periodic_task or '-'}; "
+                f"exit={exit_code}; "
+                + (
+                    f"leeftijd {completed_age:.1f} minuten; "
+                    f"maximum {maximum:.1f}"
+                    if completed_age is not None
+                    else "geen geldige voltooiingstijd"
+                )
+            )
+
         periodic_task_ages[
             task_name
         ] = task_age
-
-        task_ok = (
-            periodic_analysis_error is None
-            and task_data.get(
-                "last_status"
-            )
-            == "OK"
-            and to_int(
-                task_data.get(
-                    "last_exit_code"
-                ),
-                -1,
-            )
-            == 0
-            and task_age is not None
-            and task_age <= maximum
-        )
 
         add_check(
             checks,
@@ -1277,23 +1343,7 @@ def build_report() -> Dict[str, Any]:
             "actualiteit",
             "critical",
             task_ok,
-            (
-                f"status=OK; exit=0; leeftijd {task_age:.1f} minuten; "
-                f"maximum {maximum:.1f}"
-                if task_ok and task_age is not None
-                else (
-                    periodic_analysis_error
-                    or (
-                        f"status={task_data.get('last_status') or '-'}; "
-                        f"exit={task_data.get('last_exit_code')}; "
-                        + (
-                            f"leeftijd {task_age:.1f} minuten; maximum {maximum:.1f}"
-                            if task_age is not None
-                            else "geen geldige voltooiingstijd"
-                        )
-                    )
-                )
-            ),
+            periodic_analysis_error or detail,
         )
 
     freshness_items = (
