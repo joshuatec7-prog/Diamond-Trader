@@ -9397,230 +9397,63 @@ def handle_shadow_trade_notifications(
     agent_state: Dict[str, Any],
 ) -> int:
     """
-    Stuurt één e-mail per nieuwe virtuele opening en sluiting.
+    Shadow trade OPEN/CLOSE e-mails zijn bewust gedempt.
 
-    De sleutels worden in diamond_agent_state.json bewaard. Daardoor
-    veroorzaakt een herstart of deploy geen dubbele meldingen.
+    De shadow trades, scanner en Strategy Lab blijven ongewijzigd draaien.
+    Nieuwe open/sluit-gebeurtenissen worden wel stil als gezien opgeslagen,
+    zodat opnieuw inschakelen later geen oude e-mailachterstand veroorzaakt.
+
+    MAILFLOOD_GUARD_V1
     """
     open_history = set(
-        str(
-            value
-        )
-        for value
-        in (
-            agent_state.get(
-                "notified_shadow_open_keys"
-            )
+        str(value)
+        for value in (
+            agent_state.get("notified_shadow_open_keys")
             or []
         )
     )
 
     close_history = set(
-        str(
-            value
-        )
-        for value
-        in (
-            agent_state.get(
-                "notified_shadow_close_keys"
-            )
+        str(value)
+        for value in (
+            agent_state.get("notified_shadow_close_keys")
             or []
         )
     )
 
-    sent_count = 0
+    agent_state.setdefault("notified_shadow_open_keys", [])
+    agent_state.setdefault("notified_shadow_close_keys", [])
 
-    # Eerst sluitingen melden, daarna eventueel een nieuwe opening
-    # uit dezelfde scannerscan.
+    new_open_seen = 0
+    new_close_seen = 0
+
     for trade in load_shadow_closed_trades()[-50:]:
-        event_key = shadow_event_key(
-            "close",
-            trade,
-        )
-
+        event_key = shadow_event_key("close", trade)
         if event_key in close_history:
             continue
-
-        if not shadow_notification_retry_allowed(
-            agent_state,
-            "close",
-            event_key,
-        ):
-            continue
-
-        record_shadow_notification_attempt(
-            agent_state,
-            "close",
-            event_key,
-        )
-
-        pnl = to_float(
-            trade.get(
-                "net_pnl_eur"
-            ),
-            0.0,
-        )
-
-        sent = send_email(
-            (
-                "Diamond Scanner SCHADUWTRADE GESLOTEN - "
-                f"{trade.get('symbol') or '-'} "
-                f"€{pnl:+.2f}"
-            ),
-            format_shadow_close_email(
-                trade
-            ),
-        )
-
-        if not sent:
-            continue
-
-        agent_state[
-            "notified_shadow_close_keys"
-        ].append(
-            event_key
-        )
-
-        close_history.add(
-            event_key
-        )
-
-        agent_state[
-            "shadow_close_notifications_sent"
-        ] = int(
-            to_float(
-                agent_state.get(
-                    "shadow_close_notifications_sent"
-                ),
-                0.0,
-            )
-        ) + 1
-
-        agent_state[
-            "last_shadow_close_email_at"
-        ] = now_utc().isoformat()
-
-        agent_state[
-            "last_shadow_close_symbol"
-        ] = str(
-            trade.get(
-                "symbol"
-            )
-            or ""
-        )
-
-        trim_shadow_notification_history(
-            agent_state
-        )
-
-        save_agent_state(
-            agent_state
-        )
-
-        sent_count += 1
-
-        LOG.info(
-            "Schaduwtrade-sluitmail verstuurd | %s | pnl=%+.4f EUR",
-            trade.get(
-                "symbol"
-            ),
-            pnl,
-        )
+        agent_state["notified_shadow_close_keys"].append(event_key)
+        close_history.add(event_key)
+        new_close_seen += 1
 
     for position in load_shadow_open_positions():
-        event_key = shadow_event_key(
-            "open",
-            position,
-        )
-
+        event_key = shadow_event_key("open", position)
         if event_key in open_history:
             continue
+        agent_state["notified_shadow_open_keys"].append(event_key)
+        open_history.add(event_key)
+        new_open_seen += 1
 
-        if not shadow_notification_retry_allowed(
-            agent_state,
-            "open",
-            event_key,
-        ):
-            continue
-
-        record_shadow_notification_attempt(
-            agent_state,
-            "open",
-            event_key,
-        )
-
-        sent = send_email(
-            (
-                "Diamond Scanner SCHADUWTRADE GEOPEND - "
-                f"{position.get('symbol') or '-'} "
-                f"{position.get('side') or '-'}"
-            ),
-            format_shadow_open_email(
-                position
-            ),
-        )
-
-        if not sent:
-            continue
-
-        agent_state[
-            "notified_shadow_open_keys"
-        ].append(
-            event_key
-        )
-
-        open_history.add(
-            event_key
-        )
-
-        agent_state[
-            "shadow_open_notifications_sent"
-        ] = int(
-            to_float(
-                agent_state.get(
-                    "shadow_open_notifications_sent"
-                ),
-                0.0,
-            )
-        ) + 1
-
-        agent_state[
-            "last_shadow_open_email_at"
-        ] = now_utc().isoformat()
-
-        agent_state[
-            "last_shadow_open_symbol"
-        ] = str(
-            position.get(
-                "symbol"
-            )
-            or ""
-        )
-
-        trim_shadow_notification_history(
-            agent_state
-        )
-
-        save_agent_state(
-            agent_state
-        )
-
-        sent_count += 1
-
+    if new_open_seen or new_close_seen:
+        trim_shadow_notification_history(agent_state)
+        save_agent_state(agent_state)
         LOG.info(
-            "Schaduwtrade-openmail verstuurd | %s | %s | %s",
-            position.get(
-                "symbol"
-            ),
-            position.get(
-                "side"
-            ),
-            position.get(
-                "strategy"
-            ),
+            "Shadow trade e-mailmeldingen gedempt | "
+            "open stil verwerkt=%d | close stil verwerkt=%d",
+            new_open_seen,
+            new_close_seen,
         )
 
-    return sent_count
+    return 0
 
 
 # ============================================================
