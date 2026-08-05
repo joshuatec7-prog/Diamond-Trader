@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Diamond Trader Healthcheck v7.13
+# Diamond Trader Healthcheck v7.14
 # Geheugenarme controle: wijzigt geen bot-, test-, scanner-, Strategy Lab- of Readiness-bestanden.
 
 set -u
@@ -332,8 +332,8 @@ print(f"        Combo runs         : {runs}")
 print(f"        Combo status       : {status}")
 print(f"        Combo exitcode     : {exit_code}")
 
-if str(runner.get("version") or "") != "1.4":
-    errors.append("periodic runner is niet v1.4")
+if str(runner.get("version") or "") != "1.5":
+    errors.append("periodic runner is niet v1.5")
 if runner.get("mode") != "SEQUENTIAL_PERIODIC_ANALYSIS":
     errors.append("periodic runner-modus klopt niet")
 if "long_combo_shadow" not in tasks:
@@ -386,7 +386,8 @@ for file_name in \
     healthcheck.sh \
     scanner_healthcheck.sh \
     periodic_analysis_runner.py \
-    long_combo_shadow_lab.py
+    long_combo_shadow_lab.py \
+    scanner_selective_shadow_lab.py
 do
     if [ -f "$PROJECT_DIR/$file_name" ]; then
         echo "[OK]    $file_name"
