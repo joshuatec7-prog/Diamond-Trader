@@ -1,0 +1,4 @@
+ccxt
+pandas
+pyyaml
+python-dotenv
