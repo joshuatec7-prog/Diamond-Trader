@@ -1532,13 +1532,11 @@ def prepare_frames(
     settings: Dict[str, Any],
     baseline_dt: datetime,
 ) -> Dict[str, pd.DataFrame]:
-    since_ms = int(
-        (
-            baseline_dt.timestamp()
-            - 36 * 60 * 60
-        )
-        * 1000
-    )
+    # LONG_SHADOW_LATEST_500_V1
+    # Gebruik altijd de nieuwste 500 15m-candles.
+    # Dat is ongeveer 125 uur actuele historie en ruim voldoende
+    # voor indicatoren plus maximaal 48 uur virtuele positiehistorie.
+    _ = baseline_dt
 
     frames: Dict[str, pd.DataFrame] = {}
 
@@ -1547,7 +1545,6 @@ def prepare_frames(
             frames[symbol] = fetch_frame(
                 exchange,
                 symbol,
-                since_ms=since_ms,
                 limit=500,
             )
         except Exception:
