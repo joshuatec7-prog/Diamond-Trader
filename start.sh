@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 
-# Diamond Trader startscript v2.1
+# Diamond Trader startscript v2.2
 # Geheugenarme opzet:
 # - Agent, Supervisor, Bot en Strategy Lab blijven permanent draaien.
 # - Diagnose en Market Scanner worden sequentieel iedere 15 minuten uitgevoerd.
 # - Diagnose en Scanner draaien nooit tegelijk.
+# - Early Entry Collector v1.3.1 verzamelt alleen publieke marktdata.
+# - De aparte Early Entry Runner v1.1 herstart alleen de collector als die stopt.
 
 set -Eeuo pipefail
 
@@ -12,9 +14,11 @@ PROJECT_DIR="/opt/render/project/src"
 DATA_DIR="/var/data"
 PERIODIC_LOG="$DATA_DIR/diamond_periodic_analysis_runner.log"
 STRATEGY_LAB_LOG="$DATA_DIR/diamond_strategy_lab_runner.log"
+EARLY_ENTRY_LOG="$DATA_DIR/diamond_early_entry/collector_v1_3_1_runner.log"
 
 cd "$PROJECT_DIR"
 mkdir -p "$DATA_DIR"
+mkdir -p "$DATA_DIR/diamond_early_entry"
 
 PIDS=()
 
@@ -93,6 +97,20 @@ PIDS+=("$PERIODIC_PID")
 echo "        PID $PERIODIC_PID"
 echo "        Diagnose + Scanner: sequentieel iedere 15 minuten"
 echo "        Log: $PERIODIC_LOG"
+
+# EARLY_ENTRY_AUTOSTART_V1_3_1
+# De runner blijft permanent actief en bewaakt alleen collector v1.3.1.
+# Daardoor staat de collector zelf NIET rechtstreeks in PIDS/wait -n.
+echo "[START] Diamond Early Entry Collector"
+python3 early_entry_collector_runner_v1_1.py \
+    >> "$EARLY_ENTRY_LOG" 2>&1 &
+EARLY_ENTRY_RUNNER_PID=$!
+PIDS+=("$EARLY_ENTRY_RUNNER_PID")
+echo "        Runner PID $EARLY_ENTRY_RUNNER_PID"
+echo "        Runner: early_entry_collector_runner_v1_1.py"
+echo "        Collector: early_entry_collector_v1_3_1.py"
+echo "        Transport: publieke native REST"
+echo "        Log: $EARLY_ENTRY_LOG"
 
 echo
 echo "[OK] Alle Diamond Trader-hoofdprocessen zijn gestart."
