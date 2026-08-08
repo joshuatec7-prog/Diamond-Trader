@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Trader Periodic Analysis Runner v1.5
+Diamond Trader Periodic Analysis Runner v1.6
 
 Geheugenarme, sequentiële uitvoering van:
 1. Diamond Diagnose: exact één ronde met closed-candlecorrectie.
@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-VERSION = "1.5"
+VERSION = "1.6"
 MODE = "SEQUENTIAL_PERIODIC_ANALYSIS"
 
 PROJECT_DIR = Path("/opt/render/project/src")
@@ -48,6 +48,7 @@ LONG_ENTRY_SHADOW_LOG = DATA_DIR / "diamond_long_entry_shadow_runner.log"
 LONG_MIN_PROFIT_SHADOW_LOG = DATA_DIR / "diamond_long_min_profit_shadow_runner.log"
 LONG_COMBO_SHADOW_LOG = DATA_DIR / "diamond_long_combo_shadow_runner.log"
 SCANNER_SELECTIVE_SHADOW_LOG = DATA_DIR / "diamond_scanner_selective_shadow_runner.log"
+SCANNER_SESSION_SHADOW_LOG = DATA_DIR / "diamond_scanner_session_shadow_runner.log"
 
 INTERVAL_SECONDS = 15 * 60
 MAX_LOG_BYTES = 5_000_000
@@ -144,6 +145,12 @@ def task_commands() -> Dict[str, list[str]]:
         "scanner_selective_shadow": [
             sys.executable,
             "scanner_selective_shadow_lab.py",
+            "--update",
+            "--no-print",
+        ],
+        "scanner_session_shadow": [
+            sys.executable,
+            "scanner_session_shadow_lab.py",
             "--update",
             "--no-print",
         ],
@@ -331,9 +338,9 @@ def run_forever() -> None:
     )
 
     print(
-        "Diamond Periodic Analysis Runner v1.5 gestart | "
+        "Diamond Periodic Analysis Runner v1.6 gestart | "
         "interval=900s | sequential=True | "
-        "tasks=diagnose,scanner,shadow_v2,long_entry_shadow,long_min_profit_shadow,long_combo_shadow,scanner_selective_shadow",
+        "tasks=diagnose,scanner,shadow_v2,long_entry_shadow,long_min_profit_shadow,long_combo_shadow,scanner_selective_shadow,scanner_session_shadow",
         flush=True,
     )
 
@@ -420,6 +427,16 @@ def run_forever() -> None:
         if STOP_REQUESTED:
             break
 
+        run_task(
+            state,
+            "scanner_session_shadow",
+            task_commands()["scanner_session_shadow"],
+            SCANNER_SESSION_SHADOW_LOG,
+        )
+
+        if STOP_REQUESTED:
+            break
+
         state["last_cycle_completed_at"] = now_iso()
 
         elapsed = max(
@@ -476,7 +493,7 @@ def self_test() -> None:
     state = default_state()
     commands = task_commands()
 
-    assert state["version"] == "1.5"
+    assert state["version"] == "1.6"
     assert state["mode"] == MODE
     assert state["interval_seconds"] == 900
     assert state["sequential"] is True
@@ -489,6 +506,7 @@ def self_test() -> None:
         "long_min_profit_shadow",
         "long_combo_shadow",
         "scanner_selective_shadow",
+        "scanner_session_shadow",
     ]
 
     assert (
@@ -571,11 +589,25 @@ def self_test() -> None:
         == "diamond_scanner_selective_shadow_runner.log"
     )
 
+    assert (
+        state["tasks"]["scanner_session_shadow"]["command"][-3:]
+        == [
+            "scanner_session_shadow_lab.py",
+            "--update",
+            "--no-print",
+        ]
+    )
+
+    assert (
+        SCANNER_SESSION_SHADOW_LOG.name
+        == "diamond_scanner_session_shadow_runner.log"
+    )
+
     print(
         "PERIODIC_ANALYSIS_SELF_TEST_OK"
     )
     print(
-        "Taken: diagnose -> scanner -> shadow_v2 -> long_entry_shadow -> long_min_profit_shadow -> long_combo_shadow -> scanner_selective_shadow"
+        "Taken: diagnose -> scanner -> shadow_v2 -> long_entry_shadow -> long_min_profit_shadow -> long_combo_shadow -> scanner_selective_shadow -> scanner_session_shadow"
     )
     print(
         "Sequentieel: JA | Interval: 900 seconden"
