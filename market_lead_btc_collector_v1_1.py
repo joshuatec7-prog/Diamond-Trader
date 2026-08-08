@@ -63,7 +63,7 @@ STATE_FILE = DATA_DIR / "btc_market_lead_state_v1_1.json"
 DEFAULT_DURATION_HOURS = 6.0
 DEFAULT_SAMPLE_SECONDS = 2.0
 
-MEMORY_STOP_MIB = 430.0
+MEMORY_STOP_MIB = 1600.0
 MEMORY_STOP_CONSECUTIVE = 5
 
 FIELDS = [
@@ -444,7 +444,7 @@ def status() -> int:
 def self_test() -> int:
     assert SYMBOL == "BTC-EUR"
     assert DEFAULT_SAMPLE_SECONDS == 2.0
-    assert MEMORY_STOP_MIB == 430.0
+    assert MEMORY_STOP_MIB == 1600.0
     assert SAFETY["orders_possible"] is False
     assert SAFETY["private_api"] is False
     assert SAFETY["api_keys_used"] is False
@@ -455,7 +455,7 @@ def self_test() -> int:
     print("Bitvavo             : publieke REST")
     print("Standaard duur      : 6 uur")
     print("Sample interval     : 2 seconden")
-    print("Memory safety stop  : 430 MiB x 5")
+    print("Memory safety stop  : 1600 MiB x 5")
     print("API keys            : NEE")
     print("Private API         : NEE")
     print("Orders mogelijk     : NEE")

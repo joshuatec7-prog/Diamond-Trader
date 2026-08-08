@@ -455,8 +455,8 @@ def build_position(
         "entry_spread_pct": spread,
         "take_profit": take_profit,
         "stop_loss": stop_loss,
-        "entry_candle_timestamp_ms": candle_ms,
-        "last_checked_candle_ms": candle_ms,
+        "entry_candle_timestamp_ms": candle_ms + TIMEFRAME_MS,
+        "last_checked_candle_ms": candle_ms + TIMEFRAME_MS,
     }
 
 
@@ -556,7 +556,7 @@ def evaluate(
                 position,
                 float(position["stop_loss"]),
                 "stop_loss",
-                candle_ms,
+                candle_ms + TIMEFRAME_MS,
                 settings,
             )
 
@@ -565,7 +565,7 @@ def evaluate(
                 position,
                 float(position["take_profit"]),
                 "take_profit",
-                candle_ms,
+                candle_ms + TIMEFRAME_MS,
                 settings,
             )
 
@@ -578,7 +578,7 @@ def evaluate(
                 position,
                 close,
                 "time_exit",
-                candle_ms,
+                candle_ms + TIMEFRAME_MS,
                 settings,
             )
 

@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-VERSION = "1.6"
+VERSION = "1.7"
 MODE = "SEQUENTIAL_PERIODIC_ANALYSIS"
 
 PROJECT_DIR = Path("/opt/render/project/src")
@@ -47,6 +47,7 @@ SHADOW_V2_LOG = DATA_DIR / "diamond_shadow_v2_runner.log"
 LONG_ENTRY_SHADOW_LOG = DATA_DIR / "diamond_long_entry_shadow_runner.log"
 LONG_MIN_PROFIT_SHADOW_LOG = DATA_DIR / "diamond_long_min_profit_shadow_runner.log"
 LONG_COMBO_SHADOW_LOG = DATA_DIR / "diamond_long_combo_shadow_runner.log"
+LONG_COMBO_SHADOW_V2_LOG = DATA_DIR / "diamond_long_combo_shadow_v2_runner.log"
 SCANNER_SELECTIVE_SHADOW_LOG = DATA_DIR / "diamond_scanner_selective_shadow_runner.log"
 SCANNER_SESSION_SHADOW_LOG = DATA_DIR / "diamond_scanner_session_shadow_runner.log"
 
@@ -139,6 +140,12 @@ def task_commands() -> Dict[str, list[str]]:
         "long_combo_shadow": [
             sys.executable,
             "long_combo_shadow_lab.py",
+            "--update",
+            "--no-print",
+        ],
+        "long_combo_shadow_v2": [
+            sys.executable,
+            "long_combo_shadow_lab_v2.py",
             "--update",
             "--no-print",
         ],
@@ -419,6 +426,16 @@ def run_forever() -> None:
 
         run_task(
             state,
+            "long_combo_shadow_v2",
+            task_commands()["long_combo_shadow_v2"],
+            LONG_COMBO_SHADOW_V2_LOG,
+        )
+
+        if STOP_REQUESTED:
+            break
+
+        run_task(
+            state,
             "scanner_selective_shadow",
             task_commands()["scanner_selective_shadow"],
             SCANNER_SELECTIVE_SHADOW_LOG,
@@ -493,7 +510,7 @@ def self_test() -> None:
     state = default_state()
     commands = task_commands()
 
-    assert state["version"] == "1.6"
+    assert state["version"] == "1.7"
     assert state["mode"] == MODE
     assert state["interval_seconds"] == 900
     assert state["sequential"] is True
@@ -505,6 +522,7 @@ def self_test() -> None:
         "long_entry_shadow",
         "long_min_profit_shadow",
         "long_combo_shadow",
+        "long_combo_shadow_v2",
         "scanner_selective_shadow",
         "scanner_session_shadow",
     ]
