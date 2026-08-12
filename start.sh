@@ -121,6 +121,19 @@ echo
 # Render hoort de worker opnieuw te starten als een belangrijk proces uitvalt.
 # wait -n wacht tot het eerste permanente achtergrondproces stopt.
 set +e
+
+# BTC_EVENT_CONFIRMATION_AUTOSTART_V1
+BTC_COLLECTOR="/opt/render/project/src/btc_event_confirmation_collector.py"
+BTC_STATE="/var/data/diamond_btc_event_confirmation/collector_state.json"
+
+if [ -f "$BTC_COLLECTOR" ] && [ -f "$BTC_STATE" ]; then
+    BTC_STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",""))' "$BTC_STATE" 2>/dev/null || true)"
+
+    if [ "$BTC_STATUS" = "RUNNING" ] && ! pgrep -f 'btc_event_confirmation_collector\.py' >/dev/null 2>&1; then
+        nohup python3 "$BTC_COLLECTOR" >> /var/data/btc_event_confirmation.log 2>&1 </dev/null &
+    fi
+fi
+
 wait -n "${PIDS[@]}"
 WAIT_STATUS=$?
 set -e
