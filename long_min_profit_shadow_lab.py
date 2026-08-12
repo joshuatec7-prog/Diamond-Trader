@@ -867,6 +867,9 @@ def ingest_signals(
             ):
                 continue
 
+            if int(__import__("time").time()*1000) - candle_close_ms > 30*60*1000:
+                continue
+
             key = signal_id(
                 symbol,
                 candle_ts,
