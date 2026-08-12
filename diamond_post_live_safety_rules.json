@@ -1,0 +1,48 @@
+{
+  "version": "1.0",
+  "mode": "PREDEFINED_POST_LIVE_SAFETY",
+
+  "capital": {
+    "stake_eur_max": 130,
+    "eur_reserve_min": 250,
+    "max_open_positions": 5,
+    "sell_bot_owned_only": true
+  },
+
+  "performance_basis": {
+    "stress_bootstrap_drawdown_95_eur": 17.0,
+    "stress_bootstrap_drawdown_99_eur": 23.0,
+    "stress_loss_streak_95": 4
+  },
+
+  "performance_warning": {
+    "drawdown_eur_gte": 17.0,
+    "consecutive_losses_gte": 4,
+    "action": "WARNING_AND_REVIEW"
+  },
+
+  "performance_pause": {
+    "drawdown_eur_gt": 23.0,
+    "consecutive_losses_gte": 5,
+    "action": "PAUSE_NEW_ENTRIES_AND_REVIEW"
+  },
+
+  "technical_immediate_pause": [
+    "truth_audit_not_ok",
+    "unexpected_exchange_order",
+    "sell_non_bot_owned_position",
+    "stake_above_130",
+    "reserve_below_250_due_to_bot",
+    "more_than_5_open_positions",
+    "exchange_bot_state_mismatch",
+    "state_corruption",
+    "oom_kill",
+    "repeated_runtime_crash",
+    "live_enabled_without_manual_approval"
+  ],
+
+  "review_milestones": [5, 10, 20],
+
+  "automatic_live_restart": false,
+  "automatic_rule_changes": false
+}

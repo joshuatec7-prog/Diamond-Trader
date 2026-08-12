@@ -1,0 +1,35 @@
+{
+  "version": "1.1",
+  "target_closed": 20,
+  "milestones": {
+    "first": 5,
+    "promising": 10,
+    "final": 20
+  },
+  "final_pass_rules": {
+    "normal_pnl_gt": 0.0,
+    "normal_pf_gt": 1.0,
+    "stress_pnl_gt": 0.0,
+    "stress_pf_gt": 1.0,
+    "without_best_trade_pnl_gt": 0.0,
+    "without_best_trade_pf_gt": 1.0
+  },
+  "stress": {
+    "extra_cost_per_side_pct": 0.3
+  },
+  "statuses": {
+    "under_5": "LOOPT",
+    "from_5": "5/20 MIJLPAAL - DOORTESTEN",
+    "from_10": "10/20 MIJLPAAL - DOORTESTEN",
+    "passed_20": "GESLAAGD -> EINDREVIEW",
+    "failed_20": "AFWIJZEN",
+    "missing_trade_level_data": "20/20 -> HANDMATIGE EINDREVIEW"
+  },
+  "important": [
+    "GESLAAGD betekent nooit automatisch live.",
+    "Geen strategie-, entry-, exit- of filterwijziging op basis van kleine samples.",
+    "Geen grenzen versoepelen om sneller 20 trades te krijgen.",
+    "Bij 20/20 worden vooraf vastgelegde regels gebruikt.",
+    "Livegang vereist altijd aparte eindbeslissing."
+  ]
+}
