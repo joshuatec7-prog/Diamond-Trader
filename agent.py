@@ -2771,6 +2771,12 @@ def send_email(
     subject: str,
     body: str,
 ) -> bool:
+    # MAIL_MUTE_UNTIL_LIVE_V1
+    if __import__("os").path.exists(
+        "/var/data/diamond_mail_mute_until_live.flag"
+    ):
+        return True
+
     if not GMAIL_PASS:
         LOG.warning(
             "GMAIL_APP_PASSWORD ontbreekt"
