@@ -8,6 +8,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -153,6 +154,10 @@ def default_state() -> Dict[str, Any]:
         "short_trades": 0,
         "short_wins": 0,
         "simulated_free_quote": None,
+        # Live-order safety. Deze velden zijn backwards-compatible met oude statebestanden.
+        "pending_orders": {},
+        "recovery_required": False,
+        "recovery_reason": "",
     }
 
 
@@ -189,18 +194,42 @@ def load_state(path_str: str) -> Dict[str, Any]:
     p = Path(path_str)
     if not p.exists():
         return default_state()
+
     try:
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return default_state()
-    except Exception:
-        return default_state()
+            raise ValueError("state is geen dictionary")
+    except Exception as exc:
+        # Bij een bestaand maar onleesbaar statebestand nooit stil terugvallen
+        # naar een "lege" live-state. Nieuwe entries worden geblokkeerd totdat
+        # de operator de recovery heeft beoordeeld.
+        state = default_state()
+        state["recovery_required"] = True
+        state["recovery_reason"] = f"state_load_failed:{type(exc).__name__}"
+        return state
+
     base = default_state()
     base.update(data)
-    for key in ["positions", "cooldown", "short_positions", "short_cooldown"]:
+
+    for key in [
+        "positions",
+        "cooldown",
+        "short_positions",
+        "short_cooldown",
+        "pending_orders",
+    ]:
         if not isinstance(base.get(key), dict):
             base[key] = {}
+
+    base["recovery_required"] = to_bool(
+        base.get("recovery_required"),
+        False,
+    )
+    base["recovery_reason"] = str(
+        base.get("recovery_reason")
+        or ""
+    )
     return base
 
 def save_state(path_str: str, state: Dict[str, Any]) -> None:
@@ -537,7 +566,21 @@ class Bot:
             self.state["simulated_free_quote"] = to_float(
                 get_cfg(self.cfg, "risk.simulated_quote_balance", 3000), 3000.0
             )
-        save_state(self.state_file, self.state)
+
+        # Een corrupt bestaand statebestand wordt niet stil overschreven met
+        # een lege state. De recovery-gate blijft zichtbaar en blokkeert
+        # nieuwe entries totdat de operator de situatie heeft beoordeeld.
+        if not to_bool(
+            self.state.get("recovery_required"),
+            False,
+        ):
+            save_state(self.state_file, self.state)
+        else:
+            LOG.error(
+                "RECOVERY_REQUIRED bij opstart | reden=%s",
+                self.state.get("recovery_reason") or "onbekend",
+            )
+
         self.ensure_short_test_baseline()
 
         self.last_status_log_ts = 0.0
@@ -612,10 +655,451 @@ class Bot:
         except Exception as e:
             LOG.warning("Kon posities niet synchroniseren: %s", e)
 
-    def order_params(self) -> Dict[str, Any]:
+    def order_params(
+        self,
+        client_order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
         if self.operator_id:
-            return {"operatorId": self.operator_id}
-        return {}
+            params["operatorId"] = self.operator_id
+        if client_order_id:
+            # Bitvavo ondersteunt een eigen clientOrderId. Dit maakt een
+            # live-order na een crash/restart eenduidig terugvindbaar.
+            params["clientOrderId"] = client_order_id
+        return params
+
+    def long_order_key(
+        self,
+        symbol: str,
+        signal: Dict[str, Any],
+    ) -> str:
+        candle_key = str(
+            signal.get("signal_candle_ts")
+            or signal.get("candle_timestamp")
+            or signal.get("close")
+            or ""
+        )
+        return f"LONG|{symbol.upper()}|{candle_key}"
+
+    def client_order_id_for_key(
+        self,
+        order_key: str,
+    ) -> str:
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"diamond-trader:{order_key}",
+            )
+        )
+
+    def entries_blocked_by_recovery(self) -> bool:
+        pending = self.state.get("pending_orders") or {}
+        return bool(
+            to_bool(
+                self.state.get("recovery_required"),
+                False,
+            )
+            or pending
+        )
+
+    def set_recovery_required(
+        self,
+        reason: str,
+    ) -> None:
+        self.state["recovery_required"] = True
+        self.state["recovery_reason"] = str(reason or "onbekend")
+        save_state(self.state_file, self.state)
+
+    def clear_recovery_if_safe(self) -> None:
+        pending = self.state.get("pending_orders") or {}
+        if pending:
+            return
+        self.state["recovery_required"] = False
+        self.state["recovery_reason"] = ""
+
+    def prepare_pending_long_order(
+        self,
+        order_key: str,
+        symbol: str,
+        signal: Dict[str, Any],
+        stake_quote: float,
+        spread_pct: float,
+        protected_base_amount: float,
+    ) -> Dict[str, Any]:
+        pending = self.state.setdefault(
+            "pending_orders",
+            {},
+        )
+        if order_key in pending:
+            return pending[order_key]
+
+        record = {
+            "order_key": order_key,
+            "clientOrderId": self.client_order_id_for_key(order_key),
+            "symbol": symbol,
+            "side": "buy",
+            "status": "PREPARED",
+            "created_at": now_iso(),
+            "created_at_ts": utc_now_ts(),
+            "submitted_at": None,
+            "exchange_order_id": None,
+            "stake_quote": float(stake_quote),
+            "spread_pct": float(spread_pct),
+            "protected_base_amount": float(protected_base_amount),
+            "signal": {
+                "signal_candle_ts": str(
+                    signal.get("signal_candle_ts")
+                    or ""
+                ),
+                "close": to_float(signal.get("close"), 0.0),
+                "stop_loss": to_float(signal.get("stop_loss"), 0.0),
+                "take_profit": to_float(signal.get("take_profit"), 0.0),
+                "tech_score": to_float(signal.get("tech_score"), 0.0),
+                "rsi": to_float(signal.get("rsi"), 0.0),
+                "atr_pct": to_float(signal.get("atr_pct"), 0.0),
+            },
+        }
+        pending[order_key] = record
+        save_state(self.state_file, self.state)
+        return record
+
+    def mark_pending_submitting(
+        self,
+        order_key: str,
+    ) -> None:
+        record = (
+            self.state.get("pending_orders", {})
+            .get(order_key)
+        )
+        if not isinstance(record, dict):
+            raise RuntimeError(
+                f"Pending order ontbreekt vóór submit: {order_key}"
+            )
+        record["status"] = "SUBMITTING"
+        record["submitted_at"] = now_iso()
+        save_state(self.state_file, self.state)
+
+    def update_pending_from_order(
+        self,
+        order_key: str,
+        order: Dict[str, Any],
+        status: Optional[str] = None,
+    ) -> None:
+        record = (
+            self.state.get("pending_orders", {})
+            .get(order_key)
+        )
+        if not isinstance(record, dict):
+            return
+
+        order_status = str(
+            status
+            or order.get("status")
+            or record.get("status")
+            or "SUBMITTED"
+        )
+        record["status"] = order_status.upper()
+        record["exchange_order_id"] = (
+            order.get("id")
+            or record.get("exchange_order_id")
+        )
+        record["clientOrderId"] = str(
+            order.get("clientOrderId")
+            or (order.get("info") or {}).get("clientOrderId")
+            or record.get("clientOrderId")
+            or ""
+        )
+
+        for source, target in (
+            ("average", "fill_price"),
+            ("filled", "filled_amount"),
+            ("cost", "fill_cost"),
+        ):
+            value = order.get(source)
+            if value is not None:
+                record[target] = to_float(value, 0.0)
+
+        record["updated_at"] = now_iso()
+        save_state(self.state_file, self.state)
+
+    def abandon_pending_after_confirmed_rejection(
+        self,
+        order_key: str,
+        reason: str,
+    ) -> None:
+        pending = self.state.get("pending_orders") or {}
+        if order_key in pending:
+            pending.pop(order_key, None)
+        self.clear_recovery_if_safe()
+        save_state(self.state_file, self.state)
+        LOG.warning(
+            "PENDING ORDER AFGESLOTEN | key=%s | reden=%s",
+            order_key,
+            reason,
+        )
+
+    def fetch_order_by_client_order_id(
+        self,
+        symbol: str,
+        client_order_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        last_not_found: Optional[Exception] = None
+
+        for attempt in range(3):
+            try:
+                # Bitvavo gebruikt clientOrderId wanneer zowel orderId als
+                # clientOrderId zijn meegegeven. Zo kunnen we via de unified
+                # CCXT fetch_order dezelfde order na een restart terugvinden.
+                order = self.exchange.fetch_order(
+                    client_order_id,
+                    symbol,
+                    {"clientOrderId": client_order_id},
+                )
+                if isinstance(order, dict):
+                    return order
+            except ccxt.OrderNotFound as exc:
+                last_not_found = exc
+                if attempt < 2:
+                    time.sleep(1.0 + attempt)
+                    continue
+            except Exception:
+                raise
+
+        if last_not_found is not None:
+            return None
+        return None
+
+    def recover_position_from_pending(
+        self,
+        order_key: str,
+        record: Dict[str, Any],
+        order: Dict[str, Any],
+    ) -> bool:
+        symbol = str(record.get("symbol") or "")
+        if not symbol:
+            return False
+
+        signal = record.get("signal") or {}
+        price = to_float(
+            order.get("average")
+            or order.get("price")
+            or record.get("fill_price"),
+            0.0,
+        )
+        amount = to_float(
+            order.get("filled")
+            or record.get("filled_amount"),
+            0.0,
+        )
+        quote_amount = to_float(
+            order.get("cost")
+            or record.get("fill_cost"),
+            amount * price,
+        )
+
+        if min(price, amount, quote_amount) <= 0:
+            return False
+
+        fee_quote = self.order_fee_quote(
+            order,
+            quote_amount,
+            symbol,
+            price,
+        )
+
+        self.state.setdefault(
+            "positions",
+            {},
+        )[symbol] = {
+            "opened_by_bot": True,
+            "opened_at": to_float(
+                record.get("created_at_ts"),
+                utc_now_ts(),
+            ),
+            "entry_price": price,
+            "amount": amount,
+            "quote_amount": quote_amount,
+            "fees_buy_quote": fee_quote,
+            "stop_loss": to_float(signal.get("stop_loss"), 0.0),
+            "take_profit": to_float(signal.get("take_profit"), 0.0),
+            "highest_price": price,
+            "news_score_at_entry": 0.0,
+            "fear_greed_at_entry": None,
+            "tech_score_at_entry": to_float(
+                signal.get("tech_score"),
+                0.0,
+            ),
+            "protected_base_amount": to_float(
+                record.get("protected_base_amount"),
+                0.0,
+            ),
+            "recovered_from_pending": True,
+            "client_order_id": str(
+                record.get("clientOrderId")
+                or ""
+            ),
+            "exchange_order_id": (
+                order.get("id")
+                or record.get("exchange_order_id")
+            ),
+        }
+
+        self.state.get(
+            "pending_orders",
+            {},
+        ).pop(order_key, None)
+        self.clear_recovery_if_safe()
+        save_state(self.state_file, self.state)
+
+        LOG.warning(
+            "RECOVERY POSITIE HERSTELD | %s | key=%s | amount=%s | prijs=%.8f",
+            symbol,
+            order_key,
+            amount,
+            price,
+        )
+        return True
+
+    def reconcile_pending_orders(self) -> None:
+        pending = self.state.get("pending_orders") or {}
+        if not pending:
+            return
+
+        # Een pending live-order is altijd een recovery gate. Zolang niet
+        # eenduidig bekend is wat Bitvavo heeft gedaan, geen nieuwe entries.
+        self.state["recovery_required"] = True
+        self.state["recovery_reason"] = "RECOVERY_REQUIRED:pending_order"
+        save_state(self.state_file, self.state)
+
+        if not self.api_key or not self.api_secret:
+            LOG.error(
+                "RECOVERY_REQUIRED | pending order aanwezig maar API-credentials ontbreken"
+            )
+            return
+
+        changed = False
+
+        for order_key, record in list(pending.items()):
+            if not isinstance(record, dict):
+                continue
+
+            symbol = str(record.get("symbol") or "")
+            status = str(
+                record.get("status")
+                or ""
+            ).upper()
+
+            # PREPARED betekent: state was opgeslagen, maar de code had de
+            # order nog niet gemarkeerd als SUBMITTING. Er is dus nog geen
+            # create_order gestart en deze entry kan veilig opnieuw ontstaan.
+            if status == "PREPARED":
+                pending.pop(order_key, None)
+                changed = True
+                continue
+
+            existing = (
+                self.state.get("positions", {})
+                .get(symbol)
+            )
+            if (
+                isinstance(existing, dict)
+                and to_bool(
+                    existing.get("opened_by_bot"),
+                    False,
+                )
+            ):
+                pending.pop(order_key, None)
+                changed = True
+                continue
+
+            client_order_id = str(
+                record.get("clientOrderId")
+                or ""
+            )
+            if not symbol or not client_order_id:
+                self.state["recovery_reason"] = (
+                    f"RECOVERY_REQUIRED:pending_invalid:{order_key}"
+                )
+                continue
+
+            try:
+                order = self.fetch_order_by_client_order_id(
+                    symbol,
+                    client_order_id,
+                )
+            except Exception as exc:
+                self.state["recovery_reason"] = (
+                    f"RECOVERY_REQUIRED:exchange_unavailable:{type(exc).__name__}"
+                )
+                LOG.error(
+                    "RECOVERY ordercontrole mislukt | %s | %s",
+                    symbol,
+                    exc,
+                )
+                continue
+
+            if order is None:
+                # SUBMITTING is bewust conservatief: een netwerkfout kan zijn
+                # opgetreden nadat Bitvavo de order al accepteerde. Niet
+                # automatisch opnieuw versturen.
+                self.state["recovery_reason"] = (
+                    f"RECOVERY_REQUIRED:order_not_found:{client_order_id}"
+                )
+                continue
+
+            record["exchange_order_id"] = (
+                order.get("id")
+                or record.get("exchange_order_id")
+            )
+            order_status = str(
+                order.get("status")
+                or ""
+            ).lower()
+            filled = to_float(order.get("filled"), 0.0)
+
+            terminal = order_status in {
+                "closed",
+                "filled",
+                "canceled",
+                "cancelled",
+                "rejected",
+                "expired",
+            }
+
+            if terminal and filled > 0:
+                if self.recover_position_from_pending(
+                    order_key,
+                    record,
+                    order,
+                ):
+                    changed = True
+                continue
+
+            if terminal and filled <= 0:
+                pending.pop(order_key, None)
+                changed = True
+                continue
+
+            # Open/partieel uitgevoerde orders blijven pending en blokkeren
+            # nieuwe entries totdat een volgende cycle de eindstatus ziet.
+            record["status"] = (
+                order_status.upper()
+                if order_status
+                else "OPEN"
+            )
+            record["filled_amount"] = filled
+            record["updated_at"] = now_iso()
+            self.state["recovery_reason"] = (
+                f"RECOVERY_REQUIRED:order_open:{client_order_id}"
+            )
+            changed = True
+
+        if not self.state.get("pending_orders"):
+            self.clear_recovery_if_safe()
+            changed = True
+
+        if changed:
+            save_state(self.state_file, self.state)
 
     def safe_fetch_balance(self) -> Dict[str, Any]:
         if self.dry_run:
@@ -1526,11 +2010,14 @@ class Bot:
                 "stop_loss": stop_loss,
                 "take_profit": close_now + atr_now * tp_mult,
                 "tech_score": round(tech_score, 4),
+                "signal_candle_ts": str(last.get("ts", "")),
             }
         return None
 
     def collect_buy_candidates(self, symbols: List[str]) -> List[Dict[str, Any]]:
         candidates: List[Dict[str, Any]] = []
+        if self.entries_blocked_by_recovery():
+            return candidates
         max_open = int(to_float(get_cfg(self.cfg, "max_open_positions", 5), 5))
         if (
             self.open_positions_count() >= max_open
@@ -2991,7 +3478,13 @@ class Bot:
         resolved["cost"] = cost
         return resolved
 
-    def place_market_buy(self, symbol: str, stake_quote: float) -> Dict[str, Any]:
+    def place_market_buy(
+        self,
+        symbol: str,
+        stake_quote: float,
+        client_order_id: Optional[str] = None,
+        order_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
         ticker = self.get_ticker(symbol)
         ask = to_float(ticker.get("ask"), 0.0)
         if ask <= 0:
@@ -3000,14 +3493,47 @@ class Bot:
         est_quote = amount * ask
         min_notional = self.market_min_notional(symbol)
         if est_quote < min_notional:
-            raise ValueError(f"{symbol} te klein voor minimale orderwaarde. Nodig: {min_notional:.2f} {self.quote}")
+            raise ValueError(
+                f"{symbol} te klein voor minimale orderwaarde. "
+                f"Nodig: {min_notional:.2f} {self.quote}"
+            )
         if self.dry_run:
             return {
-                "id": f"drybuy-{int(time.time())}", "symbol": symbol, "price": ask,
-                "amount": amount, "filled": amount, "cost": est_quote,
-                "fee": {"cost": est_quote * (to_float(get_cfg(self.cfg, "taker_fee_pct", 0.25), 0.25) / 100.0), "currency": self.quote},
+                "id": f"drybuy-{int(time.time())}",
+                "symbol": symbol,
+                "price": ask,
+                "amount": amount,
+                "filled": amount,
+                "cost": est_quote,
+                "fee": {
+                    "cost": est_quote * (
+                        to_float(
+                            get_cfg(
+                                self.cfg,
+                                "taker_fee_pct",
+                                0.25,
+                            ),
+                            0.25,
+                        )
+                        / 100.0
+                    ),
+                    "currency": self.quote,
+                },
             }
-        return self.exchange.create_order(symbol, "market", "buy", amount, None, self.order_params())
+
+        # Alle lokale ordervalidatie is nu afgerond. Pas vlak vóór de
+        # exchange-call wordt PREPARED -> SUBMITTING atomair opgeslagen.
+        if order_key:
+            self.mark_pending_submitting(order_key)
+
+        return self.exchange.create_order(
+            symbol,
+            "market",
+            "buy",
+            amount,
+            None,
+            self.order_params(client_order_id),
+        )
 
     def place_market_sell(self, symbol: str, amount: float) -> Dict[str, Any]:
         amount = self.amount_to_precision_safe(symbol, amount)
@@ -3027,7 +3553,8 @@ class Bot:
         return self.exchange.create_order(symbol, "market", "sell", amount, None, self.order_params())
 
     def try_buy_symbol(
-        self, symbol: str,
+        self,
+        symbol: str,
         precomputed_signal: Optional[Dict[str, Any]] = None,
         precomputed_news_gate: Optional[Dict[str, Any]] = None,
         precomputed_ticker: Optional[Dict[str, Any]] = None,
@@ -3035,89 +3562,276 @@ class Bot:
     ) -> None:
         if not self.spot_enabled():
             return
+
+        if self.entries_blocked_by_recovery():
+            self.rate_limited_info(
+                self.last_skip_log_ts,
+                "recovery_block",
+                300,
+                "NIEUWE KOOP GEBLOKKEERD | recovery_required=%s | "
+                "reden=%s | pending=%d",
+                self.state.get("recovery_required"),
+                self.state.get("recovery_reason") or "",
+                len(self.state.get("pending_orders") or {}),
+            )
+            return
+
         if symbol in self.state["positions"]:
             return
-        if not self.allow_long_and_short_same_symbol() and symbol in self.state.get("short_positions", {}):
+        if (
+            not self.allow_long_and_short_same_symbol()
+            and symbol in self.state.get("short_positions", {})
+        ):
             return
         if self.symbol_in_cooldown(symbol):
             return
-        max_open = int(to_float(get_cfg(self.cfg, "max_open_positions", 5), 5))
+
+        max_open = int(
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "max_open_positions",
+                    5,
+                ),
+                5,
+            )
+        )
         if (
             self.open_positions_count() >= max_open
-            or self.total_positions_count() >= self.max_total_positions()
+            or self.total_positions_count()
+            >= self.max_total_positions()
         ):
             return
         if self.skip_symbol_due_to_existing_balance(symbol):
             return
 
-        signal = precomputed_signal or self.long_entry_signal(symbol)
+        signal = (
+            precomputed_signal
+            or self.long_entry_signal(symbol)
+        )
         if not signal:
             return
 
-        ticker = precomputed_ticker or self.get_ticker(symbol)
+        ticker = (
+            precomputed_ticker
+            or self.get_ticker(symbol)
+        )
         spread_pct = precomputed_spread_pct
         if spread_pct is None:
             spread_pct = self.estimate_spread_pct(ticker)
 
-        max_spread_pct = to_float(get_cfg(self.cfg, "max_spread_pct", 0.25), 0.25)
+        max_spread_pct = to_float(
+            get_cfg(
+                self.cfg,
+                "max_spread_pct",
+                0.25,
+            ),
+            0.25,
+        )
         if spread_pct > max_spread_pct:
             self.rate_limited_info(
-                self.last_skip_log_ts, f"spread:{symbol}", 1800,
-                "OVERSLAAN KOPEN %s | spread %.3f%% > %.3f%%", symbol, spread_pct, max_spread_pct,
+                self.last_skip_log_ts,
+                f"spread:{symbol}",
+                1800,
+                "OVERSLAAN KOPEN %s | spread %.3f%% > %.3f%%",
+                symbol,
+                spread_pct,
+                max_spread_pct,
             )
             return
 
-        news_gate = precomputed_news_gate or self.news.buy_gate(symbol)
+        news_gate = (
+            precomputed_news_gate
+            or self.news.buy_gate(symbol)
+        )
         if not news_gate.get("allow", False):
             self.rate_limited_info(
-                self.last_skip_log_ts, f"news:{symbol}:{news_gate.get('reason')}", 1800,
-                "OVERSLAAN KOPEN %s | news_reason=%s", symbol, news_gate.get("reason"),
+                self.last_skip_log_ts,
+                (
+                    f"news:{symbol}:"
+                    f"{news_gate.get('reason')}"
+                ),
+                1800,
+                "OVERSLAAN KOPEN %s | news_reason=%s",
+                symbol,
+                news_gate.get("reason"),
             )
             return
 
-        stake = min(to_float(get_cfg(self.cfg, "fixed_stake_quote", 40), 40.0), self.buy_budget_available())
+        stake = min(
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "fixed_stake_quote",
+                    40,
+                ),
+                40.0,
+            ),
+            self.buy_budget_available(),
+        )
         if stake <= 0:
             return
+
+        order_key: Optional[str] = None
+        client_order_id: Optional[str] = None
 
         try:
             base_asset = symbol.split("/")[0].upper()
             protected_base_amount = 0.0
+
             if not self.dry_run:
                 self.refresh_balance_cache()
-                protected_base_amount = self.asset_balance(base_asset)
+                protected_base_amount = self.asset_balance(
+                    base_asset
+                )
 
-            raw_order = self.place_market_buy(symbol, stake)
+                order_key = self.long_order_key(
+                    symbol,
+                    signal,
+                )
+                pending = (
+                    self.state.get("pending_orders")
+                    or {}
+                )
+                if order_key in pending:
+                    self.set_recovery_required(
+                        (
+                            "RECOVERY_REQUIRED:"
+                            f"duplicate_pending:{order_key}"
+                        )
+                    )
+                    return
+
+                record = self.prepare_pending_long_order(
+                    order_key,
+                    symbol,
+                    signal,
+                    stake,
+                    spread_pct,
+                    protected_base_amount,
+                )
+                client_order_id = str(
+                    record.get("clientOrderId")
+                    or ""
+                )
+
+            try:
+                raw_order = self.place_market_buy(
+                    symbol,
+                    stake,
+                    client_order_id=client_order_id,
+                    order_key=order_key,
+                )
+            except Exception:
+                if not self.dry_run and order_key:
+                    record = (
+                        self.state.get("pending_orders", {})
+                        .get(order_key)
+                    )
+                    status = str(
+                        (record or {}).get("status")
+                        or ""
+                    ).upper()
+
+                    if status == "PREPARED":
+                        # create_order is aantoonbaar nog niet gestart.
+                        self.abandon_pending_after_confirmed_rejection(
+                            order_key,
+                            "lokale_validatie_voor_submit",
+                        )
+                    else:
+                        # SUBMITTING is bewust ambigu: Bitvavo kan de order
+                        # al hebben ontvangen terwijl de response wegviel.
+                        self.set_recovery_required(
+                            (
+                                "RECOVERY_REQUIRED:"
+                                f"submit_ambiguous:{order_key}"
+                            )
+                        )
+                raise
+
+            if not self.dry_run and order_key:
+                self.update_pending_from_order(
+                    order_key,
+                    raw_order,
+                    status="SUBMITTED",
+                )
+
             fallback_price = to_float(
-                raw_order.get("average") or raw_order.get("price") or signal["close"],
+                raw_order.get("average")
+                or raw_order.get("price")
+                or signal["close"],
                 signal["close"],
             )
             fallback_amount = self.amount_to_precision_safe(
                 symbol,
-                stake / max(fallback_price, 1e-12),
+                stake / max(
+                    fallback_price,
+                    1e-12,
+                ),
             )
+
             order = self.resolve_order_fill(
                 symbol,
                 raw_order,
                 fallback_price=fallback_price,
                 fallback_amount=fallback_amount,
             )
-            price = to_float(order.get("average"), fallback_price)
-            amount = to_float(order.get("filled"), fallback_amount)
-            quote_amount = to_float(order.get("cost"), amount * price)
-            fee_quote = self.order_fee_quote(order, quote_amount, symbol, price)
+
+            price = to_float(
+                order.get("average"),
+                fallback_price,
+            )
+            amount = to_float(
+                order.get("filled"),
+                fallback_amount,
+            )
+            quote_amount = to_float(
+                order.get("cost"),
+                amount * price,
+            )
+            fee_quote = self.order_fee_quote(
+                order,
+                quote_amount,
+                symbol,
+                price,
+            )
+
+            if not self.dry_run and order_key:
+                # Eerst de bevestigde fill persistent opslaan. Crasht Render
+                # hierna vóór de positie-save, dan kan recovery de positie
+                # reconstrueren uit pending + Bitvavo.
+                self.update_pending_from_order(
+                    order_key,
+                    order,
+                    status="FILLED_CONFIRMED",
+                )
 
             if self.dry_run:
                 current_simulated = to_float(
                     self.state.get("simulated_free_quote"),
-                    to_float(get_cfg(self.cfg, "risk.simulated_quote_balance", 3000), 3000.0),
+                    to_float(
+                        get_cfg(
+                            self.cfg,
+                            "risk.simulated_quote_balance",
+                            3000,
+                        ),
+                        3000.0,
+                    ),
                 )
                 required = quote_amount + fee_quote
                 if required > current_simulated + 1e-9:
                     raise RuntimeError(
-                        f"Onvoldoende gesimuleerd saldo: nodig={required:.2f}, "
-                        f"beschikbaar={current_simulated:.2f} {self.quote}"
+                        "Onvoldoende gesimuleerd saldo: "
+                        f"nodig={required:.2f}, "
+                        f"beschikbaar={current_simulated:.2f} "
+                        f"{self.quote}"
                     )
-                self.state["simulated_free_quote"] = current_simulated - required
+                self.state["simulated_free_quote"] = (
+                    current_simulated
+                    - required
+                )
+
             news_snapshot = self.news.coin_news(symbol)
             fear_greed = self.news.fear_greed()
 
@@ -3131,32 +3845,120 @@ class Bot:
                 "stop_loss": signal["stop_loss"],
                 "take_profit": signal["take_profit"],
                 "highest_price": price,
-                "news_score_at_entry": news_snapshot.get("news_score", 0.0),
-                "fear_greed_at_entry": fear_greed.get("value"),
-                "tech_score_at_entry": signal.get("tech_score", 0.0),
-                "protected_base_amount": protected_base_amount,
+                "news_score_at_entry": (
+                    news_snapshot.get(
+                        "news_score",
+                        0.0,
+                    )
+                ),
+                "fear_greed_at_entry": (
+                    fear_greed.get("value")
+                ),
+                "tech_score_at_entry": (
+                    signal.get(
+                        "tech_score",
+                        0.0,
+                    )
+                ),
+                "protected_base_amount": (
+                    protected_base_amount
+                ),
+                "client_order_id": (
+                    client_order_id
+                    if not self.dry_run
+                    else None
+                ),
+                "exchange_order_id": (
+                    order.get("id")
+                    if not self.dry_run
+                    else None
+                ),
             }
-            save_state(self.state_file, self.state)
+
+            if not self.dry_run and order_key:
+                self.state.get(
+                    "pending_orders",
+                    {},
+                ).pop(
+                    order_key,
+                    None,
+                )
+                self.clear_recovery_if_safe()
+
+            # Positie + verwijderen van pending worden samen atomair opgeslagen.
+            save_state(
+                self.state_file,
+                self.state,
+            )
             self.refresh_balance_cache()
 
-            append_trade_csv(self.trades_file, {
-                "ts": now_iso(), "market": symbol, "side": "BUY",
-                "price": round(price, 12), "base_amount": amount,
-                "quote_amount": round(quote_amount, 8), "fees_quote": round(fee_quote, 8),
-                "spread_pct": round(spread_pct, 6), "net_pnl_quote": "", "holding_time_min": "",
-                "reason": f"entry_signal_news_{news_snapshot.get('news_score', 0.0)}",
-                "dry_run": self.dry_run,
-            })
+            append_trade_csv(
+                self.trades_file,
+                {
+                    "ts": now_iso(),
+                    "market": symbol,
+                    "side": "BUY",
+                    "price": round(price, 12),
+                    "base_amount": amount,
+                    "quote_amount": round(
+                        quote_amount,
+                        8,
+                    ),
+                    "fees_quote": round(
+                        fee_quote,
+                        8,
+                    ),
+                    "spread_pct": round(
+                        spread_pct,
+                        6,
+                    ),
+                    "net_pnl_quote": "",
+                    "holding_time_min": "",
+                    "reason": (
+                        "entry_signal_news_"
+                        f"{news_snapshot.get('news_score', 0.0)}"
+                    ),
+                    "dry_run": self.dry_run,
+                },
+            )
 
             LOG.info(
-                "KOOP %s | prijs=%.8f amount=%s quote=%.2f %s nieuws=%.2f fg=%s tech=%.2f rsi=%.2f atr%%=%.3f stop=%.8f tp=%.8f dry=%s",
-                symbol, price, amount, quote_amount, self.quote,
-                to_float(news_snapshot.get("news_score", 0.0), 0.0), fear_greed.get("value"),
-                to_float(signal.get("tech_score", 0.0), 0.0), signal["rsi"], signal["atr_pct"],
-                signal["stop_loss"], signal["take_profit"], self.dry_run,
+                "KOOP %s | prijs=%.8f amount=%s quote=%.2f %s "
+                "nieuws=%.2f fg=%s tech=%.2f rsi=%.2f "
+                "atr%%=%.3f stop=%.8f tp=%.8f dry=%s",
+                symbol,
+                price,
+                amount,
+                quote_amount,
+                self.quote,
+                to_float(
+                    news_snapshot.get(
+                        "news_score",
+                        0.0,
+                    ),
+                    0.0,
+                ),
+                fear_greed.get("value"),
+                to_float(
+                    signal.get(
+                        "tech_score",
+                        0.0,
+                    ),
+                    0.0,
+                ),
+                signal["rsi"],
+                signal["atr_pct"],
+                signal["stop_loss"],
+                signal["take_profit"],
+                self.dry_run,
             )
-        except Exception as e:
-            LOG.exception("KOOP mislukt voor %s: %s", symbol, e)
+
+        except Exception as exc:
+            LOG.exception(
+                "KOOP mislukt voor %s: %s",
+                symbol,
+                exc,
+            )
 
     def try_sell_symbol(self, symbol: str, position: Dict[str, Any], reason: str) -> None:
         # Coins die niet door de bot zijn gekocht worden nooit verkocht.
@@ -3834,6 +4636,11 @@ class Bot:
             self.state_file
         )
 
+        # Pending live-orders worden vóór nieuwe entries gereconcilieerd.
+        # Bestaande posities blijven daarna gewoon bewaakt.
+        if self.state.get("pending_orders"):
+            self.reconcile_pending_orders()
+
         self.ensure_short_test_baseline()
 
         control = load_control(
@@ -3842,7 +4649,8 @@ class Bot:
 
         self.refresh_balance_cache()
 
-        # Open posities blijven altijd bewaakt, ook tijdens een pauze.
+        # Open posities blijven altijd bewaakt, ook tijdens een pauze of
+        # recovery. Alleen nieuwe spot-entries worden door recovery geblokkeerd.
         self.manage_open_positions()
         self.manage_open_short_positions()
 
@@ -3871,11 +4679,27 @@ class Bot:
             )
         )
 
-        block_spot_entries = paused
+        recovery_block = self.entries_blocked_by_recovery()
+
+        block_spot_entries = (
+            paused
+            or recovery_block
+        )
         block_short_entries = (
             paused
             and not long_test_pause
         )
+
+        if recovery_block:
+            self.rate_limited_info(
+                self.last_skip_log_ts,
+                "recovery_gate",
+                300,
+                "RECOVERY_REQUIRED | nieuwe spot-aankopen geblokkeerd | "
+                "reden=%s | pending=%d",
+                self.state.get("recovery_reason") or "pending_order",
+                len(self.state.get("pending_orders") or {}),
+            )
 
         if paused:
             self.rate_limited_info(
