@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Diamond Trader cockpit v2.2
+# Diamond Trader cockpit v2.3
 # Compacte read-only status voor Render Shell.
 
 set -u
@@ -91,6 +91,152 @@ PY_PRECANARY
 else
     echo "Pre-canary status niet beschikbaar"
 fi
+
+echo
+echo "=== CANARY LIVE ==="
+
+# Werk de canary-analyse veilig bij wanneer de helper beschikbaar is.
+if [ -f "$ROOT/diamond_canary_log_analyzer.py" ]; then
+    python3 "$ROOT/diamond_canary_log_analyzer.py" >/dev/null 2>&1 || true
+fi
+
+# Werk de live safety-status veilig bij wanneer de helper beschikbaar is.
+if [ -f "$ROOT/diamond_live_safety_monitor.py" ]; then
+    python3 "$ROOT/diamond_live_safety_monitor.py" >/dev/null 2>&1 || true
+fi
+
+canary_analysis="$DATA/diamond_canary_log_analysis.json"
+live_safety="$DATA/diamond_live_safety_status.json"
+
+python3 - "$canary_analysis" "$live_safety" <<'PY_CANARYLIVE'
+import json
+import math
+import os
+import sys
+
+analysis_path = sys.argv[1]
+safety_path = sys.argv[2]
+
+
+def load(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def f(value, default=0.0):
+    try:
+        value = float(value)
+        return value if math.isfinite(value) else default
+    except Exception:
+        return default
+
+
+def i(value, default=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def eur(value):
+    value = f(value)
+    sign = "+" if value > 0 else ""
+    return f"€{sign}{value:.4f}"
+
+
+def pct(value):
+    value = f(value)
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.4f}%"
+
+
+def pf_text(value):
+    if value is None:
+        return "n/a"
+    try:
+        value = float(value)
+    except Exception:
+        return "n/a"
+    if math.isinf(value):
+        return "INF"
+    return f"{value:.4f}"
+
+
+analysis = load(analysis_path)
+safety = load(safety_path)
+
+closed = i(analysis.get("closed_trades"), 0)
+wins = i(analysis.get("wins"), 0)
+losses = i(analysis.get("losses"), 0)
+breakeven = i(analysis.get("breakeven"), 0)
+
+if closed < 5:
+    target = 5
+elif closed < 10:
+    target = 10
+else:
+    target = 10
+
+analysis_status = str(
+    analysis.get("status")
+    or ("READY" if closed == 0 else "OK")
+).upper()
+
+safety_status = str(
+    safety.get("status")
+    or ("READY" if closed == 0 else "ONBEKEND")
+).upper()
+
+print(
+    f"Canary trades : {closed}/{target} "
+    f"[{analysis_status}]"
+)
+print(
+    f"W/L/BE        : {wins}/{losses}/{breakeven}"
+)
+print(
+    f"Live PnL      : {eur(analysis.get('actual_net_pnl_quote'))}"
+)
+print(
+    f"PF            : {pf_text(analysis.get('profit_factor'))}"
+)
+print(
+    f"Fees          : {eur(analysis.get('total_fees_quote'))}"
+)
+print(
+    "Gem slippage  : "
+    f"BUY {pct(analysis.get('avg_buy_slippage_pct'))} | "
+    f"SELL {pct(analysis.get('avg_sell_slippage_pct'))}"
+)
+print(
+    f"Max slippage  : {pct(analysis.get('max_adverse_slippage_pct'))}"
+)
+print(
+    f"Execution diff: {eur(analysis.get('pnl_difference_quote'))}"
+)
+print(
+    f"Live safety   : {safety_status}"
+)
+
+if closed == 0:
+    print("Mijlpaal      : wacht op echte canary trade 1")
+elif closed < 5:
+    print(f"Mijlpaal      : trade {closed}/5 | fase 1 loopt")
+elif closed < 10:
+    print(f"Mijlpaal      : 5 bereikt | trade {closed}/10")
+else:
+    print("Mijlpaal      : 10/10 bereikt | handmatige review")
+
+flags = safety.get("safety_flags") or []
+if flags:
+    print("Safety flags  : " + " | ".join(str(x) for x in flags[:3]))
+else:
+    print("Safety flags  : geen")
+PY_CANARYLIVE
 
 echo
 echo "=== BELANGRIJKSTE BLOKKER ==="
