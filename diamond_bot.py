@@ -35,6 +35,7 @@ CANARY_EXECUTION_CSV_COLUMNS = [
     "reference_ask",
     "buy_fill_price",
     "buy_slippage_pct",
+    "buy_slippage_status",
     "buy_spread_pct",
     "buy_fee_quote",
     "buy_order_id",
@@ -42,6 +43,7 @@ CANARY_EXECUTION_CSV_COLUMNS = [
     "reference_bid",
     "sell_fill_price",
     "sell_slippage_pct",
+    "sell_slippage_status",
     "sell_spread_pct",
     "sell_fee_quote",
     "sell_order_id",
@@ -55,6 +57,7 @@ CANARY_EXECUTION_CSV_COLUMNS = [
     "total_fees_quote",
     "holding_time_min",
     "recovery_used",
+    "overall_status",
     "dry_run",
 ]
 
@@ -327,6 +330,46 @@ def execution_slippage_pct(
         return ((reference - fill) / reference) * 100.0
 
     return ((fill - reference) / reference) * 100.0
+
+
+def classify_slippage_status(slippage_pct: float) -> str:
+    """
+    Classificeert alleen nadelige execution-slippage.
+
+    Negatieve slippage betekent een betere fill dan de referentie en is dus OK.
+    """
+    value = to_float(slippage_pct, 0.0)
+
+    if value > 0.30:
+        return "STOP_CANDIDATE"
+    if value > 0.20:
+        return "HIGH"
+    if value > 0.10:
+        return "WARNING"
+    return "OK"
+
+
+def combine_execution_status(*statuses: str) -> str:
+    """Geeft de zwaarste executionstatus terug."""
+    ranking = {
+        "OK": 0,
+        "WARNING": 1,
+        "HIGH": 2,
+        "STOP_CANDIDATE": 3,
+    }
+
+    normalized = [
+        str(status or "OK").strip().upper()
+        for status in statuses
+    ]
+
+    if not normalized:
+        return "OK"
+
+    return max(
+        normalized,
+        key=lambda value: ranking.get(value, 0),
+    )
 
 
 def expected_canary_net_pnl_quote(
@@ -1001,6 +1044,12 @@ class Bot:
                 "reference_ask": position.get("entry_reference_ask"),
                 "buy_fill_price": position.get("entry_price"),
                 "buy_slippage_pct": position.get("entry_slippage_pct"),
+                "buy_slippage_status": classify_slippage_status(
+                    to_float(
+                        position.get("entry_slippage_pct"),
+                        0.0,
+                    )
+                ),
                 "buy_spread_pct": position.get("entry_spread_pct"),
                 "buy_fee_quote": position.get("fees_buy_quote"),
                 "buy_order_id": position.get("exchange_order_id"),
@@ -1008,6 +1057,12 @@ class Bot:
                 "base_amount": position.get("amount"),
                 "entry_quote_actual": position.get("quote_amount"),
                 "recovery_used": bool(recovered),
+                "overall_status": classify_slippage_status(
+                    to_float(
+                        position.get("entry_slippage_pct"),
+                        0.0,
+                    )
+                ),
                 "dry_run": False,
             },
         )
@@ -1057,6 +1112,17 @@ class Bot:
             sell_fill,
         )
 
+        buy_slippage_status = classify_slippage_status(
+            buy_slippage
+        )
+        sell_slippage_status = classify_slippage_status(
+            sell_slippage
+        )
+        overall_status = combine_execution_status(
+            buy_slippage_status,
+            sell_slippage_status,
+        )
+
         fee_pct = to_float(
             get_cfg(self.cfg, "taker_fee_pct", 0.25),
             0.25,
@@ -1102,6 +1168,7 @@ class Bot:
                 "reference_ask": reference_ask,
                 "buy_fill_price": buy_fill,
                 "buy_slippage_pct": buy_slippage,
+                "buy_slippage_status": buy_slippage_status,
                 "buy_spread_pct": position.get("entry_spread_pct"),
                 "buy_fee_quote": allocated_buy_fee,
                 "buy_order_id": position.get("exchange_order_id"),
@@ -1109,6 +1176,7 @@ class Bot:
                 "reference_bid": reference_bid,
                 "sell_fill_price": sell_fill,
                 "sell_slippage_pct": sell_slippage,
+                "sell_slippage_status": sell_slippage_status,
                 "sell_spread_pct": sell_spread_pct,
                 "sell_fee_quote": sell_fee_quote,
                 "sell_order_id": order.get("id"),
@@ -1132,6 +1200,7 @@ class Bot:
                 "total_fees_quote": allocated_buy_fee + sell_fee_quote,
                 "holding_time_min": holding_time_min,
                 "recovery_used": bool(recovered),
+                "overall_status": overall_status,
                 "dry_run": False,
             },
         )
@@ -1329,6 +1398,13 @@ class Bot:
                 "buy",
                 to_float(record.get("reference_ask"), price),
                 price,
+            ),
+            "entry_slippage_status": classify_slippage_status(
+                execution_slippage_pct(
+                    "buy",
+                    to_float(record.get("reference_ask"), price),
+                    price,
+                )
             ),
             "entry_spread_pct": to_float(
                 record.get("execution_spread_pct"),
@@ -4741,6 +4817,9 @@ class Bot:
                 ),
                 "entry_reference_ask": reference_ask,
                 "entry_slippage_pct": buy_slippage_pct,
+                "entry_slippage_status": classify_slippage_status(
+                    buy_slippage_pct
+                ),
                 "entry_spread_pct": execution_spread_pct,
             }
 
@@ -5764,7 +5843,7 @@ def main() -> None:
     cfg = load_yaml(cfg_path)
     setup_logging(str(get_cfg(cfg, "log_level", "INFO")))
     bot = Bot(cfg)
-    LOG.info("Diamond Bot v6.7 gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
+    LOG.info("Diamond Bot v6.8 gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
     bot.run_forever()
 
 
