@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Diamond Trader cockpit v2.5
+# Diamond Trader cockpit v2.6
 # Compacte read-only status voor Render Shell.
 
 set -u
@@ -276,6 +276,7 @@ multi = load("diamond_multi_exchange_confirmation.json")
 post = load("diamond_post_canary_review.json")
 scaling = load("diamond_scaling_gate_status.json")
 prospective = load("diamond_selective_prospective_candidate_report.json")
+event_outcome = load("diamond_event_outcome_tracker_report.json")
 
 print(
     "Universe      : "
@@ -355,6 +356,84 @@ if any(not item for item in (universe, news, fusion, admission, schedule, multi)
 else:
     print("Data-status    : researchdata aanwezig | alleen-lezen")
 PY_UNIVERSE_EVENT
+
+echo
+echo "=== EVENT OUTCOME ==="
+python3 - "$DATA/diamond_event_outcome_tracker_report.json" <<'PY_EVENT_OUTCOME'
+import json
+import math
+import sys
+
+path = sys.argv[1]
+
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+
+summary = data.get("summary") or {}
+by_status = summary.get("by_fusion_status") or {}
+
+def cp(status, horizon):
+    row = by_status.get(status) or {}
+    checkpoints = row.get("checkpoints") or {}
+    item = checkpoints.get(horizon) or {}
+    try:
+        n = int(item.get("n") or 0)
+    except Exception:
+        n = 0
+    avg = item.get("average_return_pct")
+    if n == 0 or avg is None:
+        return "n=0"
+    try:
+        avg = float(avg)
+    except Exception:
+        return f"n={n}"
+    return f"n={n} avg={avg:+.2f}%"
+
+if not data:
+    print("Outcome data : WAIT_DATA")
+else:
+    print(
+        "Events       : "
+        f"{int(summary.get('events_total') or 0)} totaal | "
+        f"nieuw {int(data.get('events_created_now') or 0)} | "
+        f"checks {int(data.get('checkpoints_completed_now') or 0)}"
+    )
+
+    labels = [
+        ("FUSED", "FUSED"),
+        ("CONFLICT", "FUSED_CONFLICT"),
+        ("NEWS", "NEWS_WATCH"),
+        ("MARKET", "MARKET_WATCH"),
+    ]
+    for label, status in labels:
+        row = by_status.get(status) or {}
+        events = int(row.get("events") or 0)
+        print(
+            f"{label:<8} : "
+            f"events={events:<3} | "
+            f"1h {cp(status,'1h')} | "
+            f"4h {cp(status,'4h')} | "
+            f"12h {cp(status,'12h')}"
+        )
+
+    fused_strong = by_status.get("FUSED_STRONG") or {}
+    fs_events = int(fused_strong.get("events") or 0)
+    if fs_events:
+        print(
+            "FUSED+   : "
+            f"events={fs_events:<3} | "
+            f"1h {cp('FUSED_STRONG','1h')} | "
+            f"4h {cp('FUSED_STRONG','4h')} | "
+            f"12h {cp('FUSED_STRONG','12h')}"
+        )
+
+print("Research-only : JA | live/orders: NEE")
+PY_EVENT_OUTCOME
 
 echo
 echo "=== RESEARCH COMPACT ==="
