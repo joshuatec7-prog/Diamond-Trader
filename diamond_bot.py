@@ -25,6 +25,39 @@ TRADE_CSV_COLUMNS = [
     "fees_quote", "spread_pct", "net_pnl_quote", "holding_time_min", "reason", "dry_run",
 ]
 
+CANARY_EXECUTION_CSV_COLUMNS = [
+    "ts",
+    "event",
+    "canary_trade_number",
+    "market",
+    "side",
+    "reason",
+    "reference_ask",
+    "buy_fill_price",
+    "buy_slippage_pct",
+    "buy_spread_pct",
+    "buy_fee_quote",
+    "buy_order_id",
+    "buy_client_order_id",
+    "reference_bid",
+    "sell_fill_price",
+    "sell_slippage_pct",
+    "sell_spread_pct",
+    "sell_fee_quote",
+    "sell_order_id",
+    "sell_client_order_id",
+    "base_amount",
+    "entry_quote_actual",
+    "exit_quote_actual",
+    "expected_net_pnl_quote",
+    "actual_net_pnl_quote",
+    "pnl_difference_quote",
+    "total_fees_quote",
+    "holding_time_min",
+    "recovery_used",
+    "dry_run",
+]
+
 SHORT_EXECUTION_CSV_COLUMNS = [
     "ts",
     "event",
@@ -158,6 +191,7 @@ def default_state() -> Dict[str, Any]:
         "pending_orders": {},
         "recovery_required": False,
         "recovery_reason": "",
+        "canary_trade_sequence": 0,
     }
 
 
@@ -257,6 +291,70 @@ def append_trade_csv(path_str: str, row: Dict[str, Any]) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow({k: row.get(k, "") for k in TRADE_CSV_COLUMNS})
+
+
+def append_canary_execution_csv(path_str: str, row: Dict[str, Any]) -> None:
+    """Schrijft uitsluitend echte live/canary execution-events."""
+    ensure_parent(path_str)
+    exists = Path(path_str).exists()
+    with open(path_str, "a", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=CANARY_EXECUTION_CSV_COLUMNS,
+        )
+        if not exists:
+            writer.writeheader()
+        writer.writerow(
+            {
+                key: row.get(key, "")
+                for key in CANARY_EXECUTION_CSV_COLUMNS
+            }
+        )
+
+
+def execution_slippage_pct(
+    side: str,
+    reference_price: float,
+    fill_price: float,
+) -> float:
+    """Positief = slechter uitgevoerd dan de vlak-voor-order referentie."""
+    reference = to_float(reference_price, 0.0)
+    fill = to_float(fill_price, 0.0)
+    if reference <= 0 or fill <= 0:
+        return 0.0
+
+    if str(side).strip().lower() == "sell":
+        return ((reference - fill) / reference) * 100.0
+
+    return ((fill - reference) / reference) * 100.0
+
+
+def expected_canary_net_pnl_quote(
+    amount: float,
+    reference_ask: float,
+    reference_bid: float,
+    taker_fee_pct: float,
+) -> float:
+    """Verwachte netto PnL zonder execution-slippage, met ingestelde taker fee."""
+    amount_value = max(0.0, to_float(amount, 0.0))
+    ask = max(0.0, to_float(reference_ask, 0.0))
+    bid = max(0.0, to_float(reference_bid, 0.0))
+    fee_rate = max(0.0, to_float(taker_fee_pct, 0.0)) / 100.0
+
+    if amount_value <= 0 or ask <= 0 or bid <= 0:
+        return 0.0
+
+    expected_entry_quote = amount_value * ask
+    expected_exit_quote = amount_value * bid
+    expected_buy_fee = expected_entry_quote * fee_rate
+    expected_sell_fee = expected_exit_quote * fee_rate
+
+    return (
+        expected_exit_quote
+        - expected_sell_fee
+        - expected_entry_quote
+        - expected_buy_fee
+    )
 
 
 def append_short_execution_csv(path_str: str, row: Dict[str, Any]) -> None:
@@ -529,6 +627,13 @@ class Bot:
         self.dry_run = to_bool(get_cfg(cfg, "dry_run", True), True)
         self.state_file = str(get_cfg(cfg, "files.state_file", "state.json"))
         self.trades_file = str(get_cfg(cfg, "files.trades_file", "transactions.csv"))
+        self.canary_execution_file = str(
+            get_cfg(
+                cfg,
+                "files.canary_execution_file",
+                "/var/data/diamond_canary_execution.csv",
+            )
+        )
         self.control_file = str(get_cfg(cfg, "files.control_file", "/var/data/diamond_control.json"))
         self.short_test_baseline_file = str(
             get_cfg(
@@ -681,6 +786,43 @@ class Bot:
         )
         return f"LONG|{symbol.upper()}|{candle_key}"
 
+    def sell_order_key(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+        reason: str,
+        sell_amount: float,
+    ) -> str:
+        """Maakt een stabiele identiteit voor één concrete live-verkoop."""
+        opened_at = to_float(
+            position.get("opened_at"),
+            0.0,
+        )
+        amount_key = f"{float(sell_amount):.16g}"
+        reason_key = str(reason or "sell").strip().lower()
+        return (
+            f"SELL|{symbol.upper()}|{opened_at:.6f}|"
+            f"{reason_key}|{amount_key}"
+        )
+
+    def pending_sell_for_symbol(
+        self,
+        symbol: str,
+    ) -> Optional[Dict[str, Any]]:
+        for record in (
+            self.state.get("pending_orders")
+            or {}
+        ).values():
+            if not isinstance(record, dict):
+                continue
+            if (
+                str(record.get("side") or "").lower() == "sell"
+                and str(record.get("symbol") or "").upper()
+                == symbol.upper()
+            ):
+                return record
+        return None
+
     def client_order_id_for_key(
         self,
         order_key: str,
@@ -733,8 +875,17 @@ class Bot:
         if order_key in pending:
             return pending[order_key]
 
+        canary_trade_number = int(
+            to_float(
+                self.state.get("canary_trade_sequence"),
+                0,
+            )
+        ) + 1
+        self.state["canary_trade_sequence"] = canary_trade_number
+
         record = {
             "order_key": order_key,
+            "canary_trade_number": canary_trade_number,
             "clientOrderId": self.client_order_id_for_key(order_key),
             "symbol": symbol,
             "side": "buy",
@@ -762,6 +913,228 @@ class Bot:
         pending[order_key] = record
         save_state(self.state_file, self.state)
         return record
+
+    def prepare_pending_sell_order(
+        self,
+        order_key: str,
+        symbol: str,
+        position: Dict[str, Any],
+        reason: str,
+        sell_amount: float,
+    ) -> Dict[str, Any]:
+        """Slaat een live SELL atomair op vóór create_order kan starten."""
+        pending = self.state.setdefault(
+            "pending_orders",
+            {},
+        )
+        if order_key in pending:
+            return pending[order_key]
+
+        record = {
+            "order_key": order_key,
+            "clientOrderId": self.client_order_id_for_key(order_key),
+            "symbol": symbol,
+            "side": "sell",
+            "status": "PREPARED",
+            "created_at": now_iso(),
+            "created_at_ts": utc_now_ts(),
+            "submitted_at": None,
+            "exchange_order_id": None,
+            "reason": str(reason or "sell"),
+            "intended_amount": float(sell_amount),
+            "canary_trade_number": int(
+                to_float(
+                    position.get("canary_trade_number"),
+                    0,
+                )
+            ),
+            "position_snapshot": {
+                "opened_at": to_float(
+                    position.get("opened_at"),
+                    0.0,
+                ),
+                "tracked_amount": to_float(
+                    position.get("amount"),
+                    0.0,
+                ),
+                "entry_quote_total": to_float(
+                    position.get("quote_amount"),
+                    0.0,
+                ),
+                "fee_buy_total": to_float(
+                    position.get("fees_buy_quote"),
+                    0.0,
+                ),
+                "protected_base_amount": to_float(
+                    position.get("protected_base_amount"),
+                    0.0,
+                ),
+            },
+        }
+        pending[order_key] = record
+        save_state(self.state_file, self.state)
+        return record
+
+    def canary_open_event(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+        recovered: bool = False,
+    ) -> None:
+        if self.dry_run:
+            return
+
+        append_canary_execution_csv(
+            self.canary_execution_file,
+            {
+                "ts": now_iso(),
+                "event": "OPEN",
+                "canary_trade_number": int(
+                    to_float(
+                        position.get("canary_trade_number"),
+                        0,
+                    )
+                ),
+                "market": symbol,
+                "side": "BUY",
+                "reason": "live_entry",
+                "reference_ask": position.get("entry_reference_ask"),
+                "buy_fill_price": position.get("entry_price"),
+                "buy_slippage_pct": position.get("entry_slippage_pct"),
+                "buy_spread_pct": position.get("entry_spread_pct"),
+                "buy_fee_quote": position.get("fees_buy_quote"),
+                "buy_order_id": position.get("exchange_order_id"),
+                "buy_client_order_id": position.get("client_order_id"),
+                "base_amount": position.get("amount"),
+                "entry_quote_actual": position.get("quote_amount"),
+                "recovery_used": bool(recovered),
+                "dry_run": False,
+            },
+        )
+
+    def canary_close_event(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+        reason: str,
+        order: Dict[str, Any],
+        filled_amount: float,
+        exit_quote_actual: float,
+        sell_fee_quote: float,
+        actual_net_pnl_quote: float,
+        holding_time_min: float,
+        reference_bid: float,
+        sell_spread_pct: float,
+        recovered: bool,
+    ) -> None:
+        if self.dry_run:
+            return
+
+        reference_ask = to_float(
+            position.get("entry_reference_ask"),
+            to_float(position.get("entry_price"), 0.0),
+        )
+        buy_fill = to_float(
+            position.get("entry_price"),
+            0.0,
+        )
+        buy_slippage = to_float(
+            position.get("entry_slippage_pct"),
+            execution_slippage_pct(
+                "buy",
+                reference_ask,
+                buy_fill,
+            ),
+        )
+        sell_fill = to_float(
+            order.get("average")
+            or order.get("price"),
+            0.0,
+        )
+        sell_slippage = execution_slippage_pct(
+            "sell",
+            reference_bid,
+            sell_fill,
+        )
+
+        fee_pct = to_float(
+            get_cfg(self.cfg, "taker_fee_pct", 0.25),
+            0.25,
+        )
+        expected_net = expected_canary_net_pnl_quote(
+            filled_amount,
+            reference_ask,
+            reference_bid,
+            fee_pct,
+        )
+        pnl_difference = actual_net_pnl_quote - expected_net
+
+        entry_amount = max(
+            to_float(position.get("amount"), 0.0),
+            1e-12,
+        )
+        fraction = min(
+            1.0,
+            max(0.0, filled_amount) / entry_amount,
+        )
+        allocated_buy_fee = (
+            to_float(
+                position.get("fees_buy_quote"),
+                0.0,
+            )
+            * fraction
+        )
+
+        append_canary_execution_csv(
+            self.canary_execution_file,
+            {
+                "ts": now_iso(),
+                "event": "CLOSE",
+                "canary_trade_number": int(
+                    to_float(
+                        position.get("canary_trade_number"),
+                        0,
+                    )
+                ),
+                "market": symbol,
+                "side": "SELL",
+                "reason": reason,
+                "reference_ask": reference_ask,
+                "buy_fill_price": buy_fill,
+                "buy_slippage_pct": buy_slippage,
+                "buy_spread_pct": position.get("entry_spread_pct"),
+                "buy_fee_quote": allocated_buy_fee,
+                "buy_order_id": position.get("exchange_order_id"),
+                "buy_client_order_id": position.get("client_order_id"),
+                "reference_bid": reference_bid,
+                "sell_fill_price": sell_fill,
+                "sell_slippage_pct": sell_slippage,
+                "sell_spread_pct": sell_spread_pct,
+                "sell_fee_quote": sell_fee_quote,
+                "sell_order_id": order.get("id"),
+                "sell_client_order_id": (
+                    order.get("clientOrderId")
+                    or (order.get("info") or {}).get("clientOrderId")
+                    or ""
+                ),
+                "base_amount": filled_amount,
+                "entry_quote_actual": (
+                    to_float(
+                        position.get("quote_amount"),
+                        0.0,
+                    )
+                    * fraction
+                ),
+                "exit_quote_actual": exit_quote_actual,
+                "expected_net_pnl_quote": expected_net,
+                "actual_net_pnl_quote": actual_net_pnl_quote,
+                "pnl_difference_quote": pnl_difference,
+                "total_fees_quote": allocated_buy_fee + sell_fee_quote,
+                "holding_time_min": holding_time_min,
+                "recovery_used": bool(recovered),
+                "dry_run": False,
+            },
+        )
 
     def mark_pending_submitting(
         self,
@@ -942,6 +1315,25 @@ class Bot:
                 order.get("id")
                 or record.get("exchange_order_id")
             ),
+            "canary_trade_number": int(
+                to_float(
+                    record.get("canary_trade_number"),
+                    0,
+                )
+            ),
+            "entry_reference_ask": to_float(
+                record.get("reference_ask"),
+                price,
+            ),
+            "entry_slippage_pct": execution_slippage_pct(
+                "buy",
+                to_float(record.get("reference_ask"), price),
+                price,
+            ),
+            "entry_spread_pct": to_float(
+                record.get("execution_spread_pct"),
+                to_float(record.get("spread_pct"), 0.0),
+            ),
         }
 
         self.state.get(
@@ -950,6 +1342,13 @@ class Bot:
         ).pop(order_key, None)
         self.clear_recovery_if_safe()
         save_state(self.state_file, self.state)
+
+        if not self.dry_run:
+            self.canary_open_event(
+                symbol,
+                self.state["positions"][symbol],
+                recovered=True,
+            )
 
         LOG.warning(
             "RECOVERY POSITIE HERSTELD | %s | key=%s | amount=%s | prijs=%.8f",
@@ -960,13 +1359,330 @@ class Bot:
         )
         return True
 
+    def apply_confirmed_sell_fill(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+        reason: str,
+        order: Dict[str, Any],
+        fallback_price: float,
+        fallback_amount: float,
+        pending_order_key: Optional[str] = None,
+        spread_pct: Optional[float] = None,
+        reference_bid: Optional[float] = None,
+        recovered: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Verwerkt één bevestigde SELL-fill exact één keer.
+
+        Positie-aanpassing, PnL en het verwijderen van pending worden samen
+        atomair opgeslagen. Daardoor kan een restart dezelfde SELL niet nog
+       maals administratief of op de exchange uitvoeren.
+        """
+        tracked_amount = to_float(
+            position.get("amount"),
+            0.0,
+        )
+        if tracked_amount <= 0:
+            raise RuntimeError(
+                f"Geen geldige bot-hoeveelheid voor {symbol}"
+            )
+
+        price = to_float(
+            order.get("average")
+            or order.get("price"),
+            fallback_price,
+        )
+        filled_amount = to_float(
+            order.get("filled"),
+            fallback_amount,
+        )
+        quote_amount = to_float(
+            order.get("cost"),
+            filled_amount * price,
+        )
+
+        if min(price, filled_amount, quote_amount) <= 0:
+            raise RuntimeError(
+                f"Bevestigde SELL-fill ongeldig voor {symbol}: "
+                f"price={price}, filled={filled_amount}, cost={quote_amount}"
+            )
+
+        tolerance = max(
+            1e-12,
+            tracked_amount * 1e-8,
+        )
+        if filled_amount > tracked_amount + tolerance:
+            self.set_recovery_required(
+                f"RECOVERY_REQUIRED:sell_fill_exceeds_position:{symbol}"
+            )
+            raise RuntimeError(
+                f"SELL-fill groter dan botpositie voor {symbol}: "
+                f"filled={filled_amount}, tracked={tracked_amount}"
+            )
+
+        fee_sell_quote = self.order_fee_quote(
+            order,
+            quote_amount,
+            symbol,
+            price,
+        )
+
+        entry_quote_total = to_float(
+            position.get("quote_amount"),
+            0.0,
+        )
+        fee_buy_total = to_float(
+            position.get("fees_buy_quote"),
+            0.0,
+        )
+        fraction = min(
+            1.0,
+            filled_amount / max(tracked_amount, 1e-12),
+        )
+        allocated_entry_quote = entry_quote_total * fraction
+        allocated_buy_fee = fee_buy_total * fraction
+
+        net_pnl_quote = (
+            quote_amount
+            - fee_sell_quote
+            - allocated_entry_quote
+            - allocated_buy_fee
+        )
+        holding_time_min = minutes_since(
+            float(
+                position.get(
+                    "opened_at",
+                    utc_now_ts(),
+                )
+            )
+        )
+
+        resolved_reference_bid = to_float(
+            reference_bid,
+            fallback_price,
+        )
+        resolved_spread_pct = to_float(
+            spread_pct,
+            0.0,
+        )
+
+        if not self.dry_run:
+            self.canary_close_event(
+                symbol=symbol,
+                position=position,
+                reason=reason,
+                order=order,
+                filled_amount=filled_amount,
+                exit_quote_actual=quote_amount,
+                sell_fee_quote=fee_sell_quote,
+                actual_net_pnl_quote=net_pnl_quote,
+                holding_time_min=holding_time_min,
+                reference_bid=resolved_reference_bid,
+                sell_spread_pct=resolved_spread_pct,
+                recovered=recovered,
+            )
+
+        self.state["pnl_quote"] = (
+            to_float(
+                self.state.get("pnl_quote"),
+                0.0,
+            )
+            + net_pnl_quote
+        )
+        self.state["trades"] = int(
+            self.state.get("trades", 0)
+        ) + 1
+        if net_pnl_quote > 0:
+            self.state["wins"] = int(
+                self.state.get("wins", 0)
+            ) + 1
+
+        remaining_amount = max(
+            0.0,
+            tracked_amount - filled_amount,
+        )
+
+        if (
+            remaining_amount > tolerance
+            and fraction < 0.999999
+        ):
+            position["amount"] = remaining_amount
+            position["quote_amount"] = max(
+                0.0,
+                entry_quote_total - allocated_entry_quote,
+            )
+            position["fees_buy_quote"] = max(
+                0.0,
+                fee_buy_total - allocated_buy_fee,
+            )
+            self.state.setdefault(
+                "positions",
+                {},
+            )[symbol] = position
+            LOG.warning(
+                "GEDEELTELIJKE VERKOOP %s | verkocht=%s | resterend=%s | recovery=%s",
+                symbol,
+                filled_amount,
+                remaining_amount,
+                recovered,
+            )
+        else:
+            self.state.setdefault(
+                "positions",
+                {},
+            ).pop(symbol, None)
+            self.state.setdefault(
+                "cooldown",
+                {},
+            )[symbol] = utc_now_ts()
+
+        if self.dry_run:
+            current_simulated = to_float(
+                self.state.get("simulated_free_quote"),
+                0.0,
+            )
+            self.state["simulated_free_quote"] = (
+                current_simulated
+                + quote_amount
+                - fee_sell_quote
+            )
+
+        if pending_order_key:
+            self.state.get(
+                "pending_orders",
+                {},
+            ).pop(
+                pending_order_key,
+                None,
+            )
+            self.clear_recovery_if_safe()
+
+        # Positie/PnL + pending verwijderen vormen één atomische state-save.
+        save_state(
+            self.state_file,
+            self.state,
+        )
+        self.refresh_balance_cache()
+
+        if spread_pct is None:
+            spread_pct = 0.0
+
+        append_trade_csv(
+            self.trades_file,
+            {
+                "ts": now_iso(),
+                "market": symbol,
+                "side": "SELL",
+                "price": round(price, 12),
+                "base_amount": filled_amount,
+                "quote_amount": round(quote_amount, 8),
+                "fees_quote": round(fee_sell_quote, 8),
+                "spread_pct": round(float(spread_pct), 6),
+                "net_pnl_quote": round(net_pnl_quote, 8),
+                "holding_time_min": round(holding_time_min, 2),
+                "reason": reason,
+                "dry_run": self.dry_run,
+            },
+        )
+
+        LOG.info(
+            "VERKOOP %s | reden=%s prijs=%.8f amount=%s "
+            "netto_pnl=%+.4f %s dry=%s recovery=%s",
+            symbol,
+            reason,
+            price,
+            filled_amount,
+            net_pnl_quote,
+            self.quote,
+            self.dry_run,
+            recovered,
+        )
+
+        return {
+            "price": price,
+            "filled_amount": filled_amount,
+            "quote_amount": quote_amount,
+            "fee_sell_quote": fee_sell_quote,
+            "net_pnl_quote": net_pnl_quote,
+            "remaining_amount": remaining_amount,
+        }
+
+    def recover_sell_from_pending(
+        self,
+        order_key: str,
+        record: Dict[str, Any],
+        order: Dict[str, Any],
+    ) -> bool:
+        symbol = str(record.get("symbol") or "")
+        if not symbol:
+            return False
+
+        position = (
+            self.state.get("positions", {})
+            .get(symbol)
+        )
+        if (
+            not isinstance(position, dict)
+            or not to_bool(
+                position.get("opened_by_bot"),
+                False,
+            )
+        ):
+            self.state["recovery_required"] = True
+            self.state["recovery_reason"] = (
+                f"RECOVERY_REQUIRED:sell_position_missing:{symbol}"
+            )
+            save_state(self.state_file, self.state)
+            return False
+
+        intended_amount = to_float(
+            record.get("intended_amount"),
+            0.0,
+        )
+        fallback_price = to_float(
+            record.get("reference_bid"),
+            to_float(
+                order.get("average")
+                or order.get("price"),
+                0.0,
+            ),
+        )
+
+        self.apply_confirmed_sell_fill(
+            symbol=symbol,
+            position=position,
+            reason=str(record.get("reason") or "sell_recovery"),
+            order=order,
+            fallback_price=fallback_price,
+            fallback_amount=intended_amount,
+            pending_order_key=order_key,
+            spread_pct=to_float(
+                record.get("execution_spread_pct"),
+                to_float(record.get("spread_pct"), 0.0),
+            ),
+            reference_bid=to_float(
+                record.get("reference_bid"),
+                fallback_price,
+            ),
+            recovered=True,
+        )
+
+        LOG.warning(
+            "RECOVERY VERKOOP HERSTELD | %s | key=%s | order=%s",
+            symbol,
+            order_key,
+            order.get("id") or record.get("exchange_order_id"),
+        )
+        return True
+
     def reconcile_pending_orders(self) -> None:
         pending = self.state.get("pending_orders") or {}
         if not pending:
             return
 
-        # Een pending live-order is altijd een recovery gate. Zolang niet
-        # eenduidig bekend is wat Bitvavo heeft gedaan, geen nieuwe entries.
+        # Iedere pending live-order is een recovery gate. Nieuwe entries blijven
+        # geblokkeerd totdat BUY of SELL eenduidig met Bitvavo is vergeleken.
         self.state["recovery_required"] = True
         self.state["recovery_reason"] = "RECOVERY_REQUIRED:pending_order"
         save_state(self.state_file, self.state)
@@ -981,17 +1697,25 @@ class Bot:
 
         for order_key, record in list(pending.items()):
             if not isinstance(record, dict):
+                self.state["recovery_reason"] = (
+                    f"RECOVERY_REQUIRED:pending_invalid:{order_key}"
+                )
+                changed = True
                 continue
 
             symbol = str(record.get("symbol") or "")
-            status = str(
-                record.get("status")
-                or ""
-            ).upper()
+            side = str(record.get("side") or "buy").lower()
+            status = str(record.get("status") or "").upper()
 
-            # PREPARED betekent: state was opgeslagen, maar de code had de
-            # order nog niet gemarkeerd als SUBMITTING. Er is dus nog geen
-            # create_order gestart en deze entry kan veilig opnieuw ontstaan.
+            if side not in {"buy", "sell"}:
+                self.state["recovery_reason"] = (
+                    f"RECOVERY_REQUIRED:pending_side_invalid:{order_key}"
+                )
+                changed = True
+                continue
+
+            # PREPARED is vóór SUBMITTING atomair opgeslagen. create_order was
+            # dus aantoonbaar nog niet gestart en de record mag veilig weg.
             if status == "PREPARED":
                 pending.pop(order_key, None)
                 changed = True
@@ -1001,8 +1725,13 @@ class Bot:
                 self.state.get("positions", {})
                 .get(symbol)
             )
+
+            # Alleen voor BUY bewijst een bestaande botpositie dat de lokale
+            # position-save al klaar was. Voor SELL is juist het verdwijnen of
+            # verkleinen van de positie onderdeel van de te herstellen actie.
             if (
-                isinstance(existing, dict)
+                side == "buy"
+                and isinstance(existing, dict)
                 and to_bool(
                     existing.get("opened_by_bot"),
                     False,
@@ -1020,6 +1749,7 @@ class Bot:
                 self.state["recovery_reason"] = (
                     f"RECOVERY_REQUIRED:pending_invalid:{order_key}"
                 )
+                changed = True
                 continue
 
             try:
@@ -1029,22 +1759,26 @@ class Bot:
                 )
             except Exception as exc:
                 self.state["recovery_reason"] = (
-                    f"RECOVERY_REQUIRED:exchange_unavailable:{type(exc).__name__}"
+                    "RECOVERY_REQUIRED:exchange_unavailable:"
+                    f"{type(exc).__name__}"
                 )
                 LOG.error(
-                    "RECOVERY ordercontrole mislukt | %s | %s",
+                    "RECOVERY ordercontrole mislukt | %s | %s | %s",
+                    side.upper(),
                     symbol,
                     exc,
                 )
+                changed = True
                 continue
 
             if order is None:
-                # SUBMITTING is bewust conservatief: een netwerkfout kan zijn
-                # opgetreden nadat Bitvavo de order al accepteerde. Niet
-                # automatisch opnieuw versturen.
+                # SUBMITTING blijft bewust ambigu: nooit opnieuw verzenden als
+                # Bitvavo de request mogelijk wel heeft ontvangen.
                 self.state["recovery_reason"] = (
-                    f"RECOVERY_REQUIRED:order_not_found:{client_order_id}"
+                    "RECOVERY_REQUIRED:order_not_found:"
+                    f"{client_order_id}"
                 )
+                changed = True
                 continue
 
             record["exchange_order_id"] = (
@@ -1067,11 +1801,21 @@ class Bot:
             }
 
             if terminal and filled > 0:
-                if self.recover_position_from_pending(
-                    order_key,
-                    record,
-                    order,
-                ):
+                recovered_ok = False
+                if side == "sell":
+                    recovered_ok = self.recover_sell_from_pending(
+                        order_key,
+                        record,
+                        order,
+                    )
+                else:
+                    recovered_ok = self.recover_position_from_pending(
+                        order_key,
+                        record,
+                        order,
+                    )
+
+                if recovered_ok:
                     changed = True
                 continue
 
@@ -1080,8 +1824,8 @@ class Bot:
                 changed = True
                 continue
 
-            # Open/partieel uitgevoerde orders blijven pending en blokkeren
-            # nieuwe entries totdat een volgende cycle de eindstatus ziet.
+            # Open/partieel uitgevoerde BUY of SELL blijft pending. Daardoor
+            # kunnen noch een dubbele BUY noch een tweede SELL ontstaan.
             record["status"] = (
                 order_status.upper()
                 if order_status
@@ -1090,7 +1834,8 @@ class Bot:
             record["filled_amount"] = filled
             record["updated_at"] = now_iso()
             self.state["recovery_reason"] = (
-                f"RECOVERY_REQUIRED:order_open:{client_order_id}"
+                "RECOVERY_REQUIRED:order_open:"
+                f"{client_order_id}"
             )
             changed = True
 
@@ -3519,14 +4264,29 @@ class Bot:
                     ),
                     "currency": self.quote,
                 },
+                "_diamond_reference_ask": ask,
+                "_diamond_execution_spread_pct": self.estimate_spread_pct(ticker),
             }
 
-        # Alle lokale ordervalidatie is nu afgerond. Pas vlak vóór de
-        # exchange-call wordt PREPARED -> SUBMITTING atomair opgeslagen.
+        execution_spread_pct = self.estimate_spread_pct(ticker)
+
+        # Referentie wordt vlak vóór submit persistent opgeslagen.
         if order_key:
+            record = (
+                self.state.get("pending_orders", {})
+                .get(order_key)
+            )
+            if isinstance(record, dict):
+                record["reference_ask"] = ask
+                record["execution_spread_pct"] = execution_spread_pct
+                record["reference_ask_at"] = now_iso()
+                save_state(self.state_file, self.state)
+
+            # Alle lokale ordervalidatie is nu afgerond. Pas vlak vóór de
+            # exchange-call wordt PREPARED -> SUBMITTING atomair opgeslagen.
             self.mark_pending_submitting(order_key)
 
-        return self.exchange.create_order(
+        order = self.exchange.create_order(
             symbol,
             "market",
             "buy",
@@ -3534,23 +4294,89 @@ class Bot:
             None,
             self.order_params(client_order_id),
         )
+        if isinstance(order, dict):
+            order = dict(order)
+            order["_diamond_reference_ask"] = ask
+            order["_diamond_execution_spread_pct"] = execution_spread_pct
+        return order
 
-    def place_market_sell(self, symbol: str, amount: float) -> Dict[str, Any]:
-        amount = self.amount_to_precision_safe(symbol, amount)
+    def place_market_sell(
+        self,
+        symbol: str,
+        amount: float,
+        client_order_id: Optional[str] = None,
+        order_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        amount = self.amount_to_precision_safe(
+            symbol,
+            amount,
+        )
         if amount <= 0:
             raise ValueError("Verkoop amount is 0.")
+
         ticker = self.get_ticker(symbol)
         bid = to_float(ticker.get("bid"), 0.0)
         if bid <= 0:
             raise ValueError(f"Geen geldige bid voor {symbol}")
+
         if self.dry_run:
             est_quote = amount * bid
             return {
-                "id": f"drysell-{int(time.time())}", "symbol": symbol, "price": bid,
-                "amount": amount, "filled": amount, "cost": est_quote,
-                "fee": {"cost": est_quote * (to_float(get_cfg(self.cfg, "taker_fee_pct", 0.25), 0.25) / 100.0), "currency": self.quote},
+                "id": f"drysell-{int(time.time())}",
+                "symbol": symbol,
+                "price": bid,
+                "amount": amount,
+                "filled": amount,
+                "cost": est_quote,
+                "fee": {
+                    "cost": est_quote * (
+                        to_float(
+                            get_cfg(
+                                self.cfg,
+                                "taker_fee_pct",
+                                0.25,
+                            ),
+                            0.25,
+                        )
+                        / 100.0
+                    ),
+                    "currency": self.quote,
+                },
+                "_diamond_reference_bid": bid,
+                "_diamond_execution_spread_pct": self.estimate_spread_pct(ticker),
             }
-        return self.exchange.create_order(symbol, "market", "sell", amount, None, self.order_params())
+
+        execution_spread_pct = self.estimate_spread_pct(ticker)
+
+        # Referentie wordt vlak vóór submit persistent opgeslagen.
+        if order_key:
+            record = (
+                self.state.get("pending_orders", {})
+                .get(order_key)
+            )
+            if isinstance(record, dict):
+                record["reference_bid"] = bid
+                record["execution_spread_pct"] = execution_spread_pct
+                record["reference_bid_at"] = now_iso()
+                save_state(self.state_file, self.state)
+
+            # Net als BUY: pas direct vóór de exchange-call PREPARED ->
+            # SUBMITTING atomair opslaan. Een crash daarna wordt recovery.
+            self.mark_pending_submitting(order_key)
+
+        order = self.exchange.create_order(
+            symbol,
+            "market",
+            "sell",
+            amount,
+            None,
+            self.order_params(client_order_id),
+        )
+        if isinstance(order, dict):
+            order = dict(order)
+            order["_diamond_reference_bid"] = bid
+            order["_diamond_execution_spread_pct"] = execution_spread_pct
+        return order
 
     def try_buy_symbol(
         self,
@@ -3757,6 +4583,36 @@ class Bot:
                     status="SUBMITTED",
                 )
 
+            reference_ask = to_float(
+                raw_order.get("_diamond_reference_ask"),
+                to_float(ticker.get("ask"), 0.0),
+            )
+            execution_spread_pct = to_float(
+                raw_order.get("_diamond_execution_spread_pct"),
+                spread_pct,
+            )
+            canary_trade_number = 0
+            if not self.dry_run and order_key:
+                pending_record = (
+                    self.state.get("pending_orders", {})
+                    .get(order_key)
+                )
+                if isinstance(pending_record, dict):
+                    reference_ask = to_float(
+                        pending_record.get("reference_ask"),
+                        reference_ask,
+                    )
+                    execution_spread_pct = to_float(
+                        pending_record.get("execution_spread_pct"),
+                        execution_spread_pct,
+                    )
+                    canary_trade_number = int(
+                        to_float(
+                            pending_record.get("canary_trade_number"),
+                            0,
+                        )
+                    )
+
             fallback_price = to_float(
                 raw_order.get("average")
                 or raw_order.get("price")
@@ -3794,6 +4650,11 @@ class Bot:
                 order,
                 quote_amount,
                 symbol,
+                price,
+            )
+            buy_slippage_pct = execution_slippage_pct(
+                "buy",
+                reference_ask,
                 price,
             )
 
@@ -3873,6 +4734,14 @@ class Bot:
                     if not self.dry_run
                     else None
                 ),
+                "canary_trade_number": (
+                    canary_trade_number
+                    if not self.dry_run
+                    else 0
+                ),
+                "entry_reference_ask": reference_ask,
+                "entry_slippage_pct": buy_slippage_pct,
+                "entry_spread_pct": execution_spread_pct,
             }
 
             if not self.dry_run and order_key:
@@ -3922,6 +4791,13 @@ class Bot:
                 },
             )
 
+            if not self.dry_run:
+                self.canary_open_event(
+                    symbol,
+                    self.state["positions"][symbol],
+                    recovered=False,
+                )
+
             LOG.info(
                 "KOOP %s | prijs=%.8f amount=%s quote=%.2f %s "
                 "nieuws=%.2f fg=%s tech=%.2f rsi=%.2f "
@@ -3960,7 +4836,12 @@ class Bot:
                 exc,
             )
 
-    def try_sell_symbol(self, symbol: str, position: Dict[str, Any], reason: str) -> None:
+    def try_sell_symbol(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+        reason: str,
+    ) -> None:
         # Coins die niet door de bot zijn gekocht worden nooit verkocht.
         if not to_bool(position.get("opened_by_bot"), False):
             LOG.info(
@@ -3969,14 +4850,39 @@ class Bot:
             )
             return
 
+        order_key: Optional[str] = None
+        client_order_id: Optional[str] = None
+
         try:
-            tracked_amount = to_float(position.get("amount"), 0.0)
+            tracked_amount = to_float(
+                position.get("amount"),
+                0.0,
+            )
             if tracked_amount <= 0:
-                raise RuntimeError(f"Geen geldige bot-hoeveelheid voor {symbol}")
+                raise RuntimeError(
+                    f"Geen geldige bot-hoeveelheid voor {symbol}"
+                )
 
             sell_amount = tracked_amount
 
             if not self.dry_run:
+                # Een bestaande pending SELL voor dit symbool is altijd eerst
+                # recovery. Nooit een tweede verkoop sturen.
+                existing_pending_sell = self.pending_sell_for_symbol(
+                    symbol
+                )
+                if existing_pending_sell is not None:
+                    self.set_recovery_required(
+                        "RECOVERY_REQUIRED:duplicate_pending_sell:"
+                        f"{symbol}"
+                    )
+                    LOG.error(
+                        "VERKOOP GEBLOKKEERD %s | pending SELL bestaat al | key=%s",
+                        symbol,
+                        existing_pending_sell.get("order_key"),
+                    )
+                    return
+
                 self.refresh_balance_cache()
                 base_asset = symbol.split("/")[0].upper()
                 free_base = self.asset_balance(base_asset)
@@ -3985,11 +4891,20 @@ class Bot:
                     0.0,
                 )
 
-                # Alleen de hoeveelheid boven het vóór de botkoop aanwezige saldo
-                # mag worden verkocht. Handmatig bezit blijft daardoor beschermd.
-                bot_owned_available = max(0.0, free_base - protected_base)
-                sell_amount = min(tracked_amount, bot_owned_available)
-                sell_amount = self.amount_to_precision_safe(symbol, sell_amount)
+                # Alleen de hoeveelheid boven het vóór de botkoop aanwezige
+                # saldo mag worden verkocht. Handmatig bezit blijft beschermd.
+                bot_owned_available = max(
+                    0.0,
+                    free_base - protected_base,
+                )
+                sell_amount = min(
+                    tracked_amount,
+                    bot_owned_available,
+                )
+                sell_amount = self.amount_to_precision_safe(
+                    symbol,
+                    sell_amount,
+                )
 
                 if sell_amount <= 0:
                     LOG.error(
@@ -4002,9 +4917,109 @@ class Bot:
                     )
                     return
 
-            raw_order = self.place_market_sell(symbol, sell_amount)
-            ticker = self.get_ticker(symbol)
-            fallback_price = to_float(ticker.get("bid"), 0.0)
+                order_key = self.sell_order_key(
+                    symbol,
+                    position,
+                    reason,
+                    sell_amount,
+                )
+                pending = self.state.get("pending_orders") or {}
+                if order_key in pending:
+                    self.set_recovery_required(
+                        "RECOVERY_REQUIRED:duplicate_pending_sell:"
+                        f"{order_key}"
+                    )
+                    return
+
+                record = self.prepare_pending_sell_order(
+                    order_key,
+                    symbol,
+                    position,
+                    reason,
+                    sell_amount,
+                )
+                client_order_id = str(
+                    record.get("clientOrderId")
+                    or ""
+                )
+
+            try:
+                raw_order = self.place_market_sell(
+                    symbol,
+                    sell_amount,
+                    client_order_id=client_order_id,
+                    order_key=order_key,
+                )
+            except Exception:
+                if not self.dry_run and order_key:
+                    record = (
+                        self.state.get("pending_orders", {})
+                        .get(order_key)
+                    )
+                    status = str(
+                        (record or {}).get("status")
+                        or ""
+                    ).upper()
+
+                    if status == "PREPARED":
+                        # create_order is aantoonbaar nog niet gestart.
+                        self.abandon_pending_after_confirmed_rejection(
+                            order_key,
+                            "lokale_validatie_voor_sell_submit",
+                        )
+                    else:
+                        # SUBMITTING is ambigu: niet opnieuw verkopen.
+                        self.set_recovery_required(
+                            "RECOVERY_REQUIRED:sell_submit_ambiguous:"
+                            f"{order_key}"
+                        )
+                raise
+
+            if not self.dry_run and order_key:
+                self.update_pending_from_order(
+                    order_key,
+                    raw_order,
+                    status="SUBMITTED",
+                )
+
+            reference_bid = to_float(
+                raw_order.get("_diamond_reference_bid"),
+                0.0,
+            )
+            execution_spread_pct = to_float(
+                raw_order.get("_diamond_execution_spread_pct"),
+                0.0,
+            )
+
+            if not self.dry_run and order_key:
+                record = (
+                    self.state.get("pending_orders", {})
+                    .get(order_key)
+                )
+                if isinstance(record, dict):
+                    reference_bid = to_float(
+                        record.get("reference_bid"),
+                        reference_bid,
+                    )
+                    execution_spread_pct = to_float(
+                        record.get("execution_spread_pct"),
+                        execution_spread_pct,
+                    )
+
+            if reference_bid <= 0:
+                ticker = self.get_ticker(symbol)
+                reference_bid = to_float(
+                    ticker.get("bid"),
+                    0.0,
+                )
+                if execution_spread_pct <= 0:
+                    execution_spread_pct = self.estimate_spread_pct(
+                        ticker
+                    )
+
+            fallback_price = reference_bid
+            spread_pct = execution_spread_pct
+
             order = self.resolve_order_fill(
                 symbol,
                 raw_order,
@@ -4012,98 +5027,38 @@ class Bot:
                 fallback_amount=sell_amount,
             )
 
-            price = to_float(order.get("average"), fallback_price)
-            filled_amount = to_float(order.get("filled"), sell_amount)
-            quote_amount = to_float(order.get("cost"), filled_amount * price)
-            fee_sell_quote = self.order_fee_quote(order, quote_amount, symbol, price)
+            if not self.dry_run and order_key:
+                # Eerst bevestigde SELL-fill bewaren. Crasht Render vóór de
+                # positie/PnL-save, dan reconstrueert recovery exact deze fill.
+                self.update_pending_from_order(
+                    order_key,
+                    order,
+                    status="FILLED_CONFIRMED",
+                )
 
-            entry_quote_total = to_float(position.get("quote_amount"), 0.0)
-            fee_buy_total = to_float(position.get("fees_buy_quote"), 0.0)
-            fraction = min(1.0, filled_amount / max(tracked_amount, 1e-12))
-            allocated_entry_quote = entry_quote_total * fraction
-            allocated_buy_fee = fee_buy_total * fraction
-
-            net_pnl_quote = (
-                quote_amount
-                - fee_sell_quote
-                - allocated_entry_quote
-                - allocated_buy_fee
+            self.apply_confirmed_sell_fill(
+                symbol=symbol,
+                position=position,
+                reason=reason,
+                order=order,
+                fallback_price=fallback_price,
+                fallback_amount=sell_amount,
+                pending_order_key=(
+                    order_key
+                    if not self.dry_run
+                    else None
+                ),
+                spread_pct=spread_pct,
+                reference_bid=reference_bid,
+                recovered=False,
             )
-            holding_time_min = minutes_since(
-                float(position.get("opened_at", utc_now_ts()))
-            )
 
-            self.state["pnl_quote"] = (
-                to_float(self.state.get("pnl_quote"), 0.0)
-                + net_pnl_quote
-            )
-            self.state["trades"] = int(self.state.get("trades", 0)) + 1
-            if net_pnl_quote > 0:
-                self.state["wins"] = int(self.state.get("wins", 0)) + 1
-
-            remaining_amount = max(0.0, tracked_amount - filled_amount)
-
-            if remaining_amount > 0 and fraction < 0.999999:
-                position["amount"] = remaining_amount
-                position["quote_amount"] = max(
-                    0.0,
-                    entry_quote_total - allocated_entry_quote,
-                )
-                position["fees_buy_quote"] = max(
-                    0.0,
-                    fee_buy_total - allocated_buy_fee,
-                )
-                self.state["positions"][symbol] = position
-                LOG.warning(
-                    "GEDEELTELIJKE VERKOOP %s | verkocht=%s | resterend=%s",
-                    symbol,
-                    filled_amount,
-                    remaining_amount,
-                )
-            else:
-                self.state["positions"].pop(symbol, None)
-                self.state["cooldown"][symbol] = utc_now_ts()
-
-            if self.dry_run:
-                current_simulated = to_float(
-                    self.state.get("simulated_free_quote"),
-                    0.0,
-                )
-                self.state["simulated_free_quote"] = (
-                    current_simulated + quote_amount - fee_sell_quote
-                )
-
-            save_state(self.state_file, self.state)
-            self.refresh_balance_cache()
-
-            spread_pct = self.estimate_spread_pct(ticker)
-            append_trade_csv(self.trades_file, {
-                "ts": now_iso(),
-                "market": symbol,
-                "side": "SELL",
-                "price": round(price, 12),
-                "base_amount": filled_amount,
-                "quote_amount": round(quote_amount, 8),
-                "fees_quote": round(fee_sell_quote, 8),
-                "spread_pct": round(spread_pct, 6),
-                "net_pnl_quote": round(net_pnl_quote, 8),
-                "holding_time_min": round(holding_time_min, 2),
-                "reason": reason,
-                "dry_run": self.dry_run,
-            })
-
-            LOG.info(
-                "VERKOOP %s | reden=%s prijs=%.8f amount=%s netto_pnl=%+.4f %s dry=%s",
-                symbol,
-                reason,
-                price,
-                filled_amount,
-                net_pnl_quote,
-                self.quote,
-                self.dry_run,
-            )
         except Exception as exc:
-            LOG.exception("VERKOOP mislukt voor %s: %s", symbol, exc)
+            LOG.exception(
+                "VERKOOP mislukt voor %s: %s",
+                symbol,
+                exc,
+            )
 
     def manage_open_positions(self) -> None:
         positions = list((self.state.get("positions") or {}).items())
@@ -4809,7 +5764,7 @@ def main() -> None:
     cfg = load_yaml(cfg_path)
     setup_logging(str(get_cfg(cfg, "log_level", "INFO")))
     bot = Bot(cfg)
-    LOG.info("Diamond Bot v6.5 gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
+    LOG.info("Diamond Bot v6.7 gestart | dry_run=%s | state=%s | trades=%s | control=%s", bot.dry_run, bot.state_file, bot.trades_file, bot.control_file)
     bot.run_forever()
 
 
