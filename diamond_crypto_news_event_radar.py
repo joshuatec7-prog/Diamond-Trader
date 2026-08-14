@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "1.0"
+VERSION = "1.1"
 DATA = Path("/var/data")
 UNIVERSE_PATH = DATA / "diamond_dynamic_universe.json"
 OUTPUT_PATH = DATA / "diamond_crypto_news_events.json"
@@ -288,26 +288,48 @@ def name_is_usable(name: str) -> bool:
 
 
 def symbol_mention_score(text: str, symbol: str) -> int:
-    # Sterke vormen.
     escaped = re.escape(symbol)
-    if re.search(rf"\${escaped}\b", text, flags=re.IGNORECASE):
+
+    # Expliciete ticker-vormen blijven altijd geldig.
+    if re.search(rf"\${escaped}(?![A-Za-z0-9])", text, flags=re.IGNORECASE):
         return 5
     if re.search(rf"\({escaped}\)", text):
         return 5
-    if re.search(rf"\b{escaped}[-/]EUR\b", text, flags=re.IGNORECASE):
+    if re.search(
+        rf"(?<![A-Za-z0-9]){escaped}[-/]EUR(?![A-Za-z0-9])",
+        text,
+        flags=re.IGNORECASE,
+    ):
         return 5
 
-    # Voor ambigue symbolen eisen we expliciete hoofdletters.
+    # 1- en 2-letter tickers zijn te ambigu als los woord.
+    # Voorbeeld: U-EUR mag niet matchen op "U.S.".
+    # Ze kunnen nog wel via de volledige assetnaam in detect_assets().
+    if len(symbol) <= 2:
+        return 0
+
+    # Bekende ambigue symbolen: alleen expliciete uppercase token.
     if symbol in AMBIGUOUS_SYMBOLS:
-        return 3 if re.search(rf"\b{escaped}\b", text) else 0
+        return 3 if re.search(
+            rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])",
+            text,
+        ) else 0
 
-    # Niet-ambigue symbolen: uppercase token of case-insensitive voor symbolen >=4.
-    if re.search(rf"\b{escaped}\b", text):
+    # Overige tickers.
+    if re.search(
+        rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])",
+        text,
+    ):
         return 4
-    if len(symbol) >= 4 and re.search(rf"\b{escaped}\b", text, flags=re.IGNORECASE):
-        return 2
-    return 0
 
+    if len(symbol) >= 4 and re.search(
+        rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return 2
+
+    return 0
 
 def detect_assets(text: str, assets: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     found: List[Dict[str, Any]] = []
