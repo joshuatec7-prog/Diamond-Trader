@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Trader Periodic Analysis Runner v2.0
+Diamond Trader Periodic Analysis Runner v2.1
 
 Geheugenarme, sequentiële uitvoering van:
 1. Diamond Diagnose: exact één ronde met closed-candlecorrectie.
@@ -38,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-VERSION = "2.0"
+VERSION = "2.1"
 MODE = "SEQUENTIAL_PERIODIC_ANALYSIS"
 
 PROJECT_DIR = Path("/opt/render/project/src")
@@ -223,6 +223,8 @@ def default_state() -> Dict[str, Any]:
         "last_cycle_started_at": None,
         "last_cycle_completed_at": None,
         "next_cycle_not_before": None,
+        "list4_last_refresh_cycle": None,
+        "list4_last_refresh_at": None,
         "tasks": {
             name: default_task(command)
             for name, command in commands.items()
@@ -369,14 +371,25 @@ def run_task(
 
 def list4_refresh_due(state: Dict[str, Any]) -> bool:
     """
-    Eerste cyclus meteen verversen; daarna elke 4 cycli (~1 uur).
-    Event-outcome zelf draait iedere cyclus om 1h/4h/12h checkpoints
-    zo dicht mogelijk bij hun horizon te vullen.
+    v2.1:
+    - als nog nooit een succesvolle Lijst-4 refresh is geregistreerd: NU draaien;
+    - daarna opnieuw zodra minimaal 4 runner-cycli verstreken zijn (~1 uur).
+
+    Hierdoor blokkeert een oude/persistente cycle_count de eerste refresh
+    na introductie van deze taken niet meer.
     """
     cycle_count = int(state.get("cycle_count", 0) or 0)
-    if cycle_count <= 1:
+    last_cycle = state.get("list4_last_refresh_cycle")
+
+    if last_cycle is None:
         return True
-    return ((cycle_count - 1) % LIST4_REFRESH_EVERY_CYCLES) == 0
+
+    try:
+        last_cycle = int(last_cycle)
+    except (TypeError, ValueError):
+        return True
+
+    return (cycle_count - last_cycle) >= LIST4_REFRESH_EVERY_CYCLES
 
 
 def run_forever() -> None:
@@ -523,45 +536,62 @@ def run_forever() -> None:
             break
 
         if list4_refresh_due(state):
-            run_task(
-                state,
-                "list4_fusion",
-                task_commands()["list4_fusion"],
-                LIST4_FUSION_LOG,
+            list4_exit_codes = []
+
+            list4_exit_codes.append(
+                run_task(
+                    state,
+                    "list4_fusion",
+                    task_commands()["list4_fusion"],
+                    LIST4_FUSION_LOG,
+                )
             )
 
             if STOP_REQUESTED:
                 break
 
-            run_task(
-                state,
-                "list4_admission",
-                task_commands()["list4_admission"],
-                LIST4_ADMISSION_LOG,
+            list4_exit_codes.append(
+                run_task(
+                    state,
+                    "list4_admission",
+                    task_commands()["list4_admission"],
+                    LIST4_ADMISSION_LOG,
+                )
             )
 
             if STOP_REQUESTED:
                 break
 
-            run_task(
-                state,
-                "list4_deep_scan",
-                task_commands()["list4_deep_scan"],
-                LIST4_DEEP_SCAN_LOG,
+            list4_exit_codes.append(
+                run_task(
+                    state,
+                    "list4_deep_scan",
+                    task_commands()["list4_deep_scan"],
+                    LIST4_DEEP_SCAN_LOG,
+                )
             )
 
             if STOP_REQUESTED:
                 break
 
-            run_task(
-                state,
-                "list4_multi_exchange",
-                task_commands()["list4_multi_exchange"],
-                LIST4_MULTI_EXCHANGE_LOG,
+            list4_exit_codes.append(
+                run_task(
+                    state,
+                    "list4_multi_exchange",
+                    task_commands()["list4_multi_exchange"],
+                    LIST4_MULTI_EXCHANGE_LOG,
+                )
             )
 
             if STOP_REQUESTED:
                 break
+
+            if all(code == 0 for code in list4_exit_codes):
+                state["list4_last_refresh_cycle"] = int(
+                    state.get("cycle_count", 0) or 0
+                )
+                state["list4_last_refresh_at"] = now_iso()
+                save_json_atomic(STATE_FILE, state)
 
         run_task(
             state,
@@ -639,7 +669,7 @@ def self_test() -> None:
     state = default_state()
     commands = task_commands()
 
-    assert state["version"] == "2.0"
+    assert state["version"] == "2.1"
     assert state["mode"] == MODE
     assert state["interval_seconds"] == 900
     assert state["list4_refresh_every_cycles"] == 4
@@ -790,9 +820,16 @@ def self_test() -> None:
     )
 
     # Cadence sanity-check.
-    assert list4_refresh_due({"cycle_count": 1}) is True
-    assert list4_refresh_due({"cycle_count": 2}) is False
-    assert list4_refresh_due({"cycle_count": 5}) is True
+    # Belangrijk: bestaande hoge cycle_count zonder last-refresh moet direct draaien.
+    assert list4_refresh_due({"cycle_count": 1346}) is True
+    assert list4_refresh_due({
+        "cycle_count": 1347,
+        "list4_last_refresh_cycle": 1346,
+    }) is False
+    assert list4_refresh_due({
+        "cycle_count": 1350,
+        "list4_last_refresh_cycle": 1346,
+    }) is True
 
     assert (
         state["tasks"]["scanner_session_shadow"]["command"][-3:]
