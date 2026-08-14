@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Trader Periodic Analysis Runner v1.6
+Diamond Trader Periodic Analysis Runner v1.8
 
 Geheugenarme, sequentiële uitvoering van:
 1. Diamond Diagnose: exact één ronde met closed-candlecorrectie.
@@ -10,9 +10,13 @@ Geheugenarme, sequentiële uitvoering van:
 5. LONG Min-Profit Shadow Lab: vergelijkt €1.00 / €0.50 / €0.25 netto minimumwinst.
 6. LONG Combo Shadow Lab: vergelijkt CURRENT / WAIT30_100 / WAIT30_050.
 7. Scanner Selective Shadow Lab: vergelijkt CURRENT / SELECTIVE / STRONG.
+8. Scanner Session Shadow Lab: volgt sessie-effecten research-only.
+9. SELECTIVE Prospective Candidate Tracker: vergelijkt vanaf vaste baseline
+   alleen NIEUWE gesloten SELECTIVE trades voor CURRENT / GUARDED_MIX /
+   RR_GE_140 / LONG_ALL.
 
 Belangrijk:
-- Alle zeven taken draaien strikt na elkaar en nooit tegelijk.
+- Alle tien taken draaien strikt na elkaar en nooit tegelijk.
 - De handelsbot, Agent, Supervisor en Strategy Lab blijven ongemoeid.
 - Deze runner plaatst zelf geen orders en wijzigt geen strategie-instellingen.
 - Alle drie LONG Shadow Labs gebruiken alleen publieke marktdata.
@@ -33,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-VERSION = "1.7"
+VERSION = "1.8"
 MODE = "SEQUENTIAL_PERIODIC_ANALYSIS"
 
 PROJECT_DIR = Path("/opt/render/project/src")
@@ -49,6 +53,7 @@ LONG_MIN_PROFIT_SHADOW_LOG = DATA_DIR / "diamond_long_min_profit_shadow_runner.l
 LONG_COMBO_SHADOW_LOG = DATA_DIR / "diamond_long_combo_shadow_runner.log"
 LONG_COMBO_SHADOW_V2_LOG = DATA_DIR / "diamond_long_combo_shadow_v2_runner.log"
 SCANNER_SELECTIVE_SHADOW_LOG = DATA_DIR / "diamond_scanner_selective_shadow_runner.log"
+SELECTIVE_PROSPECTIVE_CANDIDATE_LOG = DATA_DIR / "diamond_selective_prospective_candidate_runner.log"
 SCANNER_SESSION_SHADOW_LOG = DATA_DIR / "diamond_scanner_session_shadow_runner.log"
 
 INTERVAL_SECONDS = 15 * 60
@@ -154,6 +159,10 @@ def task_commands() -> Dict[str, list[str]]:
             "scanner_selective_shadow_lab.py",
             "--update",
             "--no-print",
+        ],
+        "selective_prospective_candidate": [
+            sys.executable,
+            "diamond_selective_prospective_candidate_tracker.py",
         ],
         "scanner_session_shadow": [
             sys.executable,
@@ -345,9 +354,9 @@ def run_forever() -> None:
     )
 
     print(
-        "Diamond Periodic Analysis Runner v1.6 gestart | "
-        "interval=900s | sequential=True | "
-        "tasks=diagnose,scanner,shadow_v2,long_entry_shadow,long_min_profit_shadow,long_combo_shadow,scanner_selective_shadow,scanner_session_shadow",
+        f"Diamond Periodic Analysis Runner v{VERSION} gestart | "
+        f"interval={INTERVAL_SECONDS}s | sequential=True | "
+        f"tasks={','.join(task_commands().keys())}",
         flush=True,
     )
 
@@ -446,6 +455,16 @@ def run_forever() -> None:
 
         run_task(
             state,
+            "selective_prospective_candidate",
+            task_commands()["selective_prospective_candidate"],
+            SELECTIVE_PROSPECTIVE_CANDIDATE_LOG,
+        )
+
+        if STOP_REQUESTED:
+            break
+
+        run_task(
+            state,
             "scanner_session_shadow",
             task_commands()["scanner_session_shadow"],
             SCANNER_SESSION_SHADOW_LOG,
@@ -510,7 +529,7 @@ def self_test() -> None:
     state = default_state()
     commands = task_commands()
 
-    assert state["version"] == "1.7"
+    assert state["version"] == "1.8"
     assert state["mode"] == MODE
     assert state["interval_seconds"] == 900
     assert state["sequential"] is True
@@ -524,6 +543,7 @@ def self_test() -> None:
         "long_combo_shadow",
         "long_combo_shadow_v2",
         "scanner_selective_shadow",
+        "selective_prospective_candidate",
         "scanner_session_shadow",
     ]
 
@@ -608,6 +628,16 @@ def self_test() -> None:
     )
 
     assert (
+        state["tasks"]["selective_prospective_candidate"]["command"][-1]
+        == "diamond_selective_prospective_candidate_tracker.py"
+    )
+
+    assert (
+        SELECTIVE_PROSPECTIVE_CANDIDATE_LOG.name
+        == "diamond_selective_prospective_candidate_runner.log"
+    )
+
+    assert (
         state["tasks"]["scanner_session_shadow"]["command"][-3:]
         == [
             "scanner_session_shadow_lab.py",
@@ -625,7 +655,8 @@ def self_test() -> None:
         "PERIODIC_ANALYSIS_SELF_TEST_OK"
     )
     print(
-        "Taken: diagnose -> scanner -> shadow_v2 -> long_entry_shadow -> long_min_profit_shadow -> long_combo_shadow -> scanner_selective_shadow -> scanner_session_shadow"
+        "Taken: "
+        + " -> ".join(task_commands().keys())
     )
     print(
         "Sequentieel: JA | Interval: 900 seconden"
