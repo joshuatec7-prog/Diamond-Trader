@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "1.1"
+VERSION = "1.2"
 DATA = Path("/var/data")
 UNIVERSE_PATH = DATA / "diamond_dynamic_universe.json"
 OUTPUT_PATH = DATA / "diamond_crypto_news_events.json"
@@ -277,13 +277,20 @@ def universe_assets(
 def name_is_usable(name: str) -> bool:
     clean = re.sub(r"[^a-z0-9 ]+", " ", name.lower())
     clean = re.sub(r"\s+", " ", clean).strip()
+
     if len(clean) < 4:
         return False
-    if clean in {
-        "gas", "magic", "move", "one", "safe", "super", "time",
-        "people", "city", "core", "mask", "portal",
-    }:
+
+    # Generieke woorden mogen nooit op assetnaam alléén een munt koppelen.
+    # Voorbeelden uit runtime: Four (FORM) in "Big Four", Near, Open, Rose, Bill.
+    generic_asset_names = {
+        "bill", "city", "core", "form", "four", "gas", "magic", "mask",
+        "move", "near", "one", "open", "people", "portal", "rare", "rose",
+        "safe", "sand", "spell", "super", "time",
+    }
+    if clean in generic_asset_names:
         return False
+
     return True
 
 
