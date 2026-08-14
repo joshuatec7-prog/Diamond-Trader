@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
-VERSION = "1.0"
+VERSION = "1.1"
 ROOT = Path(__file__).resolve().parent
 DATA = Path("/var/data")
 
@@ -119,20 +119,46 @@ def direction_relation(change_pct: float, impact_hint: str) -> str:
 
 
 def news_map(news: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Alleen MEDIUM/HIGH asset-matches mogen de fusion beïnvloeden.
+    LOW-confidence nieuws blijft zichtbaar in de News Radar, maar wordt hier
+    bewust genegeerd zodat gewone woorden/tickers geen research-kandidaat maken.
+    """
     result = {}
+
     for row in news.get("market_summary") or []:
         if not isinstance(row, dict):
             continue
+
         market = str(row.get("market") or "")
         if not market:
             continue
-        latest = row.get("latest") or []
-        first = latest[0] if latest and isinstance(latest[0], dict) else {}
+
+        latest = [
+            item for item in (row.get("latest") or [])
+            if isinstance(item, dict)
+            and str(item.get("mention_confidence") or "").upper()
+            in {"HIGH", "MEDIUM"}
+        ]
+
+        if not latest:
+            continue
+
+        latest.sort(
+            key=lambda item: to_float(item.get("event_score"), 0.0),
+            reverse=True,
+        )
+        first = latest[0]
+
         result[market] = {
-            "news_events": to_int(row.get("news_events"), 0),
-            "best_score": to_float(row.get("best_score"), 0.0),
-            "market_event_confirmed_by_news": bool(
-                row.get("market_event_confirmed_by_news")
+            "news_events": len(latest),
+            "best_score": max(
+                to_float(item.get("event_score"), 0.0)
+                for item in latest
+            ),
+            "market_event_confirmed_by_news": any(
+                bool(item.get("market_event_candidate"))
+                for item in latest
             ),
             "event_type": str(first.get("event_type") or "general_news"),
             "impact_hint": str(
@@ -145,8 +171,8 @@ def news_map(news: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 first.get("mention_confidence") or "UNKNOWN"
             ),
         }
-    return result
 
+    return result
 
 def market_component(row: Dict[str, Any]) -> float:
     # rank_score uit punt 1 is al gebaseerd op volume, spread en beweging.
