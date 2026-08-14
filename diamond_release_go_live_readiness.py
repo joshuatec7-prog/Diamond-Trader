@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Diamond Trader Release / Go-Live Readiness v1.2
+# Diamond Trader Release / Go-Live Readiness v1.3
 
 import hashlib
 import json
@@ -86,6 +86,19 @@ def config_value(cfg, dotted, default=None):
     return cur
 
 
+def as_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "ja", "on", "aan"}:
+        return True
+    if text in {"0", "false", "no", "nee", "off", "uit"}:
+        return False
+    return default
+
+
 manual_path = DATA / "diamond_manual_final_reviews.json"
 manual = load_json(manual_path)
 
@@ -109,7 +122,7 @@ def manual_review(key, base):
 
 
 print("=" * 80)
-print(" DIAMOND TRADER RELEASE / GO-LIVE READINESS v1.2")
+print(" DIAMOND TRADER RELEASE / GO-LIVE READINESS v1.3")
 print("=" * 80)
 
 gate = run(["python3", "diamond_decision_gate_v1_4.py"])
@@ -131,6 +144,7 @@ required = [
     "diamond_go_live_preflight.sh",
     "diamond_post_live_safety_rules.json",
     "DIAMOND_POST_LIVE_SAFETY_RUNBOOK.md",
+    "diamond_pre_canary_safety_matrix_test.py",
 ]
 
 for name in required:
@@ -337,13 +351,111 @@ print(
     f"Safety / Recovery | {safety_passed}/{max(7, safety_total)}"
 )
 
+bot_path = ROOT / "diamond_bot.py"
+try:
+    bot_source = bot_path.read_text(encoding="utf-8")
+except Exception:
+    bot_source = ""
+
+
+def source_has_all(tokens):
+    return bool(bot_source) and all(
+        token in bot_source
+        for token in tokens
+    )
+
+
+buy_recovery_ready = source_has_all(
+    [
+        "def prepare_pending_long_order(",
+        "def recover_position_from_pending(",
+        "def client_order_id_for_key(",
+        "def fetch_order_by_client_order_id(",
+    ]
+)
+
+sell_recovery_ready = source_has_all(
+    [
+        "def sell_order_key(",
+        "def prepare_pending_sell_order(",
+        "def recover_sell_from_pending(",
+        "def place_market_sell(",
+    ]
+)
+
+canary_logging_ready = source_has_all(
+    [
+        "CANARY_EXECUTION_CSV_COLUMNS",
+        "def canary_open_event(",
+        "def canary_close_event(",
+        "/var/data/diamond_canary_execution.csv",
+        "expected_net_pnl_quote",
+        "actual_net_pnl_quote",
+        "buy_order_id",
+        "sell_order_id",
+    ]
+)
+
+slippage_status_ready = source_has_all(
+    [
+        "def classify_slippage_status(",
+        "buy_slippage_status",
+        "sell_slippage_status",
+        "overall_status",
+        "STOP_CANDIDATE",
+    ]
+)
+
+matrix_script = ROOT / "diamond_pre_canary_safety_matrix_test.py"
+matrix_output = ""
+matrix_passed = 0
+matrix_total = 0
+
+if matrix_script.exists():
+    matrix_output = run(
+        ["python3", str(matrix_script)]
+    )
+    matrix_match = re.search(
+        r"TOTAL\s+(\d+)/(\d+)\s+PASS",
+        matrix_output,
+    )
+    if matrix_match:
+        matrix_passed = int(matrix_match.group(1))
+        matrix_total = int(matrix_match.group(2))
+
+pre_canary_matrix_ready = bool(
+    matrix_total >= 16
+    and matrix_passed == matrix_total
+)
+
+print(
+    f"[{'PASS' if buy_recovery_ready else 'WAIT'}] "
+    "BUY Recovery | persistent order identity"
+)
+print(
+    f"[{'PASS' if sell_recovery_ready else 'WAIT'}] "
+    "SELL Recovery | persistent order identity"
+)
+print(
+    f"[{'PASS' if canary_logging_ready else 'WAIT'}] "
+    "Canary Execution Logging | reference/fill/fee/PnL"
+)
+print(
+    f"[{'PASS' if slippage_status_ready else 'WAIT'}] "
+    "Slippage Status | OK/WARNING/HIGH/STOP_CANDIDATE"
+)
+print(
+    f"[{'PASS' if pre_canary_matrix_ready else 'WAIT'}] "
+    f"Pre-Canary Matrix | {matrix_passed}/{matrix_total or 16}"
+)
+
 config_path = ROOT / "config.yaml"
 try:
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
 except Exception:
     cfg = {}
 
-dry_run = bool(config_value(cfg, "risk.dry_run", True))
+dry_run = as_bool(config_value(cfg, "risk.dry_run", True), True)
 reserve = float(config_value(cfg, "risk.eur_reserve", 0) or 0)
 max_open = int(config_value(cfg, "risk.max_open_positions", 999) or 999)
 max_total = int(config_value(cfg, "trading.max_total_positions", 999) or 999)
@@ -388,6 +500,11 @@ canary_ready = bool(
     paper_ready
     and execution_status == "PASS"
     and safety_ready
+    and buy_recovery_ready
+    and sell_recovery_ready
+    and canary_logging_ready
+    and slippage_status_ready
+    and pre_canary_matrix_ready
     and not infra_fail
     and dry_run
     and reserve >= 250
@@ -407,6 +524,11 @@ live_active = bool(
     not dry_run
     and approval_ok
     and safety_ready
+    and buy_recovery_ready
+    and sell_recovery_ready
+    and canary_logging_ready
+    and slippage_status_ready
+    and pre_canary_matrix_ready
     and not pending
     and not recovery_required
 )
@@ -426,6 +548,18 @@ if not canary_ready:
     if not safety_ready:
         blockers.append(
             f"Safety {safety_passed}/{max(7, safety_total)}"
+        )
+    if not buy_recovery_ready:
+        blockers.append("BUY recovery niet PASS")
+    if not sell_recovery_ready:
+        blockers.append("SELL recovery niet PASS")
+    if not canary_logging_ready:
+        blockers.append("canary execution logging niet PASS")
+    if not slippage_status_ready:
+        blockers.append("slippage status niet PASS")
+    if not pre_canary_matrix_ready:
+        blockers.append(
+            f"pre-canary matrix {matrix_passed}/{matrix_total or 16}"
         )
     if infra_fail:
         blockers.append(
@@ -457,6 +591,13 @@ phase_status = {
     "execution_closed": execution_n,
     "safety_passed": safety_passed,
     "safety_total": max(7, safety_total),
+    "buy_recovery_ready": buy_recovery_ready,
+    "sell_recovery_ready": sell_recovery_ready,
+    "canary_logging_ready": canary_logging_ready,
+    "slippage_status_ready": slippage_status_ready,
+    "pre_canary_matrix_ready": pre_canary_matrix_ready,
+    "pre_canary_matrix_passed": matrix_passed,
+    "pre_canary_matrix_total": matrix_total or 16,
     "pending_orders": len(pending),
     "recovery_required": recovery_required,
 }

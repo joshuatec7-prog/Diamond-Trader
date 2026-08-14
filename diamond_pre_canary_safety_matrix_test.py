@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import sys, types, importlib.util, tempfile, json, os
 from pathlib import Path
 
@@ -10,7 +11,7 @@ ccxt.Exchange = Exchange
 ccxt.bitvavo = lambda *a, **k: None
 sys.modules['ccxt'] = ccxt
 
-MODULE_PATH = '/mnt/data/punt3/diamond_bot.py'
+MODULE_PATH = str(Path(__file__).resolve().with_name("diamond_bot.py"))
 spec = importlib.util.spec_from_file_location('diamond_bot_matrix', MODULE_PATH)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
