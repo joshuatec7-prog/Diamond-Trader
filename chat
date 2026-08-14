@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Diamond Trader cockpit v2.3
+# Diamond Trader cockpit v2.4
 # Compacte read-only status voor Render Shell.
 
 set -u
@@ -95,12 +95,10 @@ fi
 echo
 echo "=== CANARY LIVE ==="
 
-# Werk de canary-analyse veilig bij wanneer de helper beschikbaar is.
 if [ -f "$ROOT/diamond_canary_log_analyzer.py" ]; then
     python3 "$ROOT/diamond_canary_log_analyzer.py" >/dev/null 2>&1 || true
 fi
 
-# Werk de live safety-status veilig bij wanneer de helper beschikbaar is.
 if [ -f "$ROOT/diamond_live_safety_monitor.py" ]; then
     python3 "$ROOT/diamond_live_safety_monitor.py" >/dev/null 2>&1 || true
 fi
@@ -111,7 +109,6 @@ live_safety="$DATA/diamond_live_safety_status.json"
 python3 - "$canary_analysis" "$live_safety" <<'PY_CANARYLIVE'
 import json
 import math
-import os
 import sys
 
 analysis_path = sys.argv[1]
@@ -191,36 +188,19 @@ safety_status = str(
     or ("READY" if closed == 0 else "ONBEKEND")
 ).upper()
 
-print(
-    f"Canary trades : {closed}/{target} "
-    f"[{analysis_status}]"
-)
-print(
-    f"W/L/BE        : {wins}/{losses}/{breakeven}"
-)
-print(
-    f"Live PnL      : {eur(analysis.get('actual_net_pnl_quote'))}"
-)
-print(
-    f"PF            : {pf_text(analysis.get('profit_factor'))}"
-)
-print(
-    f"Fees          : {eur(analysis.get('total_fees_quote'))}"
-)
+print(f"Canary trades : {closed}/{target} [{analysis_status}]")
+print(f"W/L/BE        : {wins}/{losses}/{breakeven}")
+print(f"Live PnL      : {eur(analysis.get('actual_net_pnl_quote'))}")
+print(f"PF            : {pf_text(analysis.get('profit_factor'))}")
+print(f"Fees          : {eur(analysis.get('total_fees_quote'))}")
 print(
     "Gem slippage  : "
     f"BUY {pct(analysis.get('avg_buy_slippage_pct'))} | "
     f"SELL {pct(analysis.get('avg_sell_slippage_pct'))}"
 )
-print(
-    f"Max slippage  : {pct(analysis.get('max_adverse_slippage_pct'))}"
-)
-print(
-    f"Execution diff: {eur(analysis.get('pnl_difference_quote'))}"
-)
-print(
-    f"Live safety   : {safety_status}"
-)
+print(f"Max slippage  : {pct(analysis.get('max_adverse_slippage_pct'))}")
+print(f"Execution diff: {eur(analysis.get('pnl_difference_quote'))}")
+print(f"Live safety   : {safety_status}")
 
 if closed == 0:
     print("Mijlpaal      : wacht op echte canary trade 1")
@@ -248,6 +228,109 @@ elif [ -n "$exec_line" ]; then
 else
     echo "Execution-status niet gevonden"
 fi
+
+# Punt 10, Lijst 4: alleen bestaande researchstatus compact lezen.
+# Geen netwerkrefresh van universe/news/exchanges vanuit 'chat' zelf.
+# Post-canary/scaling mogen wel read-only uit bestaande lokale data worden ververst.
+if [ -f "$ROOT/diamond_post_canary_review.py" ]; then
+    python3 "$ROOT/diamond_post_canary_review.py" >/dev/null 2>&1 || true
+fi
+if [ -f "$ROOT/diamond_scaling_gate.py" ]; then
+    python3 "$ROOT/diamond_scaling_gate.py" >/dev/null 2>&1 || true
+fi
+
+echo
+echo "=== UNIVERSE / EVENT ==="
+python3 - "$DATA" <<'PY_UNIVERSE_EVENT'
+import json
+import sys
+from pathlib import Path
+
+data_dir = Path(sys.argv[1])
+
+
+def load(name):
+    path = data_dir / name
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def count(d, key, default="-"):
+    try:
+        value = (d.get("counts") or {}).get(key)
+        return default if value is None else value
+    except Exception:
+        return default
+
+
+universe = load("diamond_dynamic_universe.json")
+news = load("diamond_crypto_news_events.json")
+fusion = load("diamond_event_market_fusion.json")
+admission = load("diamond_shadow_admission_queue.json")
+schedule = load("diamond_deep_scan_schedule.json")
+multi = load("diamond_multi_exchange_confirmation.json")
+post = load("diamond_post_canary_review.json")
+scaling = load("diamond_scaling_gate_status.json")
+
+print(
+    "Universe      : "
+    f"{count(universe,'active_eur_markets')} EUR | "
+    f"liquid {count(universe,'liquidity_pass')} | "
+    f"events {count(universe,'market_event_candidates')}"
+)
+
+print(
+    "Nieuws        : "
+    f"{count(news,'markets_with_news')} markten | "
+    f"mapped {count(news,'mapped_news_events')} | "
+    f"market+news {count(news,'market_event_plus_news')}"
+)
+
+print(
+    "Fusion        : "
+    f"fused {count(fusion,'fused')} | "
+    f"deep {count(fusion,'deep_scan_candidates')} | "
+    f"shadow {count(fusion,'shadow_candidates')}"
+)
+
+print(
+    "Admission     : "
+    f"admit {count(admission,'new_shadow_admissions')} | "
+    f"watch {count(admission,'watch')} | "
+    f"live 0"
+)
+
+print(
+    "Deep-scan     : "
+    f"D {count(schedule,'deep')} | "
+    f"W {count(schedule,'watch')} | "
+    f"B {count(schedule,'base')} | "
+    f"heavy {count(schedule,'due_heavy_now')}"
+)
+
+print(
+    "Exchanges     : "
+    f"2x {count(multi,'confirmed_2x')} | "
+    f"1x {count(multi,'confirmed_partial')} | "
+    f"mixed {count(multi,'mixed')} | "
+    f"opp {count(multi,'opposed')} | "
+    f"geen {count(multi,'no_external_coverage')}"
+)
+
+post_status = str(post.get("status") or "WAIT_DATA")
+scaling_status = str(scaling.get("status") or "WAIT_DATA")
+print(f"Post-canary   : {post_status}")
+print(f"Scaling       : {scaling_status}")
+
+if any(not item for item in (universe, news, fusion, admission, schedule, multi)):
+    print("Data-status    : één of meer researchbestanden ontbreken")
+else:
+    print("Data-status    : researchdata aanwezig | alleen-lezen")
+PY_UNIVERSE_EVENT
 
 echo
 echo "=== RESEARCH COMPACT ==="
