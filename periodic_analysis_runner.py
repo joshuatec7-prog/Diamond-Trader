@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Trader Periodic Analysis Runner v1.9
+Diamond Trader Periodic Analysis Runner v2.0
 
 Geheugenarme, sequentiële uitvoering van:
 1. Diamond Diagnose: exact één ronde met closed-candlecorrectie.
@@ -38,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-VERSION = "1.9"
+VERSION = "2.0"
 MODE = "SEQUENTIAL_PERIODIC_ANALYSIS"
 
 PROJECT_DIR = Path("/opt/render/project/src")
@@ -56,9 +56,15 @@ LONG_COMBO_SHADOW_V2_LOG = DATA_DIR / "diamond_long_combo_shadow_v2_runner.log"
 SCANNER_SELECTIVE_SHADOW_LOG = DATA_DIR / "diamond_scanner_selective_shadow_runner.log"
 EXECUTION_QUALITY_SHADOW_LOG = DATA_DIR / "diamond_execution_quality_shadow_runner.log"
 SELECTIVE_PROSPECTIVE_CANDIDATE_LOG = DATA_DIR / "diamond_selective_prospective_candidate_runner.log"
+LIST4_FUSION_LOG = DATA_DIR / "diamond_list4_fusion_runner.log"
+LIST4_ADMISSION_LOG = DATA_DIR / "diamond_list4_admission_runner.log"
+LIST4_DEEP_SCAN_LOG = DATA_DIR / "diamond_list4_deep_scan_runner.log"
+LIST4_MULTI_EXCHANGE_LOG = DATA_DIR / "diamond_list4_multi_exchange_runner.log"
+EVENT_OUTCOME_LOG = DATA_DIR / "diamond_event_outcome_runner.log"
 SCANNER_SESSION_SHADOW_LOG = DATA_DIR / "diamond_scanner_session_shadow_runner.log"
 
 INTERVAL_SECONDS = 15 * 60
+LIST4_REFRESH_EVERY_CYCLES = 4  # circa 1x per uur
 MAX_LOG_BYTES = 5_000_000
 
 STOP_REQUESTED = False
@@ -170,6 +176,28 @@ def task_commands() -> Dict[str, list[str]]:
             sys.executable,
             "diamond_selective_prospective_candidate_tracker.py",
         ],
+        "list4_fusion": [
+            sys.executable,
+            "diamond_event_market_fusion.py",
+        ],
+        "list4_admission": [
+            sys.executable,
+            "diamond_coin_admission_shadow_gate.py",
+        ],
+        "list4_deep_scan": [
+            sys.executable,
+            "diamond_dynamic_deep_scan_scheduler.py",
+            "--no-refresh",
+        ],
+        "list4_multi_exchange": [
+            sys.executable,
+            "diamond_multi_exchange_confirmation.py",
+            "--no-refresh",
+        ],
+        "event_outcome": [
+            sys.executable,
+            "diamond_event_outcome_tracker.py",
+        ],
         "scanner_session_shadow": [
             sys.executable,
             "scanner_session_shadow_lab.py",
@@ -188,6 +216,7 @@ def default_state() -> Dict[str, Any]:
         "pid": os.getpid(),
         "started_at": now_iso(),
         "interval_seconds": INTERVAL_SECONDS,
+        "list4_refresh_every_cycles": LIST4_REFRESH_EVERY_CYCLES,
         "sequential": True,
         "active_task": None,
         "cycle_count": 0,
@@ -219,6 +248,7 @@ def load_state() -> Dict[str, Any]:
     state["mode"] = MODE
     state["pid"] = os.getpid()
     state["interval_seconds"] = INTERVAL_SECONDS
+    state["list4_refresh_every_cycles"] = LIST4_REFRESH_EVERY_CYCLES
     state["sequential"] = True
 
     tasks = state.setdefault("tasks", {})
@@ -334,6 +364,19 @@ def run_task(
     save_json_atomic(STATE_FILE, state)
 
     return exit_code
+
+
+
+def list4_refresh_due(state: Dict[str, Any]) -> bool:
+    """
+    Eerste cyclus meteen verversen; daarna elke 4 cycli (~1 uur).
+    Event-outcome zelf draait iedere cyclus om 1h/4h/12h checkpoints
+    zo dicht mogelijk bij hun horizon te vullen.
+    """
+    cycle_count = int(state.get("cycle_count", 0) or 0)
+    if cycle_count <= 1:
+        return True
+    return ((cycle_count - 1) % LIST4_REFRESH_EVERY_CYCLES) == 0
 
 
 def run_forever() -> None:
@@ -479,6 +522,57 @@ def run_forever() -> None:
         if STOP_REQUESTED:
             break
 
+        if list4_refresh_due(state):
+            run_task(
+                state,
+                "list4_fusion",
+                task_commands()["list4_fusion"],
+                LIST4_FUSION_LOG,
+            )
+
+            if STOP_REQUESTED:
+                break
+
+            run_task(
+                state,
+                "list4_admission",
+                task_commands()["list4_admission"],
+                LIST4_ADMISSION_LOG,
+            )
+
+            if STOP_REQUESTED:
+                break
+
+            run_task(
+                state,
+                "list4_deep_scan",
+                task_commands()["list4_deep_scan"],
+                LIST4_DEEP_SCAN_LOG,
+            )
+
+            if STOP_REQUESTED:
+                break
+
+            run_task(
+                state,
+                "list4_multi_exchange",
+                task_commands()["list4_multi_exchange"],
+                LIST4_MULTI_EXCHANGE_LOG,
+            )
+
+            if STOP_REQUESTED:
+                break
+
+        run_task(
+            state,
+            "event_outcome",
+            task_commands()["event_outcome"],
+            EVENT_OUTCOME_LOG,
+        )
+
+        if STOP_REQUESTED:
+            break
+
         run_task(
             state,
             "scanner_session_shadow",
@@ -545,9 +639,10 @@ def self_test() -> None:
     state = default_state()
     commands = task_commands()
 
-    assert state["version"] == "1.9"
+    assert state["version"] == "2.0"
     assert state["mode"] == MODE
     assert state["interval_seconds"] == 900
+    assert state["list4_refresh_every_cycles"] == 4
     assert state["sequential"] is True
 
     assert list(commands.keys()) == [
@@ -561,6 +656,11 @@ def self_test() -> None:
         "scanner_selective_shadow",
         "execution_quality_shadow",
         "selective_prospective_candidate",
+        "list4_fusion",
+        "list4_admission",
+        "list4_deep_scan",
+        "list4_multi_exchange",
+        "event_outcome",
         "scanner_session_shadow",
     ]
 
@@ -663,6 +763,36 @@ def self_test() -> None:
         SELECTIVE_PROSPECTIVE_CANDIDATE_LOG.name
         == "diamond_selective_prospective_candidate_runner.log"
     )
+
+    assert (
+        state["tasks"]["list4_fusion"]["command"][-1]
+        == "diamond_event_market_fusion.py"
+    )
+
+    assert (
+        state["tasks"]["list4_admission"]["command"][-1]
+        == "diamond_coin_admission_shadow_gate.py"
+    )
+
+    assert (
+        state["tasks"]["list4_deep_scan"]["command"][-2:]
+        == ["diamond_dynamic_deep_scan_scheduler.py", "--no-refresh"]
+    )
+
+    assert (
+        state["tasks"]["list4_multi_exchange"]["command"][-2:]
+        == ["diamond_multi_exchange_confirmation.py", "--no-refresh"]
+    )
+
+    assert (
+        state["tasks"]["event_outcome"]["command"][-1]
+        == "diamond_event_outcome_tracker.py"
+    )
+
+    # Cadence sanity-check.
+    assert list4_refresh_due({"cycle_count": 1}) is True
+    assert list4_refresh_due({"cycle_count": 2}) is False
+    assert list4_refresh_due({"cycle_count": 5}) is True
 
     assert (
         state["tasks"]["scanner_session_shadow"]["command"][-3:]
