@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Trader Periodic Analysis Runner v1.8
+Diamond Trader Periodic Analysis Runner v1.9
 
 Geheugenarme, sequentiële uitvoering van:
 1. Diamond Diagnose: exact één ronde met closed-candlecorrectie.
@@ -10,13 +10,14 @@ Geheugenarme, sequentiële uitvoering van:
 5. LONG Min-Profit Shadow Lab: vergelijkt €1.00 / €0.50 / €0.25 netto minimumwinst.
 6. LONG Combo Shadow Lab: vergelijkt CURRENT / WAIT30_100 / WAIT30_050.
 7. Scanner Selective Shadow Lab: vergelijkt CURRENT / SELECTIVE / STRONG.
-8. Scanner Session Shadow Lab: volgt sessie-effecten research-only.
-9. SELECTIVE Prospective Candidate Tracker: vergelijkt vanaf vaste baseline
+8. Execution Quality Shadow: verwerkt nieuwe SELECTIVE trades prospectief.
+9. Scanner Session Shadow Lab: volgt sessie-effecten research-only.
+10. SELECTIVE Prospective Candidate Tracker: vergelijkt vanaf vaste baseline
    alleen NIEUWE gesloten SELECTIVE trades voor CURRENT / GUARDED_MIX /
    RR_GE_140 / LONG_ALL.
 
 Belangrijk:
-- Alle tien taken draaien strikt na elkaar en nooit tegelijk.
+- Alle elf taken draaien strikt na elkaar en nooit tegelijk.
 - De handelsbot, Agent, Supervisor en Strategy Lab blijven ongemoeid.
 - Deze runner plaatst zelf geen orders en wijzigt geen strategie-instellingen.
 - Alle drie LONG Shadow Labs gebruiken alleen publieke marktdata.
@@ -37,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-VERSION = "1.8"
+VERSION = "1.9"
 MODE = "SEQUENTIAL_PERIODIC_ANALYSIS"
 
 PROJECT_DIR = Path("/opt/render/project/src")
@@ -53,6 +54,7 @@ LONG_MIN_PROFIT_SHADOW_LOG = DATA_DIR / "diamond_long_min_profit_shadow_runner.l
 LONG_COMBO_SHADOW_LOG = DATA_DIR / "diamond_long_combo_shadow_runner.log"
 LONG_COMBO_SHADOW_V2_LOG = DATA_DIR / "diamond_long_combo_shadow_v2_runner.log"
 SCANNER_SELECTIVE_SHADOW_LOG = DATA_DIR / "diamond_scanner_selective_shadow_runner.log"
+EXECUTION_QUALITY_SHADOW_LOG = DATA_DIR / "diamond_execution_quality_shadow_runner.log"
 SELECTIVE_PROSPECTIVE_CANDIDATE_LOG = DATA_DIR / "diamond_selective_prospective_candidate_runner.log"
 SCANNER_SESSION_SHADOW_LOG = DATA_DIR / "diamond_scanner_session_shadow_runner.log"
 
@@ -159,6 +161,10 @@ def task_commands() -> Dict[str, list[str]]:
             "scanner_selective_shadow_lab.py",
             "--update",
             "--no-print",
+        ],
+        "execution_quality_shadow": [
+            sys.executable,
+            "scanner_execution_quality_shadow.py",
         ],
         "selective_prospective_candidate": [
             sys.executable,
@@ -455,6 +461,16 @@ def run_forever() -> None:
 
         run_task(
             state,
+            "execution_quality_shadow",
+            task_commands()["execution_quality_shadow"],
+            EXECUTION_QUALITY_SHADOW_LOG,
+        )
+
+        if STOP_REQUESTED:
+            break
+
+        run_task(
+            state,
             "selective_prospective_candidate",
             task_commands()["selective_prospective_candidate"],
             SELECTIVE_PROSPECTIVE_CANDIDATE_LOG,
@@ -529,7 +545,7 @@ def self_test() -> None:
     state = default_state()
     commands = task_commands()
 
-    assert state["version"] == "1.8"
+    assert state["version"] == "1.9"
     assert state["mode"] == MODE
     assert state["interval_seconds"] == 900
     assert state["sequential"] is True
@@ -543,6 +559,7 @@ def self_test() -> None:
         "long_combo_shadow",
         "long_combo_shadow_v2",
         "scanner_selective_shadow",
+        "execution_quality_shadow",
         "selective_prospective_candidate",
         "scanner_session_shadow",
     ]
@@ -625,6 +642,16 @@ def self_test() -> None:
     assert (
         SCANNER_SELECTIVE_SHADOW_LOG.name
         == "diamond_scanner_selective_shadow_runner.log"
+    )
+
+    assert (
+        state["tasks"]["execution_quality_shadow"]["command"][-1]
+        == "scanner_execution_quality_shadow.py"
+    )
+
+    assert (
+        EXECUTION_QUALITY_SHADOW_LOG.name
+        == "diamond_execution_quality_shadow_runner.log"
     )
 
     assert (
