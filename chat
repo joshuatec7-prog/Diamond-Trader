@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Diamond Trader cockpit v2.4
+# Diamond Trader cockpit v2.5
 # Compacte read-only status voor Render Shell.
 
 set -u
@@ -275,6 +275,7 @@ schedule = load("diamond_deep_scan_schedule.json")
 multi = load("diamond_multi_exchange_confirmation.json")
 post = load("diamond_post_canary_review.json")
 scaling = load("diamond_scaling_gate_status.json")
+prospective = load("diamond_selective_prospective_candidate_report.json")
 
 print(
     "Universe      : "
@@ -325,6 +326,29 @@ post_status = str(post.get("status") or "WAIT_DATA")
 scaling_status = str(scaling.get("status") or "WAIT_DATA")
 print(f"Post-canary   : {post_status}")
 print(f"Scaling       : {scaling_status}")
+
+rules = {
+    str(row.get("rule") or ""): row
+    for row in (prospective.get("rules") or [])
+    if isinstance(row, dict)
+}
+
+def prospective_n(name):
+    try:
+        return int((rules.get(name) or {}).get("n") or 0)
+    except Exception:
+        return 0
+
+if prospective:
+    print(
+        "SELECTIVE new : "
+        f"CURRENT {prospective_n('CURRENT_ALL')}/20 | "
+        f"GUARDED {prospective_n('GUARDED_MIX')}/20 | "
+        f"RR>=1.40 {prospective_n('RR_GE_140')}/20 | "
+        f"LONG {prospective_n('LONG_ALL')}/20"
+    )
+else:
+    print("SELECTIVE new : WAIT_DATA")
 
 if any(not item for item in (universe, news, fusion, admission, schedule, multi)):
     print("Data-status    : één of meer researchbestanden ontbreken")
