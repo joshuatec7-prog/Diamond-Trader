@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Diamond Trader API-key / Security Audit v1.0
+# Diamond Trader API-key / Security Audit v1.1
 #
 # Read-only security audit:
 # - geen private exchange-API;
@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 SECRET_ENV_NAMES = (
     "BITVAVO_API_KEY",
@@ -69,6 +69,28 @@ SAFE_EXACT_VALUES = {
 }
 SAFE_PREFIXES = ("${", "{{", "<")
 
+TEST_FIXTURE_PLACEHOLDERS = {
+    "key",
+    "secret",
+    "api_key",
+    "api_secret",
+    "offline",
+    "dummy",
+    "test",
+}
+
+TEST_FILE_HINTS = (
+    "test",
+    "fixture",
+    "drill",
+    "matrix",
+)
+
+
+def is_test_fixture_file(path: Path) -> bool:
+    name = path.name.lower()
+    return any(hint in name for hint in TEST_FILE_HINTS)
+
 
 def relpath(path: Path, root: Path) -> str:
     try:
@@ -113,12 +135,26 @@ def read_text(path: Path) -> Optional[str]:
     return None
 
 
-def safe_literal(value: str) -> bool:
+def safe_literal(value: str, path: Optional[Path] = None) -> bool:
     lower = value.strip().lower()
-    return (
-        lower in SAFE_EXACT_VALUES
-        or any(lower.startswith(prefix) for prefix in SAFE_PREFIXES)
-    )
+
+    if lower in SAFE_EXACT_VALUES:
+        return True
+
+    if any(lower.startswith(prefix) for prefix in SAFE_PREFIXES):
+        return True
+
+    # Alleen in expliciet herkenbare test/fixture/drill/matrix-bestanden zijn
+    # triviale dummywaarden zoals "key" en "secret" toegestaan.
+    # In productiecode blijven exact dezelfde waarden gewoon een FAIL.
+    if (
+        path is not None
+        and is_test_fixture_file(path)
+        and lower in TEST_FIXTURE_PLACEHOLDERS
+    ):
+        return True
+
+    return False
 
 
 def finding(
@@ -184,7 +220,7 @@ def scan_file(
         # Hardcoded waarde zoals api_secret = "abc..."
         for match in ASSIGNMENT_RE.finditer(line):
             value = match.group(2)
-            if safe_literal(value):
+            if safe_literal(value, path):
                 continue
             # Environment lookup zelf is juist gewenst.
             lower_line = line.lower()
