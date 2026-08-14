@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Diamond Trader cockpit v2.0
+# Compacte read-only status voor Render Shell.
+
+set -u
+
+ROOT="/opt/render/project/src"
+DATA="/var/data"
+cd "$ROOT" || exit 1
+
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+readiness="$tmpdir/readiness.txt"
+gate="$tmpdir/gate.txt"
+regime="$tmpdir/regime.txt"
+safety="$tmpdir/safety.txt"
+
+python3 diamond_release_go_live_readiness.py >"$readiness" 2>&1 || true
+python3 diamond_decision_gate_v1_4.py >"$gate" 2>&1 || true
+python3 scanner_regime_shadow_lab.py >"$regime" 2>&1 || true
+
+if [ -f "$DATA/diamond_safety_recovery_shadow.py" ]; then
+    python3 "$DATA/diamond_safety_recovery_shadow.py" >"$safety" 2>&1 || true
+fi
+
+echo
+echo "============================================================"
+echo " DIAMOND TRADER COCKPIT"
+echo " $(date)"
+echo "============================================================"
+
+echo
+echo "=== HOOFDSTATUS ==="
+grep -m1 '^\[PASS\] SELECTIVE' "$readiness" 2>/dev/null || \
+    echo "[WAIT] SELECTIVE | status niet gevonden"
+
+grep -m1 '^\[\(PASS\|WAIT\|REVIEW\|FAIL\)\] Execution BASELINE' "$readiness" 2>/dev/null || \
+    echo "[WAIT] Execution BASELINE | status niet gevonden"
+
+grep -m1 '^\[\(PASS\|WAIT\)\] Safety / Recovery' "$readiness" 2>/dev/null || \
+    echo "[WAIT] Safety / Recovery | status niet gevonden"
+
+grep -E '^PAPER READY|^CANARY READY|^LIVE ACTIVE' "$readiness" 2>/dev/null || true
+
+echo
+echo "=== BELANGRIJKSTE BLOKKER ==="
+exec_line="$(grep -m1 '^\[\(PASS\|WAIT\|REVIEW\|FAIL\)\] Execution BASELINE' "$readiness" 2>/dev/null || true)"
+if echo "$exec_line" | grep -q '^\[PASS\]'; then
+    echo "Execution: PASS - controleer overige canary-gates"
+elif [ -n "$exec_line" ]; then
+    echo "$exec_line"
+else
+    echo "Execution-status niet gevonden"
+fi
+
+echo
+echo "=== RESEARCH COMPACT ==="
+
+long_line="$(awk '
+/LONG QUALITY/{on=1; next}
+/SHORT QUALITY/{on=0}
+on && /ALL_ELIGIBLE/ {line=$0}
+END{print line}
+' "$gate" 2>/dev/null)"
+[ -n "$long_line" ] && echo "LONG  : $long_line" || echo "LONG  : geen status"
+
+short_line="$(awk '
+/SHORT QUALITY/{on=1; next}
+/REGIME SHADOW/{on=0}
+on && /ALL_ELIGIBLE/ {line=$0}
+END{print line}
+' "$gate" 2>/dev/null)"
+[ -n "$short_line" ] && echo "SHORT : $short_line" || echo "SHORT : geen status"
+
+btc_line="$(grep -m1 '^\[\(PASS\|WAIT\|REVIEW\|FAIL\)\] BTC Event Confirmation' "$readiness" 2>/dev/null || true)"
+[ -n "$btc_line" ] && echo "BTC EVT: $btc_line"
+
+echo
+echo "=== REGIME ==="
+grep -E '^(CURRENT|COMPRESSION|BTC_ALIGNED|BTC_OPPOSITE)[[:space:]]' "$regime" 2>/dev/null || \
+    echo "Geen regime-status"
+
+echo
+echo "=== SYSTEEM ==="
+runner_line="$(grep -m1 'Periodic runner' "$gate" 2>/dev/null || true)"
+[ -n "$runner_line" ] && echo "$runner_line" || echo "Periodic runner: status niet gevonden"
+
+for proc in \
+    "agent.py" \
+    "supervisor_agent.py" \
+    "closed_candle_runner.py" \
+    "periodic_analysis_runner.py"
+do
+    if pgrep -f "$proc" >/dev/null 2>&1; then
+        printf "OK   %s\n" "$proc"
+    else
+        printf "FOUT %s\n" "$proc"
+    fi
+done
+
+echo
+echo "=== SAFETY DETAIL ==="
+if [ -s "$safety" ]; then
+    grep -E '^(PASS|MISSING|WARNING)[[:space:]]' "$safety" 2>/dev/null || true
+    grep -E '^(Ontbrekend|Warnings|Orders|Private API)' "$safety" 2>/dev/null || true
+else
+    echo "Safety detail niet beschikbaar"
+fi
+
+echo
+echo "============================================================"
+echo " Alleen lezen | Geen orders | Geen live/config wijziging"
+echo "============================================================"
