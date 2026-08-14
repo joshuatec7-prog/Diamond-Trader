@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Diamond Trader startscript v2.4
+# Diamond Trader startscript v2.5
 # - Repo-versie van `chat` wordt na iedere deploy automatisch actief.
 # - Geen strategie-, stake- of livewijzigingen.
 
@@ -27,15 +27,47 @@ setup_shell_helpers() {
     fi
 
     mkdir -p "$HOME/bin"
-    ln -sf "$DATA_DIR/chat" "$HOME/bin/chat"
+
+    cat > "$HOME/bin/chat" <<'SH'
+#!/usr/bin/env bash
+set -u
+
+CORE="/var/data/chat"
+
+if [ ! -x "$CORE" ]; then
+    echo "FOUT: $CORE ontbreekt of is niet uitvoerbaar."
+    exit 1
+fi
+
+if grep -q 'PLAK VANAF HIER' "$CORE" 2>/dev/null; then
+    exec "$CORE" "$@"
+fi
+
+printf '\033[1;31m============================================================\033[0m\n'
+printf '\033[1;31mPLAK VANAF HIER\033[0m\n'
+printf '\033[1;31m============================================================\033[0m\n'
+
+"$CORE" "$@"
+status=$?
+
+printf '\033[1;31m============================================================\033[0m\n'
+printf '\033[1;31mEINDE - TOT HIER PLAKKEN\033[0m\n'
+printf '\033[1;31m============================================================\033[0m\n'
+
+exit "$status"
+SH
+
+    chmod +x "$HOME/bin/chat"
 
     local path_line='export PATH="$HOME/bin:$PATH"'
     for profile in "$HOME/.bashrc" "$HOME/.profile"; do
         touch "$profile"
-        grep -qxF "$path_line" "$profile" 2>/dev/null || echo "$path_line" >> "$profile"
+        grep -qxF "$path_line" "$profile" 2>/dev/null || \
+            echo "$path_line" >> "$profile"
     done
 
     export PATH="$HOME/bin:$PATH"
+    hash -r 2>/dev/null || true
     echo "[OK] Render Shell commando beschikbaar: chat"
 }
 
