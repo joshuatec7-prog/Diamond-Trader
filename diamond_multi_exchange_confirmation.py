@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-VERSION = "1.0"
+VERSION = "1.1"
 ROOT = Path(__file__).resolve().parent
 DATA = Path("/var/data")
 
@@ -33,7 +33,7 @@ OUTPUT_PATH = DATA / "diamond_multi_exchange_confirmation.json"
 SCHEDULER_HELPER = ROOT / "diamond_dynamic_deep_scan_scheduler.py"
 
 BINANCE_BASE = "https://data-api.binance.vision"
-COINBASE_BASE = "https://api.exchange.coinbase.com"
+COINBASE_BASE = "https://api.coinbase.com/api/v3/brokerage/market"
 
 MAX_CANDIDATES = 15
 DIRECTION_DEADBAND_PCT = 0.50
@@ -272,103 +272,140 @@ def fetch_binance_snapshot() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
         return {}, status
 
 
-def fetch_coinbase_products() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def fetch_coinbase_snapshot(
+    candidate_bases: List[str],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """
+    Gebruik uitsluitend Coinbase Advanced Trade PUBLIC market endpoints.
+    De oude Exchange API-route kan vanuit Render HTTP 403 geven.
+
+    List Public Products bevat direct 24h koersverandering en volume.
+    Daardoor zijn geen private API-calls en geen per-product stats-calls nodig.
+    """
     status = {
         "exchange": "coinbase",
         "status": "FAIL",
         "products": 0,
-        "stats_ok": 0,
-        "stats_fail": 0,
+        "pages": 0,
+        "matched": 0,
         "error": None,
     }
+
+    products: List[Dict[str, Any]] = []
+    cursor = None
+    seen_cursors = set()
+
     try:
-        payload = http_json(f"{COINBASE_BASE}/products")
-        products = [
-            row for row in payload
-            if isinstance(row, dict)
-            and str(row.get("status") or "").lower() == "online"
-        ]
+        for _ in range(12):
+            params = {
+                "limit": "100",
+                "product_type": "SPOT",
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            url = (
+                f"{COINBASE_BASE}/products?"
+                + urllib.parse.urlencode(params)
+            )
+            payload = http_json(url)
+
+            page = payload.get("products") or []
+            page = [row for row in page if isinstance(row, dict)]
+            products.extend(page)
+            status["pages"] += 1
+
+            pagination = payload.get("pagination") or {}
+            has_next = bool(pagination.get("has_next"))
+            next_cursor = pagination.get("next_cursor")
+
+            if not has_next or not next_cursor:
+                break
+            if next_cursor in seen_cursors:
+                break
+
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
         status["products"] = len(products)
-        status["status"] = "PASS"
-        return products, status
-    except Exception as exc:
-        status["error"] = type(exc).__name__
-        return [], status
 
-
-def fetch_coinbase_stat(product_id: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
-    try:
-        encoded = urllib.parse.quote(product_id, safe="-")
-        payload = http_json(
-            f"{COINBASE_BASE}/products/{encoded}/stats",
-            timeout=10,
-        )
-        open_price = to_float(payload.get("open"))
-        last = to_float(payload.get("last"))
-        if open_price <= 0 or last <= 0:
-            return product_id, None, "ONGELDIGE_PRIJS"
-
-        change = ((last - open_price) / open_price) * 100.0
-        return product_id, {
-            "last": last,
-            "change_24h_pct": change,
-            "base_volume_24h": to_float(payload.get("volume")),
-        }, None
-    except Exception as exc:
-        return product_id, None, type(exc).__name__
-
-
-def build_coinbase_snapshot(
-    candidate_bases: List[str],
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    products, status = fetch_coinbase_products()
-    if not products:
-        return {}, status
-
-    selected: Dict[str, Dict[str, Any]] = {}
-    for base in candidate_bases:
-        product = choose_pair(
-            products,
-            base,
-            COINBASE_QUOTES,
-            base_key="base_currency",
-            quote_key="quote_currency",
-            id_key="id",
-            status_key="status",
-            allowed_status={"ONLINE"},
-        )
-        if product:
-            selected[base] = product
-
-    results: Dict[str, Dict[str, Any]] = {}
-
-    # Kleine begrensde paralleliteit: alleen top-kandidaten, publieke stats.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            executor.submit(fetch_coinbase_stat, str(product["id"])): base
-            for base, product in selected.items()
-        }
-        for future in concurrent.futures.as_completed(futures):
-            base = futures[future]
-            product = selected[base]
-            product_id, stat, error = future.result()
-            if stat is None:
-                status["stats_fail"] += 1
+        normalized = []
+        for row in products:
+            product_id = str(row.get("product_id") or "")
+            if not product_id:
                 continue
 
-            status["stats_ok"] += 1
-            results[base] = {
+            base = str(
+                row.get("base_currency_id")
+                or row.get("base_display_symbol")
+                or ""
+            ).upper()
+            quote = str(
+                row.get("quote_currency_id")
+                or row.get("quote_display_symbol")
+                or ""
+            ).upper()
+
+            if (not base or not quote) and "-" in product_id:
+                p_base, p_quote = product_id.split("-", 1)
+                base = base or p_base.upper()
+                quote = quote or p_quote.upper()
+
+            product_type = str(row.get("product_type") or "SPOT").upper()
+            if product_type not in {"SPOT", "UNKNOWN_PRODUCT_TYPE", ""}:
+                continue
+
+            if bool(row.get("trading_disabled")) or bool(row.get("is_disabled")):
+                continue
+
+            normalized.append({
+                "id": product_id,
+                "base": base,
+                "quote": quote,
+                "status": str(row.get("status") or "ONLINE").upper(),
+                "price": to_float(row.get("price")),
+                "change_24h_pct": to_float(
+                    str(row.get("price_percentage_change_24h") or "0")
+                    .replace("%", "")
+                ),
+                "volume_24h": to_float(row.get("volume_24h")),
+                "approximate_quote_24h_volume": to_float(
+                    row.get("approximate_quote_24h_volume")
+                ),
+            })
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for base in candidate_bases:
+            product = choose_pair(
+                normalized,
+                base,
+                COINBASE_QUOTES,
+                base_key="base",
+                quote_key="quote",
+                id_key="id",
+            )
+            if not product:
+                continue
+
+            result[base] = {
                 "exchange": "coinbase",
-                "pair": product_id,
-                "quote": str(product.get("quote_currency") or "").upper(),
-                **stat,
+                "pair": product["id"],
+                "quote": product["quote"],
+                "last": product["price"],
+                "change_24h_pct": product["change_24h_pct"],
+                "base_volume_24h": product["volume_24h"],
+                "approximate_quote_24h_volume": (
+                    product["approximate_quote_24h_volume"]
+                ),
             }
 
-    if status["stats_ok"] == 0:
-        status["status"] = "PARTIAL" if status["products"] else "FAIL"
+        status["matched"] = len(result)
+        status["status"] = "PASS"
+        return result, status
 
-    return results, status
-
+    except Exception as exc:
+        status["error"] = type(exc).__name__
+        return {}, status
 
 def compare_market(
     row: Dict[str, Any],
@@ -528,8 +565,8 @@ def print_report(result: Dict[str, Any]) -> None:
         extra = ""
         if source["exchange"] == "coinbase":
             extra = (
-                f" stats_ok={source.get('stats_ok',0)}"
-                f" stats_fail={source.get('stats_fail',0)}"
+                f" pages={source.get('pages',0)}"
+                f" matched={source.get('matched',0)}"
             )
         print(
             f"{source['exchange']:<10} "
@@ -627,7 +664,7 @@ def main() -> int:
     ]
 
     binance_data, binance_status = fetch_binance_snapshot()
-    coinbase_data, coinbase_status = build_coinbase_snapshot(bases)
+    coinbase_data, coinbase_status = fetch_coinbase_snapshot(bases)
 
     report = build_report(
         schedule,
