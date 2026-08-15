@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Trader Periodic Analysis Runner v2.2
+Diamond Trader Periodic Analysis Runner v2.3
 
 Geheugenarme, sequentiële uitvoering van:
 1. Diamond Diagnose: exact één ronde met closed-candlecorrectie.
@@ -38,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-VERSION = "2.2"
+VERSION = "2.3"
 MODE = "SEQUENTIAL_PERIODIC_ANALYSIS"
 
 PROJECT_DIR = Path("/opt/render/project/src")
@@ -56,6 +56,7 @@ LONG_COMBO_SHADOW_V2_LOG = DATA_DIR / "diamond_long_combo_shadow_v2_runner.log"
 SCANNER_SELECTIVE_SHADOW_LOG = DATA_DIR / "diamond_scanner_selective_shadow_runner.log"
 EXECUTION_QUALITY_SHADOW_LOG = DATA_DIR / "diamond_execution_quality_shadow_runner.log"
 SELECTIVE_PROSPECTIVE_CANDIDATE_LOG = DATA_DIR / "diamond_selective_prospective_candidate_runner.log"
+ENTRY_TIMING_PROSPECTIVE_LOG = DATA_DIR / "diamond_entry_timing_prospective_runner.log"
 LIST4_FUSION_LOG = DATA_DIR / "diamond_list4_fusion_runner.log"
 LIST4_ADMISSION_LOG = DATA_DIR / "diamond_list4_admission_runner.log"
 LIST4_DEEP_SCAN_LOG = DATA_DIR / "diamond_list4_deep_scan_runner.log"
@@ -176,6 +177,10 @@ def task_commands() -> Dict[str, list[str]]:
         "selective_prospective_candidate": [
             sys.executable,
             "diamond_selective_prospective_candidate_tracker.py",
+        ],
+        "entry_timing_prospective": [
+            sys.executable,
+            "diamond_entry_timing_prospective_tracker.py",
         ],
         "list4_fusion": [
             sys.executable,
@@ -559,6 +564,16 @@ def run_forever() -> None:
         if STOP_REQUESTED:
             break
 
+        run_task(
+            state,
+            "entry_timing_prospective",
+            task_commands()["entry_timing_prospective"],
+            ENTRY_TIMING_PROSPECTIVE_LOG,
+        )
+
+        if STOP_REQUESTED:
+            break
+
         if list4_refresh_due(state):
             list4_exit_codes = []
 
@@ -711,7 +726,7 @@ def self_test() -> None:
     state = default_state()
     commands = task_commands()
 
-    assert state["version"] == "2.2"
+    assert state["version"] == "2.3"
     assert state["mode"] == MODE
     assert state["interval_seconds"] == 900
     assert state["list4_refresh_every_cycles"] == 4
@@ -730,6 +745,7 @@ def self_test() -> None:
         "scanner_selective_shadow",
         "execution_quality_shadow",
         "selective_prospective_candidate",
+        "entry_timing_prospective",
         "list4_fusion",
         "list4_admission",
         "list4_deep_scan",
@@ -837,6 +853,11 @@ def self_test() -> None:
     assert (
         SELECTIVE_PROSPECTIVE_CANDIDATE_LOG.name
         == "diamond_selective_prospective_candidate_runner.log"
+    )
+
+    assert (
+        state["tasks"]["entry_timing_prospective"]["command"][-1]
+        == "diamond_entry_timing_prospective_tracker.py"
     )
 
     assert (
