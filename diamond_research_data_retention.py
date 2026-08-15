@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Diamond Trader Research Data Retention / Rotation v1.0
+# Diamond Trader Research Data Retention / Rotation v1.1
 #
 # Veilige, begrensde retentie voor ALLEEN Lijst-4 researchdata.
 # Kritieke bot-state, trades, canary logs, config en control-bestanden
@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 
-VERSION = "1.0"
+VERSION = "1.1"
 DATA = Path("/var/data")
 ARCHIVE = DATA / "diamond_research_archive"
 
@@ -40,6 +40,10 @@ RESEARCH_SOURCES = {
     "shadow_admission_queue": DATA / "diamond_shadow_admission_queue.json",
     "deep_scan_schedule": DATA / "diamond_deep_scan_schedule.json",
     "multi_exchange_confirmation": DATA / "diamond_multi_exchange_confirmation.json",
+    "selective_prospective_state": DATA / "diamond_selective_prospective_candidate_state.json",
+    "selective_prospective_report": DATA / "diamond_selective_prospective_candidate_report.json",
+    "event_outcome_state": DATA / "diamond_event_outcome_tracker_state.json",
+    "event_outcome_report": DATA / "diamond_event_outcome_tracker_report.json",
 }
 
 # Extra expliciete beschermingscontrole. Deze bestanden vallen sowieso buiten
