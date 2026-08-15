@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Trader Periodic Analysis Runner v2.1
+Diamond Trader Periodic Analysis Runner v2.2
 
 Geheugenarme, sequentiële uitvoering van:
 1. Diamond Diagnose: exact één ronde met closed-candlecorrectie.
@@ -38,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-VERSION = "2.1"
+VERSION = "2.2"
 MODE = "SEQUENTIAL_PERIODIC_ANALYSIS"
 
 PROJECT_DIR = Path("/opt/render/project/src")
@@ -61,6 +61,7 @@ LIST4_ADMISSION_LOG = DATA_DIR / "diamond_list4_admission_runner.log"
 LIST4_DEEP_SCAN_LOG = DATA_DIR / "diamond_list4_deep_scan_runner.log"
 LIST4_MULTI_EXCHANGE_LOG = DATA_DIR / "diamond_list4_multi_exchange_runner.log"
 EVENT_OUTCOME_LOG = DATA_DIR / "diamond_event_outcome_runner.log"
+RESEARCH_RETENTION_LOG = DATA_DIR / "diamond_research_retention_runner.log"
 SCANNER_SESSION_SHADOW_LOG = DATA_DIR / "diamond_scanner_session_shadow_runner.log"
 
 INTERVAL_SECONDS = 15 * 60
@@ -198,6 +199,11 @@ def task_commands() -> Dict[str, list[str]]:
             sys.executable,
             "diamond_event_outcome_tracker.py",
         ],
+        "research_retention": [
+            sys.executable,
+            "diamond_research_data_retention.py",
+            "--apply",
+        ],
         "scanner_session_shadow": [
             sys.executable,
             "scanner_session_shadow_lab.py",
@@ -225,6 +231,8 @@ def default_state() -> Dict[str, Any]:
         "next_cycle_not_before": None,
         "list4_last_refresh_cycle": None,
         "list4_last_refresh_at": None,
+        "research_retention_last_success_date": None,
+        "research_retention_last_success_at": None,
         "tasks": {
             name: default_task(command)
             for name, command in commands.items()
@@ -390,6 +398,22 @@ def list4_refresh_due(state: Dict[str, Any]) -> bool:
         return True
 
     return (cycle_count - last_cycle) >= LIST4_REFRESH_EVERY_CYCLES
+
+
+def research_retention_due(
+    state: Dict[str, Any],
+    utc_date: Optional[str] = None,
+) -> bool:
+    """
+    Eén succesvolle retention-run per UTC-dag.
+
+    Bij eerste introductie van v2.2 ontbreekt de datum en draait de taak
+    direct. diamond_research_data_retention.py --apply is idempotent:
+    bestaande snapshots van dezelfde UTC-dag worden veilig overgeslagen.
+    """
+    today = utc_date or datetime.now(timezone.utc).date().isoformat()
+    last_date = state.get("research_retention_last_success_date")
+    return str(last_date or "") != today
 
 
 def run_forever() -> None:
@@ -603,6 +627,24 @@ def run_forever() -> None:
         if STOP_REQUESTED:
             break
 
+        if research_retention_due(state):
+            retention_exit = run_task(
+                state,
+                "research_retention",
+                task_commands()["research_retention"],
+                RESEARCH_RETENTION_LOG,
+            )
+
+            if STOP_REQUESTED:
+                break
+
+            if retention_exit == 0:
+                state["research_retention_last_success_date"] = (
+                    datetime.now(timezone.utc).date().isoformat()
+                )
+                state["research_retention_last_success_at"] = now_iso()
+                save_json_atomic(STATE_FILE, state)
+
         run_task(
             state,
             "scanner_session_shadow",
@@ -669,10 +711,12 @@ def self_test() -> None:
     state = default_state()
     commands = task_commands()
 
-    assert state["version"] == "2.1"
+    assert state["version"] == "2.2"
     assert state["mode"] == MODE
     assert state["interval_seconds"] == 900
     assert state["list4_refresh_every_cycles"] == 4
+    assert state["research_retention_last_success_date"] is None
+    assert state["research_retention_last_success_at"] is None
     assert state["sequential"] is True
 
     assert list(commands.keys()) == [
@@ -691,6 +735,7 @@ def self_test() -> None:
         "list4_deep_scan",
         "list4_multi_exchange",
         "event_outcome",
+        "research_retention",
         "scanner_session_shadow",
     ]
 
@@ -818,6 +863,30 @@ def self_test() -> None:
         state["tasks"]["event_outcome"]["command"][-1]
         == "diamond_event_outcome_tracker.py"
     )
+
+    assert (
+        state["tasks"]["research_retention"]["command"][-2:]
+        == ["diamond_research_data_retention.py", "--apply"]
+    )
+
+    assert (
+        RESEARCH_RETENTION_LOG.name
+        == "diamond_research_retention_runner.log"
+    )
+
+    # Dagcadans retention: eerste keer/direct, daarna pas volgende UTC-dag.
+    assert research_retention_due(
+        {"research_retention_last_success_date": None},
+        "2026-08-15",
+    ) is True
+    assert research_retention_due(
+        {"research_retention_last_success_date": "2026-08-15"},
+        "2026-08-15",
+    ) is False
+    assert research_retention_due(
+        {"research_retention_last_success_date": "2026-08-15"},
+        "2026-08-16",
+    ) is True
 
     # Cadence sanity-check.
     # Belangrijk: bestaande hoge cycle_count zonder last-refresh moet direct draaien.
