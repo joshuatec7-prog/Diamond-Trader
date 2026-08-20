@@ -209,13 +209,30 @@ def rr_between(row: Dict[str, Any], low: float, high: float) -> bool:
 
 
 def lead_ok(r):
- try:
-  e=json.loads(Path("/var/data/diamond_binance_1m_lead_state.json").read_text()).get("events",[])
-  t=datetime.fromisoformat(str(r.get("opened_at") or r.get("detected_at")).replace("Z","+00:00")).timestamp()*1000
-  asset=str(r.get("symbol") or "").split("/")[0]
-  side=str(r.get("side") or "").upper()
-  return any(x.get("asset")==asset and x.get("direction")==side and 0<=t-float(x["ts_ms"])<=120000 for x in reversed(e))
- except:return False
+    try:
+        events = json.loads(
+            Path("/var/data/diamond_binance_1m_lead_state.json").read_text()
+        ).get("events", [])
+
+        raw_time = r.get("opened_at") or r.get("detected_at")
+        if not raw_time:
+            return False
+
+        t = datetime.fromisoformat(
+            str(raw_time).replace("Z", "+00:00")
+        ).timestamp() * 1000
+
+        side = str(r.get("side") or "").upper()
+
+        # Market Lead-assets zijn referentie-assets.
+        # Het SELECTIVE-symbool hoeft dus niet dezelfde munt te zijn.
+        return any(
+            str(x.get("direction") or "").upper() == side
+            and 0 <= t - float(x.get("ts_ms", 0)) <= 120000
+            for x in reversed(events)
+        )
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
 
 def rules():
  return [
