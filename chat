@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Diamond Trader cockpit v2.6
+# Diamond Trader cockpit v2.8
 # Compacte read-only status voor Render Shell.
 
 set -u
@@ -34,11 +34,18 @@ echo
 
 echo
 echo "=== HOOFDSTATUS ==="
-grep -m1 '^\[PASS\] SELECTIVE' "$readiness" 2>/dev/null || \
+grep -m1 '^\[\(PASS\|WAIT\|REVIEW\|FAIL\)\] SELECTIVE' "$readiness" 2>/dev/null || \
     echo "[WAIT] SELECTIVE | status niet gevonden"
 
 grep -m1 '^\[\(PASS\|WAIT\|REVIEW\|FAIL\)\] Execution BASELINE' "$readiness" 2>/dev/null || \
     echo "[WAIT] Execution BASELINE | status niet gevonden"
+
+grep -m1 'Execution NO_BEARISH_WEAK' "$readiness" 2>/dev/null || true
+grep -m1 'Execution BEARISH_ONLY' "$readiness" 2>/dev/null || true
+
+python3 diamond_selective_v2_candidate_tracker.py 2>/dev/null |
+grep -E 'CURRENT_ALL|RR_GE_160|TREND_BREAKOUT' |
+sed 's/^/[WAIT] SELECTIVE V2 /;s/$/ | research/'
 
 grep -m1 '^\[\(PASS\|WAIT\)\] Safety / Recovery' "$readiness" 2>/dev/null || \
     echo "[WAIT] Safety / Recovery | status niet gevonden"
@@ -494,3 +501,6 @@ echo " Alleen lezen | Geen orders | Geen live/config wijziging"
 printf '\033[1;31m============================================================\033[0m\n'
 printf '\033[1;31mEINDE DIAMOND TRADER COCKPIT\033[0m\n'
 printf '\033[1;31m============================================================\033[0m\n'
+
+# MASTER_COCKPIT_V3
+python3 diamond_master_research_status.py 2>/dev/null

@@ -177,6 +177,7 @@ def task_commands() -> Dict[str, list[str]]:
         "selective_prospective_candidate": [
             sys.executable,
             "diamond_selective_prospective_candidate_tracker.py",
+            "diamond_selective_v2_candidate_tracker.py",
         ],
         "entry_timing_prospective": [
             sys.executable,
@@ -848,6 +849,7 @@ def self_test() -> None:
     assert (
         state["tasks"]["selective_prospective_candidate"]["command"][-1]
         == "diamond_selective_prospective_candidate_tracker.py"
+        == "diamond_selective_v2_candidate_tracker.py"
     )
 
     assert (

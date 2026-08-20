@@ -188,7 +188,8 @@ def section_status(title):
 
 print("\n2. RELEASE-GATES")
 
-selective_status, selective_detail = section_status("SELECTIVE")
+selective_status = "FAIL"
+selective_detail = "FROZEN 38/38 | W/L=15/23 PnL=€+23.1779 PF=1.3286 | AFWIJZEN"
 result("SELECTIVE", selective_status, selective_detail, blocking=True)
 
 m = re.search(
@@ -222,12 +223,25 @@ if m:
         execution_status,
     )
 
+execution_n = 20
+execution_status = "FAIL"
+execution_detail = "FROZEN 20/20 | W/L=7/13 PnL=€-6.7389 PF=0.8183 | AFWIJZEN"
+
 result(
     "Execution BASELINE",
     execution_status,
     execution_detail,
     blocking=True,
 )
+
+run(["python3", "scanner_execution_quality_shadow.py"])
+eq = load_json(DATA / "diamond_execution_quality_shadow_report.json")
+for name in ("NO_BEARISH_WEAK", "BEARISH_ONLY"):
+    x = (eq.get("groups") or {}).get(name, {})
+    n = int(x.get("closed", 0) or 0)
+    status = "WAIT" if n < 20 else "REVIEW"
+    detail = f"{n}/20 W/L={x.get('wins',0)}/{x.get('losses',0)} PnL=€{float(x.get('pnl',0) or 0):+.4f} PF={x.get('profit_factor',0)}"
+    result("Execution " + name, status, detail, blocking=False)
 
 print("\n3. ONDERZOEK - NIET BLOKKEREND")
 

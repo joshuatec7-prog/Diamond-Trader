@@ -132,6 +132,10 @@ def load_baseline():
                 baseline,
             )
 
+        if not baseline.get("regime_filter_started_at"):
+            baseline["regime_filter_started_at"] = now_iso()
+            save_json(BASELINE, baseline)
+
         return baseline
 
     baseline = {
@@ -291,8 +295,24 @@ def run():
         ]
     )
 
+    regime_started = parse_dt(
+        baseline["regime_filter_started_at"]
+    )
+
     groups = {
         "BASELINE": selected,
+
+        "NO_BEARISH_WEAK": [
+            r for r in selected
+            if r["detected_at"] >= regime_started
+            and str(r.get("market_regime") or "").upper() != "BEARISH_WEAK"
+        ],
+
+        "BEARISH_ONLY": [
+            r for r in selected
+            if r["detected_at"] >= regime_started
+            and str(r.get("market_regime") or "").upper() == "BEARISH"
+        ],
 
         "HIGH_VOLUME": [
             row for row in selected
@@ -363,3 +383,37 @@ def run():
 
 if __name__ == "__main__":
     run()
+
+
+# SELECTIVE_V2_AUTORUN
+if __name__ == "__main__":
+    try:
+        __import__("subprocess").run(
+            [__import__("sys").executable,
+             "diamond_selective_v2_candidate_tracker.py"],
+            stdout=__import__("subprocess").DEVNULL,
+            stderr=__import__("subprocess").DEVNULL,
+            timeout=60
+        )
+    except Exception:
+        pass
+
+
+# MARKET_LEAD_V2_AUTORUN
+if __name__ == "__main__":
+    try:
+        __import__("subprocess").run(
+            [__import__("sys").executable,
+             "diamond_market_lead_v2.py"],
+            stdout=__import__("subprocess").DEVNULL,
+            stderr=__import__("subprocess").DEVNULL,
+            timeout=120
+        )
+    except Exception:
+        pass
+
+# BINANCE_1M_SELECTIVE_AUTORUN
+if __name__=="__main__":
+ import subprocess,sys
+ for f in ("diamond_binance_1m_lead_events.py","diamond_selective_binance_1m_tracker.py"):
+  subprocess.run([sys.executable,f],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=90)
