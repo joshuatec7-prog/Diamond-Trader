@@ -678,6 +678,9 @@ class Bot:
             )
         )
         self.control_file = str(get_cfg(cfg, "files.control_file", "/var/data/diamond_control.json"))
+        self.live_approval_file = str(
+            get_cfg(cfg, "files.live_approval_file", "/var/data/diamond_live_approval.json")
+        )
         self.short_test_baseline_file = str(
             get_cfg(
                 cfg,
@@ -876,6 +879,105 @@ class Bot:
                 f"diamond-trader:{order_key}",
             )
         )
+
+    def live_approval(self) -> Dict[str, Any]:
+        path = Path(getattr(
+            self,
+            "live_approval_file",
+            "/var/data/diamond_live_approval.json",
+        ))
+        if not path.exists():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    def canary_new_entry_gate(
+        self,
+        stake_quote: float,
+        canary_trade_number: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Fail-closed gate voor iedere nieuwe echte BUY."""
+        if self.dry_run:
+            return {"allow": True, "reason": "dry_run"}
+
+        approval = self.live_approval()
+
+        approved = bool(
+            str(approval.get("status", "")).upper() == "APPROVED"
+            or approval.get("approved") is True
+        )
+        if not approved:
+            return {"allow": False, "reason": "approval_missing_or_revoked"}
+
+        if str(approval.get("mode") or "").upper() != "CANARY":
+            return {"allow": False, "reason": "approval_mode_not_canary"}
+
+        if not to_bool(approval.get("allow_new_entries"), False):
+            return {"allow": False, "reason": "new_entries_not_allowed"}
+
+        expires_at = str(approval.get("expires_at") or "").strip()
+        if not expires_at:
+            return {"allow": False, "reason": "approval_expiry_missing"}
+
+        try:
+            expiry = datetime.fromisoformat(
+                expires_at.replace("Z", "+00:00")
+            )
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= expiry.astimezone(timezone.utc):
+                return {"allow": False, "reason": "approval_expired"}
+        except Exception:
+            return {"allow": False, "reason": "approval_expiry_invalid"}
+
+        max_trades = int(
+            to_float(approval.get("max_canary_trades"), 0)
+        )
+        if max_trades < 1 or max_trades > 5:
+            return {"allow": False, "reason": "invalid_max_canary_trades"}
+
+        hard_max = to_float(
+            get_cfg(
+                self.cfg,
+                "risk.canary_hard_max_stake_quote",
+                130.0,
+            ),
+            130.0,
+        )
+        approved_max = to_float(
+            approval.get("max_stake_quote"),
+            0.0,
+        )
+        allowed_stake = min(hard_max, approved_max)
+
+        if allowed_stake <= 0:
+            return {"allow": False, "reason": "invalid_max_stake"}
+
+        if float(stake_quote) > allowed_stake + 1e-9:
+            return {"allow": False, "reason": "stake_above_canary_limit"}
+
+        trade_number = canary_trade_number
+        if trade_number is None:
+            trade_number = int(
+                to_float(
+                    self.state.get("canary_trade_sequence"),
+                    0,
+                )
+            ) + 1
+
+        if int(trade_number) < 1 or int(trade_number) > max_trades:
+            return {"allow": False, "reason": "canary_trade_limit_reached"}
+
+        return {
+            "allow": True,
+            "reason": "approved_canary_entry",
+            "trade_number": int(trade_number),
+            "max_trades": max_trades,
+            "max_stake_quote": allowed_stake,
+        }
 
     def entries_blocked_by_recovery(self) -> bool:
         pending = self.state.get("pending_orders") or {}
@@ -4346,6 +4448,28 @@ class Bot:
 
         execution_spread_pct = self.estimate_spread_pct(ticker)
 
+        if not order_key:
+            raise RuntimeError("LIVE_BUY_BLOCKED:missing_pending_order")
+
+        pending_record = (
+            self.state.get("pending_orders", {}).get(order_key)
+        )
+        canary_trade_number = int(
+            to_float(
+                (pending_record or {}).get("canary_trade_number"),
+                0,
+            )
+        )
+
+        gate = self.canary_new_entry_gate(
+            stake_quote,
+            canary_trade_number=canary_trade_number,
+        )
+        if not gate.get("allow", False):
+            raise RuntimeError(
+                "LIVE_BUY_BLOCKED:" + str(gate.get("reason"))
+            )
+
         # Referentie wordt vlak vóór submit persistent opgeslagen.
         if order_key:
             record = (
@@ -4573,6 +4697,19 @@ class Bot:
         )
         if stake <= 0:
             return
+
+        if not self.dry_run:
+            gate = self.canary_new_entry_gate(stake)
+            if not gate.get("allow", False):
+                self.rate_limited_info(
+                    self.last_skip_log_ts,
+                    f"canary_gate:{symbol}:{gate.get('reason')}",
+                    300,
+                    "LIVE BUY GEBLOKKEERD %s | %s",
+                    symbol,
+                    gate.get("reason"),
+                )
+                return
 
         order_key: Optional[str] = None
         client_order_id: Optional[str] = None

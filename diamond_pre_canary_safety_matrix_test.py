@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys, types, importlib.util, tempfile, json, os
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 # Minimal ccxt stub so the production module can be imported offline.
 ccxt = types.ModuleType('ccxt')
@@ -79,6 +80,7 @@ def mkbot(root, exchange=None, state=None):
     b.trades_file = str(root/'transactions.csv')
     b.canary_execution_file = str(root/'canary.csv')
     b.control_file = str(root/'control.json')
+    b.live_approval_file = str(root/'live_approval.json')
     b.short_test_baseline_file = str(root/'short_base.json')
     b.short_test_report_file = str(root/'short_report.json')
     b.short_execution_file = str(root/'short_exec.csv')
@@ -102,6 +104,22 @@ def mkbot(root, exchange=None, state=None):
     b.amount_to_precision_safe = lambda symbol, amount: float(amount)
     b.asset_balance = lambda asset: {'EUR':1000.0, 'BTC':1.0}.get(str(asset).upper(),0.0)
     b.rate_limited_info = lambda *a, **k: None
+
+    approval = {
+        'status': 'APPROVED',
+        'mode': 'CANARY',
+        'allow_new_entries': True,
+        'expires_at': (
+            datetime.now(timezone.utc) + timedelta(hours=2)
+        ).isoformat(),
+        'max_canary_trades': 5,
+        'max_stake_quote': 130.0,
+    }
+    Path(b.live_approval_file).write_text(
+        json.dumps(approval),
+        encoding='utf-8',
+    )
+
     mod.save_state(b.state_file, b.state)
     return b
 
@@ -370,6 +388,129 @@ def t16():
         assert a==c and len(a)>10
         return f'stabiele clientOrderId {a}'
 test('16. Stabiele order-identiteit', t16)
+
+
+# 17-24 harde fail-closed CANARY entry gate
+
+def approval_path(bot):
+    return Path(bot.live_approval_file)
+
+def set_approval(bot, **changes):
+    data = {
+        'status': 'APPROVED',
+        'mode': 'CANARY',
+        'allow_new_entries': True,
+        'expires_at': (
+            datetime.now(timezone.utc) + timedelta(hours=2)
+        ).isoformat(),
+        'max_canary_trades': 5,
+        'max_stake_quote': 130.0,
+    }
+    data.update(changes)
+    approval_path(bot).write_text(
+        json.dumps(data),
+        encoding='utf-8',
+    )
+
+def t17():
+    with tempfile.TemporaryDirectory() as td:
+        b=mkbot(td)
+        approval_path(b).unlink()
+        r=b.canary_new_entry_gate(35)
+        assert not r['allow']
+        return r['reason']
+test('17. Geen live approval blokkeert BUY', t17)
+
+def t18():
+    with tempfile.TemporaryDirectory() as td:
+        b=mkbot(td)
+        set_approval(b, mode='LIVE')
+        r=b.canary_new_entry_gate(35)
+        assert not r['allow']
+        return r['reason']
+test('18. Alleen CANARY mode toegestaan', t18)
+
+def t19():
+    with tempfile.TemporaryDirectory() as td:
+        b=mkbot(td)
+        set_approval(b, allow_new_entries=False)
+        r=b.canary_new_entry_gate(35)
+        assert not r['allow']
+        return r['reason']
+test('19. Ingetrokken nieuwe entries blokkeren BUY', t19)
+
+def t20():
+    with tempfile.TemporaryDirectory() as td:
+        b=mkbot(td)
+        set_approval(
+            b,
+            expires_at=(
+                datetime.now(timezone.utc)-timedelta(minutes=1)
+            ).isoformat(),
+        )
+        r=b.canary_new_entry_gate(35)
+        assert not r['allow']
+        return r['reason']
+test('20. Verlopen approval blokkeert BUY', t20)
+
+def t21():
+    with tempfile.TemporaryDirectory() as td:
+        b=mkbot(td)
+        set_approval(b, max_stake_quote=30)
+        r=b.canary_new_entry_gate(35)
+        assert not r['allow']
+        return r['reason']
+test('21. Canary stake-limiet wordt hard afgedwongen', t21)
+
+def t22():
+    with tempfile.TemporaryDirectory() as td:
+        b=mkbot(td)
+        b.state['canary_trade_sequence']=5
+        r=b.canary_new_entry_gate(35)
+        assert not r['allow']
+        return r['reason']
+test('22. Canary trade 6 van 5 wordt geblokkeerd', t22)
+
+def t23():
+    with tempfile.TemporaryDirectory() as td:
+        b=mkbot(td)
+        r=b.canary_new_entry_gate(35)
+        assert r['allow'] and r['trade_number']==1
+        return 'geldige canary trade 1'
+test('23. Geldige canary approval staat trade 1 toe', t23)
+
+def t24():
+    with tempfile.TemporaryDirectory() as td:
+        ex=FakeExchange()
+        b=mkbot(td,ex)
+
+        key=b.long_order_key('BTC/EUR',signal)
+        rec=b.prepare_pending_long_order(
+            key,'BTC/EUR',signal,35,0.05,0.0
+        )
+
+        set_approval(
+            b,
+            status='REVOKED',
+            approved=False,
+        )
+
+        blocked=False
+        try:
+            b.place_market_buy(
+                'BTC/EUR',
+                35,
+                client_order_id=rec['clientOrderId'],
+                order_key=key,
+            )
+        except RuntimeError as exc:
+            blocked='LIVE_BUY_BLOCKED' in str(exc)
+
+        assert blocked
+        assert len(ex.create_calls)==0
+        return 'approval vóór submit opnieuw gecontroleerd; 0 orders'
+test('24. Approval revoke vlak vóór exchange-submit', t24)
+
 
 print('\n'.join(f"{'PASS' if ok else 'FAIL'} | {name} | {detail}" for name,ok,detail in results))
 print(f"\nTOTAL {sum(ok for _,ok,_ in results)}/{len(results)} PASS")
