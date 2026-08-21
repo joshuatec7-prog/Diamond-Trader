@@ -17,6 +17,7 @@ import ccxt
 import pandas as pd
 import yaml
 from dotenv import load_dotenv
+from diamond_selective_execution_adapter import new_execution_contracts
 
 LOG = logging.getLogger("diamond_trader")
 
@@ -668,6 +669,18 @@ class Bot:
         self.cfg = cfg
         self.quote = str(get_cfg(cfg, "quote", "EUR")).upper()
         self.dry_run = to_bool(get_cfg(cfg, "dry_run", True), True)
+        self.selective_execution_enabled = to_bool(
+            get_cfg(cfg, "execution.selective_contracts_enabled", False),
+            False,
+        )
+        self.selective_signals_file = str(
+            get_cfg(cfg, "files.market_signals_file",
+                    "/var/data/diamond_market_signals.csv")
+        )
+        self.selective_execution_cursor_file = str(
+            get_cfg(cfg, "files.selective_execution_cursor_file",
+                    "/var/data/diamond_selective_execution_cursor.json")
+        )
         self.state_file = str(get_cfg(cfg, "files.state_file", "state.json"))
         self.trades_file = str(get_cfg(cfg, "files.trades_file", "transactions.csv"))
         self.canary_execution_file = str(
@@ -818,6 +831,29 @@ class Bot:
             # live-order na een crash/restart eenduidig terugvindbaar.
             params["clientOrderId"] = client_order_id
         return params
+
+    def legacy_spot_entry_route_enabled(self) -> bool:
+        return not self.selective_execution_enabled
+
+    def selective_dry_run_candidates(self) -> List[Dict[str, Any]]:
+        if not self.selective_execution_enabled:
+            return []
+        if not self.dry_run:
+            raise RuntimeError("SELECTIVE_EXECUTION_BLOCKED:2D_DRY_RUN_ONLY")
+
+        contracts = new_execution_contracts(
+            Path(self.selective_signals_file),
+            Path(self.selective_execution_cursor_file),
+        )
+        for item in contracts:
+            item["execution_mode"] = "DRY_RUN_ONLY"
+            LOG.info(
+                "SELECTIVE DRY-RUN | key=%s | %s | %s",
+                item.get("candidate_key"),
+                item.get("symbol"),
+                item.get("strategy"),
+            )
+        return contracts
 
     def long_order_key(
         self,
@@ -5884,6 +5920,17 @@ class Bot:
                 long_test_pause,
             )
 
+        if self.selective_execution_enabled and not block_spot_entries:
+            if self.dry_run:
+                self.selective_dry_run_candidates()
+            else:
+                self.rate_limited_info(
+                    self.last_skip_log_ts,
+                    "selective_2d_live_block",
+                    300,
+                    "SELECTIVE 2D is DRY-RUN ONLY | live BUY geblokkeerd",
+                )
+
         max_open_spot = int(
             to_float(
                 get_cfg(
@@ -5898,6 +5945,7 @@ class Bot:
         if (
             not block_spot_entries
             and self.spot_enabled()
+            and self.legacy_spot_entry_route_enabled()
             and self.open_positions_count()
             < max_open_spot
             and self.total_positions_count()
