@@ -4158,16 +4158,20 @@ class Bot:
 
         fee_items: List[Dict[str, Any]] = []
 
-        fee = order.get("fee")
-        if isinstance(fee, dict):
-            fee_items.append(fee)
-
+        # CCXT kan dezelfde Bitvavo-fee zowel in "fee" als in "fees"
+        # teruggeven. Gebruik "fees" wanneer die beschikbaar is.
         fees = order.get("fees")
-        if isinstance(fees, list):
+        if isinstance(fees, list) and any(
+            isinstance(item, dict) for item in fees
+        ):
             fee_items.extend(
                 item for item in fees
                 if isinstance(item, dict)
             )
+        else:
+            fee = order.get("fee")
+            if isinstance(fee, dict):
+                fee_items.append(fee)
 
         total_quote_fee = 0.0
         found_valid_fee = False
@@ -4177,7 +4181,9 @@ class Bot:
             if cost <= 0:
                 continue
 
-            currency = str(item.get("currency") or quote_asset).upper()
+            currency = str(
+                item.get("currency") or quote_asset
+            ).upper()
 
             if currency == quote_asset:
                 total_quote_fee += cost
@@ -4187,7 +4193,8 @@ class Bot:
                 found_valid_fee = True
             else:
                 LOG.warning(
-                    "Onbekende feevaluta voor %s: %s; fallback fee wordt gebruikt",
+                    "Onbekende feevaluta voor %s: %s; "
+                    "fallback fee wordt gebruikt",
                     symbol,
                     currency,
                 )
