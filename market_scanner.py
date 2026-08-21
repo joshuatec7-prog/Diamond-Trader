@@ -674,7 +674,21 @@ def select_markets(
     exchange: ccxt.Exchange,
     tickers: Dict[str, Any],
     cfg: Dict[str, Any],
+    rotation_index: int = 0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    Hybride marktselectie.
+
+    Eerst blijven alle bestaande liquiditeits- en spreadfilters gelden.
+    Uit de geschikte markt worden daarna geselecteerd:
+    - 50% sterkste 24h movers;
+    - 25% hoogste quote-volume;
+    - resterende plaatsen rouleren door de rest.
+
+    Zo blijft het aantal zware OHLC-analyses begrensd terwijl snelle
+    marktbewegingen niet meer uitsluitend door een volume-toplijst
+    gemist kunnen worden.
+    """
     eligible: List[Dict[str, Any]] = []
 
     counts = {
@@ -685,6 +699,9 @@ def select_markets(
         "spread_blocked": 0,
         "invalid_ticker": 0,
         "eligible": 0,
+        "selected_movers": 0,
+        "selected_volume": 0,
+        "selected_rotation": 0,
     }
 
     for symbol, market in exchange.markets.items():
@@ -745,15 +762,102 @@ def select_markets(
             ),
         })
 
-    eligible.sort(
+    counts["eligible"] = len(eligible)
+
+    if not eligible:
+        return [], counts
+
+    top_n = min(int(cfg["top_n"]), len(eligible))
+
+    mover_quota = max(1, top_n // 2)
+    volume_quota = max(1, top_n // 4)
+
+    selected: List[Dict[str, Any]] = []
+    selected_symbols = set()
+
+    def add_unique(items, maximum, reason):
+        added = 0
+
+        for item in items:
+            if added >= maximum:
+                break
+
+            symbol = item["symbol"]
+
+            if symbol in selected_symbols:
+                continue
+
+            row = dict(item)
+            row["selection_reason"] = reason
+            selected.append(row)
+            selected_symbols.add(symbol)
+            added += 1
+
+        return added
+
+    # Zowel sterke stijging als sterke daling is marktbeweging.
+    movers = sorted(
+        eligible,
+        key=lambda item: abs(item["change_pct_24h"]),
+        reverse=True,
+    )
+
+    counts["selected_movers"] = add_unique(
+        movers,
+        mover_quota,
+        "MOVER_24H",
+    )
+
+    volume_ranked = sorted(
+        eligible,
         key=lambda item: item["quote_volume"],
         reverse=True,
     )
 
-    counts["eligible"] = len(eligible)
+    counts["selected_volume"] = add_unique(
+        volume_ranked,
+        volume_quota,
+        "HIGH_VOLUME",
+    )
 
-    return eligible[:cfg["top_n"]], counts
+    remaining_slots = top_n - len(selected)
 
+    if remaining_slots > 0:
+        rotation_pool = sorted(
+            (
+                item
+                for item in eligible
+                if item["symbol"] not in selected_symbols
+            ),
+            key=lambda item: item["symbol"],
+        )
+
+        if rotation_pool:
+            start = (
+                max(0, int(rotation_index))
+                * remaining_slots
+            ) % len(rotation_pool)
+
+            rotated = (
+                rotation_pool[start:]
+                + rotation_pool[:start]
+            )
+
+            counts["selected_rotation"] = add_unique(
+                rotated,
+                remaining_slots,
+                "ROTATION",
+            )
+
+    # Veiligheidsfill als overlap/pool ooit onvoldoende is.
+    if len(selected) < top_n:
+        add_unique(
+            volume_ranked,
+            top_n - len(selected),
+            "FILL",
+        )
+
+    return selected[:top_n], counts
 
 def rsi(series: pd.Series, length: int) -> pd.Series:
     difference = series.diff()
@@ -2055,6 +2159,7 @@ def scan_once(
         exchange,
         tickers,
         cfg,
+        rotation_index=to_int(state.get("scan_count"), 0),
     )
 
     markets = include_open_position_markets(
