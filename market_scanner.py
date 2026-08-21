@@ -74,6 +74,7 @@ DATA_DIR = Path(
 REPORT_FILE = DATA_DIR / "diamond_market_signals.json"
 STATE_FILE = DATA_DIR / "diamond_market_scanner_state.json"
 SIGNALS_CSV_FILE = DATA_DIR / "diamond_market_signals.csv"
+SIGNAL_MEASUREMENTS_FILE = DATA_DIR / "diamond_signal_measurements.jsonl"
 SHADOW_TRADES_FILE = DATA_DIR / "diamond_shadow_trades.csv"
 LOG_FILE = DATA_DIR / "diamond_market_scanner.log"
 
@@ -758,6 +759,8 @@ def select_markets(
             "symbol": symbol,
             "base": base,
             "last": last,
+            "bid": to_float(ticker.get("bid"), 0.0),
+            "ask": to_float(ticker.get("ask"), 0.0),
             "quote_volume": volume,
             "spread_pct": spread,
             "change_pct_24h": to_float(
@@ -1362,6 +1365,7 @@ def make_signal(
         "spread_pct": market["spread_pct"],
         "quote_volume": market["quote_volume"],
         "change_pct_24h": market["change_pct_24h"],
+        "selection_reason": market.get("selection_reason", "UNKNOWN"),
         "economics": calculation,
         "economically_positive": (
             calculation["expected_net_pct"] >= cfg["min_expected_net_pct"]
@@ -1715,6 +1719,49 @@ def analyse_symbol(
         cfg,
     )
 
+    if signals:
+        source = "FRESH_TICKER"
+        try:
+            ticker = api_call(
+                f"fresh ticker {market['symbol']}",
+                lambda: exchange.fetch_ticker(market["symbol"]),
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Fresh ticker mislukt | %s | fallback scan-ticker | %s",
+                market["symbol"], exc,
+            )
+            source = "SCAN_TICKER_FALLBACK"
+            ticker = market
+
+        bid = to_float(ticker.get("bid"), to_float(market.get("bid"), 0.0))
+        ask = to_float(ticker.get("ask"), to_float(market.get("ask"), 0.0))
+        last = to_float(ticker.get("last"), to_float(market.get("last"), 0.0))
+        mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else last
+        current_spread = spread_pct({"bid": bid, "ask": ask})
+
+        for signal in signals:
+            candle_entry = to_float(signal.get("entry_price"), 0.0)
+            executable = (ask if signal["side"] == "LONG" else bid) or last
+            gap = (
+                (executable - candle_entry) / candle_entry * 100.0
+                if candle_entry > 0 and executable > 0 else 0.0
+            )
+
+            signal.update({
+                "detection_quote_at": now_iso(),
+                "detection_last": last,
+                "detection_bid": bid,
+                "detection_ask": ask,
+                "detection_mid": mid,
+                "detection_spread_pct": current_spread,
+                "executable_entry_price": executable,
+                "entry_gap_pct": gap,
+                "adverse_entry_gap_pct":
+                    gap if signal["side"] == "LONG" else -gap,
+                "quote_source": source,
+            })
+
     fifteen = snapshots["15m"]
 
     recent_candles: List[Dict[str, Any]] = []
@@ -1748,6 +1795,39 @@ def analyse_symbol(
         "_recent_candles_15m": recent_candles,
     }
 
+
+
+
+def append_signal_measurement(signal: Dict[str, Any]) -> None:
+    """Schrijf execution-meetdata apart, zonder bestaande CSV te wijzigen."""
+    row = {
+        "signal_key": signal.get("signal_key"),
+        "detected_at": signal.get("detected_at"),
+        "candle_timestamp": signal.get("candle_timestamp"),
+        "symbol": signal.get("symbol"),
+        "strategy": signal.get("strategy"),
+        "side": signal.get("side"),
+        "selection_reason": signal.get("selection_reason", "UNKNOWN"),
+        "market_regime": signal.get("market_regime"),
+        "score": signal.get("score"),
+        "candle_entry_price": signal.get("entry_price"),
+        "detection_quote_at": signal.get("detection_quote_at"),
+        "detection_last": signal.get("detection_last"),
+        "detection_bid": signal.get("detection_bid"),
+        "detection_ask": signal.get("detection_ask"),
+        "detection_mid": signal.get("detection_mid"),
+        "detection_spread_pct": signal.get("detection_spread_pct"),
+        "executable_entry_price": signal.get("executable_entry_price"),
+        "entry_gap_pct": signal.get("entry_gap_pct"),
+        "adverse_entry_gap_pct": signal.get("adverse_entry_gap_pct"),
+        "quote_source": signal.get("quote_source"),
+        "shadow_eligible": signal.get("shadow_eligible"),
+    }
+
+    SIGNAL_MEASUREMENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    with SIGNAL_MEASUREMENTS_FILE.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def append_unique_signal(signal: Dict[str, Any]) -> None:
@@ -1800,6 +1880,15 @@ def append_unique_signal(signal: Dict[str, Any]) -> None:
             writer.writeheader()
 
         writer.writerow(row)
+
+    try:
+        append_signal_measurement(signal)
+    except Exception as exc:
+        LOG.warning(
+            "Signal measurement schrijven mislukt | %s | %s",
+            signal.get("signal_key"),
+            exc,
+        )
 
 
 
@@ -2226,7 +2315,10 @@ def scan_once(
         reverse=True,
     )
 
-    seen = {str(item) for item in state["seen_signal_keys"]}
+    seen_order = list(dict.fromkeys(
+        str(item) for item in state["seen_signal_keys"]
+    ))
+    seen = set(seen_order)
     new_signals = 0
     opened_this_scan = 0
 
@@ -2237,6 +2329,7 @@ def scan_once(
             continue
 
         seen.add(key)
+        seen_order.append(key)
         append_unique_signal(signal)
         new_signals += 1
 
@@ -2247,7 +2340,7 @@ def scan_once(
         ):
             opened_this_scan += 1
 
-    state["seen_signal_keys"] = list(seen)[-5000:]
+    state["seen_signal_keys"] = seen_order[-5000:]
     state["last_scan_at"] = now_iso()
     state["scan_count"] = to_int(state.get("scan_count"), 0) + 1
     state["total_unique_signals"] = (
@@ -2288,6 +2381,7 @@ def scan_once(
                     market["change_pct_24h"],
                     4,
                 ),
+                "selection_reason": market.get("selection_reason", "UNKNOWN"),
             }
             for market in markets
         ],

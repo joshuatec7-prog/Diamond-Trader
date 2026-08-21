@@ -81,6 +81,8 @@ BASELINE_FILE = DATA_DIR / "diamond_scanner_selective_shadow_baseline.json"
 STATE_FILE = DATA_DIR / "diamond_scanner_selective_shadow_state.json"
 REPORT_FILE = DATA_DIR / "diamond_scanner_selective_shadow_report.json"
 TRADES_FILE = DATA_DIR / "diamond_scanner_selective_shadow_trades.csv"
+SIGNAL_MEASUREMENTS_FILE = DATA_DIR / "diamond_signal_measurements.jsonl"
+EXECUTION_MEASUREMENTS_FILE = DATA_DIR / "diamond_selective_execution_measurements.jsonl"
 
 TARGET_CLOSED = 20
 TIMEFRAME_MS = 15 * 60 * 1000
@@ -369,6 +371,63 @@ def candidate_key(row: Dict[str, str]) -> str:
     ])
 
 
+
+def load_signal_measurements() -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    if not SIGNAL_MEASUREMENTS_FILE.exists():
+        return result
+
+    with SIGNAL_MEASUREMENTS_FILE.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            key = "|".join([
+                str(row.get("symbol") or "").upper(),
+                str(row.get("strategy") or ""),
+                str(row.get("side") or "").upper(),
+                str(row.get("candle_timestamp") or ""),
+            ])
+            result[key] = row
+
+    return result
+
+
+def append_execution_measurement(row: Dict[str, Any]) -> None:
+    data = {
+        "candidate_key": row.get("candidate_key"),
+        "closed_at": row.get("closed_at"),
+        "symbol": row.get("symbol"),
+        "strategy": row.get("strategy"),
+        "side": row.get("side"),
+        "selection_reason": row.get("selection_reason", "UNKNOWN"),
+        "candle_entry_price": row.get("candle_entry_price"),
+        "legacy_entry_price": row.get("entry_price"),
+        "detection_quote_at": row.get("detection_quote_at"),
+        "detection_bid": row.get("detection_bid"),
+        "detection_ask": row.get("detection_ask"),
+        "detection_spread_pct": row.get("detection_spread_pct"),
+        "executable_entry_price": row.get("executable_entry_price"),
+        "entry_gap_pct": row.get("entry_gap_pct"),
+        "adverse_entry_gap_pct": row.get("adverse_entry_gap_pct"),
+        "quote_source": row.get("quote_source"),
+        "measurement_available": row.get("measurement_available"),
+        "mae_pct": row.get("mae_pct"),
+        "mfe_pct": row.get("mfe_pct"),
+        "exec_mae_pct": row.get("exec_mae_pct"),
+        "exec_mfe_pct": row.get("exec_mfe_pct"),
+        "exit_price": row.get("exit_price"),
+        "exit_reason": row.get("exit_reason"),
+        "net_pnl_eur": row.get("net_pnl_eur"),
+        "total_fees_eur": row.get("total_fees_eur"),
+        "duration_minutes": row.get("duration_minutes"),
+    }
+
+    with EXECUTION_MEASUREMENTS_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
 def after_baseline(row: Dict[str, str], baseline_dt: datetime) -> bool:
     detected = parse_datetime(row.get("detected_at"))
     return detected is not None and detected >= baseline_dt
@@ -408,7 +467,9 @@ def build_position(
     variant: str,
     row: Dict[str, str],
     settings: Dict[str, Any],
+    measurement: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
+    measurement = measurement or {}
     raw_entry = to_float(row.get("entry_price"), 0.0)
     raw_tp = to_float(row.get("take_profit"), 0.0)
     raw_sl = to_float(row.get("stop_loss"), 0.0)
@@ -448,6 +509,23 @@ def build_position(
         "market_regime": str(row.get("market_regime") or "-"),
         "signal_score": to_float(row.get("score"), 0.0),
         "reward_risk": to_float(row.get("reward_risk"), 0.0),
+        "selection_reason": measurement.get("selection_reason", "UNKNOWN"),
+        "candle_entry_price": measurement.get("candle_entry_price", raw_entry),
+        "detection_quote_at": measurement.get("detection_quote_at"),
+        "detection_bid": measurement.get("detection_bid"),
+        "detection_ask": measurement.get("detection_ask"),
+        "detection_spread_pct": measurement.get("detection_spread_pct"),
+        "executable_entry_price": measurement.get("executable_entry_price"),
+        "entry_gap_pct": measurement.get("entry_gap_pct"),
+        "adverse_entry_gap_pct": measurement.get("adverse_entry_gap_pct"),
+        "quote_source": measurement.get("quote_source"),
+        "measurement_available": bool(
+            to_float(measurement.get("executable_entry_price"), 0.0) > 0
+        ),
+        "mae_pct": 0.0,
+        "mfe_pct": 0.0,
+        "exec_mae_pct": 0.0,
+        "exec_mfe_pct": 0.0,
         "entry_price": entry,
         "amount": amount,
         "stake_eur": stake,
@@ -542,6 +620,48 @@ def evaluate(
         low = to_float(candle[3], 0.0)
         close = to_float(candle[4], 0.0)
 
+        entry = float(position["entry_price"])
+        if entry > 0:
+            if position["side"] == "LONG":
+                adverse = max(0.0, (entry - low) / entry * 100.0)
+                favorable = max(0.0, (high - entry) / entry * 100.0)
+            else:
+                adverse = max(0.0, (high - entry) / entry * 100.0)
+                favorable = max(0.0, (entry - low) / entry * 100.0)
+
+            position["mae_pct"] = max(
+                to_float(position.get("mae_pct")), adverse
+            )
+            position["mfe_pct"] = max(
+                to_float(position.get("mfe_pct")), favorable
+            )
+
+        exec_entry = to_float(
+            position.get("executable_entry_price"), 0.0
+        )
+        if exec_entry > 0:
+            if position["side"] == "LONG":
+                exec_adverse = max(
+                    0.0, (exec_entry - low) / exec_entry * 100.0
+                )
+                exec_favorable = max(
+                    0.0, (high - exec_entry) / exec_entry * 100.0
+                )
+            else:
+                exec_adverse = max(
+                    0.0, (high - exec_entry) / exec_entry * 100.0
+                )
+                exec_favorable = max(
+                    0.0, (exec_entry - low) / exec_entry * 100.0
+                )
+
+            position["exec_mae_pct"] = max(
+                to_float(position.get("exec_mae_pct")), exec_adverse
+            )
+            position["exec_mfe_pct"] = max(
+                to_float(position.get("exec_mfe_pct")), exec_favorable
+            )
+
         if position["side"] == "LONG":
             stop_hit = low <= float(position["stop_loss"])
             target_hit = high >= float(position["take_profit"])
@@ -627,7 +747,11 @@ def ingest(
     baseline_dt: datetime,
     settings: Dict[str, Any],
 ) -> None:
-    processed = {str(x) for x in state["processed_signal_keys"]}
+    processed_order = list(dict.fromkeys(
+        str(x) for x in state["processed_signal_keys"]
+    ))
+    processed = set(processed_order)
+    measurements = load_signal_measurements()
 
     # Per variant/munt/candle maximaal één signaal, met de hoogste score.
     grouped: Dict[str, Dict[Tuple[str, str], Dict[str, str]]] = {
@@ -643,6 +767,7 @@ def ingest(
             continue
 
         processed.add(key)
+        processed_order.append(key)
 
         if not to_bool(row.get("shadow_eligible"), False):
             continue
@@ -674,7 +799,12 @@ def ingest(
             grouped[name].values(),
             key=lambda x: datetime_ms(x.get("candle_timestamp")),
         ):
-            position = build_position(name, row, settings)
+            position = build_position(
+                name,
+                row,
+                settings,
+                measurements.get(candidate_key(row)),
+            )
             if position is None:
                 continue
 
@@ -686,7 +816,7 @@ def ingest(
             totals["accepted_signals"] += 1
             totals["opened"] += 1
 
-    state["processed_signal_keys"] = list(processed)[-MAX_SIGNAL_KEYS:]
+    state["processed_signal_keys"] = processed_order[-MAX_SIGNAL_KEYS:]
 
 
 def update_open_positions(
@@ -725,6 +855,15 @@ def update_open_positions(
                 continue
 
             append_trade(closed)
+
+            if name == "SELECTIVE":
+                try:
+                    append_execution_measurement(closed)
+                except Exception as exc:
+                    errors.append(
+                        f"measurement {key}: {type(exc).__name__}: {exc}"
+                    )
+
             closed_refs.append((name, key))
 
             totals = state["variants"][name]["totals"]
