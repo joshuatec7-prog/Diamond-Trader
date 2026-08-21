@@ -155,6 +155,9 @@ files:
   short_execution_file: /var/data/diamond_short_execution.csv
   short_test_archive_dir: /var/data/short_test_archive
 
+execution:
+  selective_contracts_enabled: true
+
 logging:
   level: INFO
   loop_sleep_seconds: 300
