@@ -2770,10 +2770,16 @@ def fetch_btc_24h_change(
 def send_email(
     subject: str,
     body: str,
+    bypass_mute: bool = False,
 ) -> bool:
     # MAIL_MUTE_UNTIL_LIVE_V1
-    if __import__("os").path.exists(
-        "/var/data/diamond_mail_mute_until_live.flag"
+    # Algemene/status/shadow-mails blijven gedempt wanneer de flag bestaat.
+    # Echte LIVE BUY/SELL-meldingen mogen gericht door deze mute heen.
+    if (
+        not bypass_mute
+        and __import__("os").path.exists(
+            "/var/data/diamond_mail_mute_until_live.flag"
+        )
     ):
         return True
 
@@ -9399,6 +9405,250 @@ def format_shadow_close_email(
     ])
 
 
+def handle_live_trade_notifications(
+    agent_state: Dict[str, Any],
+) -> int:
+    """
+    Stuurt precies één e-mail per nieuwe ECHTE BUY/SELL-transactie.
+
+    Veiligheid:
+    - dry-run transacties worden nooit gemaild;
+    - bestaande transacties worden bij eerste initialisatie alleen
+      als gezien opgeslagen;
+    - verzonden transacties worden persistent onthouden;
+    - restart/deploy veroorzaakt daardoor geen dubbele meldingen;
+    - bij mailfout wordt de transactie niet als verzonden gemarkeerd,
+      zodat later opnieuw geprobeerd kan worden.
+    """
+    path = Path(TRADES_FILE)
+
+    if not path.exists():
+        return 0
+
+    try:
+        with path.open(
+            "r",
+            encoding="utf-8-sig",
+            newline="",
+        ) as file:
+            rows = list(csv.DictReader(file))
+    except Exception as exc:
+        LOG.error(
+            "Live transacties lezen mislukt: %s",
+            exc,
+        )
+        return 0
+
+    live_rows: List[Dict[str, Any]] = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        side = str(
+            row.get("side") or ""
+        ).strip().upper()
+
+        if side not in {"BUY", "SELL"}:
+            continue
+
+        # Fail-safe: alleen rijen met expliciete dry_run-kolom.
+        if "dry_run" not in row:
+            continue
+
+        if to_bool(
+            row.get("dry_run"),
+            True,
+        ):
+            continue
+
+        live_rows.append(row)
+
+    def event_key(
+        row: Dict[str, Any],
+    ) -> str:
+        raw = "|".join(
+            [
+                str(row.get("ts") or ""),
+                str(row.get("market") or ""),
+                str(row.get("side") or ""),
+                str(row.get("price") or ""),
+                str(row.get("amount") or ""),
+                str(row.get("quote_amount") or ""),
+                str(row.get("fees_quote") or ""),
+                str(row.get("reason") or ""),
+            ]
+        )
+
+        return hashlib.sha256(
+            raw.encode("utf-8")
+        ).hexdigest()
+
+    existing_keys = [
+        event_key(row)
+        for row in live_rows
+    ]
+
+    # Eerste start na installatie:
+    # alle reeds bestaande echte trades als gezien markeren.
+    if not to_bool(
+        agent_state.get(
+            "live_trade_notifications_initialized"
+        ),
+        False,
+    ):
+        agent_state[
+            "notified_live_trade_keys"
+        ] = existing_keys[-500:]
+
+        agent_state[
+            "live_trade_notifications_initialized"
+        ] = True
+
+        agent_state.setdefault(
+            "live_trade_notifications_sent",
+            0,
+        )
+
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.info(
+            "Live trade mail baseline gestart | "
+            "bestaande echte transacties=%d",
+            len(existing_keys),
+        )
+
+        return 0
+
+    history = set(
+        str(value)
+        for value in (
+            agent_state.get(
+                "notified_live_trade_keys"
+            )
+            or []
+        )
+    )
+
+    agent_state.setdefault(
+        "notified_live_trade_keys",
+        [],
+    )
+    agent_state.setdefault(
+        "live_trade_notifications_sent",
+        0,
+    )
+
+    sent_count = 0
+
+    for row in live_rows:
+        key = event_key(row)
+
+        if key in history:
+            continue
+
+        side = str(
+            row.get("side") or ""
+        ).strip().upper()
+
+        market = str(
+            row.get("market") or "ONBEKEND"
+        )
+
+        action = (
+            "AANKOOP"
+            if side == "BUY"
+            else "VERKOOP"
+        )
+
+        subject = (
+            f"Diamond Trader LIVE {action} | {market}"
+        )
+
+        lines = [
+            "DIAMOND TRADER LIVE TRANSACTIE",
+            "=" * 40,
+            f"Type       : {action}",
+            f"Markt      : {market}",
+            f"Tijd       : {row.get('ts') or '-'}",
+            f"Prijs      : {row.get('price') or '-'}",
+            f"Aantal     : {row.get('amount') or '-'}",
+            f"Bedrag     : {row.get('quote_amount') or '-'}",
+            f"Kosten     : {row.get('fees_quote') or '-'}",
+            f"Netto PnL  : {row.get('net_pnl_quote') or '-'}",
+            f"Reden      : {row.get('reason') or '-'}",
+            "=" * 40,
+            "Dit is een echte Bitvavo-transactie.",
+        ]
+
+        sent = send_email(
+            subject,
+            "\n".join(lines),
+            bypass_mute=True,
+        )
+
+        if not sent:
+            LOG.warning(
+                "Live trade e-mail mislukt | %s | %s",
+                side,
+                market,
+            )
+            continue
+
+        agent_state[
+            "notified_live_trade_keys"
+        ].append(key)
+
+        history.add(key)
+
+        agent_state[
+            "notified_live_trade_keys"
+        ] = agent_state[
+            "notified_live_trade_keys"
+        ][-500:]
+
+        agent_state[
+            "live_trade_notifications_sent"
+        ] = int(
+            to_float(
+                agent_state.get(
+                    "live_trade_notifications_sent"
+                ),
+                0,
+            )
+        ) + 1
+
+        agent_state[
+            "last_live_trade_email_at"
+        ] = now_local().isoformat()
+
+        agent_state[
+            "last_live_trade_email_market"
+        ] = market
+
+        agent_state[
+            "last_live_trade_email_side"
+        ] = side
+
+        # Meteen persistent opslaan om dubbele mails na restart
+        # zo veel mogelijk uit te sluiten.
+        save_agent_state(
+            agent_state
+        )
+
+        LOG.info(
+            "Live trade e-mail verzonden | %s | %s",
+            side,
+            market,
+        )
+
+        sent_count += 1
+
+    return sent_count
+
+
 def handle_shadow_trade_notifications(
     agent_state: Dict[str, Any],
 ) -> int:
@@ -9716,6 +9966,10 @@ def main() -> None:
     while True:
         try:
             handle_daily_backup(
+                agent_state
+            )
+
+            handle_live_trade_notifications(
                 agent_state
             )
 
