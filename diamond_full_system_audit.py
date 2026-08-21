@@ -80,6 +80,44 @@ if rc==0:
 snaps=sorted(DATA.glob("diamond_source_snapshot_*.tar.gz"),key=lambda p:p.stat().st_mtime,reverse=True)
 if not snaps: problem("WARN","Broncode/Git","Geen persistente source snapshot")
 
+
+# PERIODIC TASK-COMMAND INTEGRITY
+try:
+    import ast as _ast
+
+    _src = Path("periodic_analysis_runner.py").read_text(errors="ignore")
+    _tree = _ast.parse(_src)
+
+    for _fn in [
+        n for n in _tree.body
+        if isinstance(n, _ast.FunctionDef) and n.name == "task_commands"
+    ]:
+        for _node in _ast.walk(_fn):
+            if not isinstance(_node, _ast.List):
+                continue
+
+            _scripts = [
+                x.value
+                for x in _node.elts
+                if isinstance(x, _ast.Constant)
+                and isinstance(x.value, str)
+                and x.value.endswith(".py")
+            ]
+
+            if len(_scripts) > 1:
+                problem(
+                    "FAIL",
+                    "Broncode/Git",
+                    "Periodic command bevat meerdere Python-scripts: "
+                    + ", ".join(_scripts),
+                )
+except Exception as e:
+    problem(
+        "WARN",
+        "Broncode/Git",
+        f"Periodic command-integriteit niet controleerbaar: {type(e).__name__}",
+    )
+
 # RUNTIME
 _,ps=run(["ps","-eo","args="]); lines=ps.splitlines()
 for script in ["agent.py","supervisor_agent.py","closed_candle_runner.py","periodic_analysis_runner.py"]:

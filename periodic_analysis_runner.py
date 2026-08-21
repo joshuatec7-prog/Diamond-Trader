@@ -56,6 +56,7 @@ LONG_COMBO_SHADOW_V2_LOG = DATA_DIR / "diamond_long_combo_shadow_v2_runner.log"
 SCANNER_SELECTIVE_SHADOW_LOG = DATA_DIR / "diamond_scanner_selective_shadow_runner.log"
 EXECUTION_QUALITY_SHADOW_LOG = DATA_DIR / "diamond_execution_quality_shadow_runner.log"
 SELECTIVE_PROSPECTIVE_CANDIDATE_LOG = DATA_DIR / "diamond_selective_prospective_candidate_runner.log"
+SELECTIVE_POST_COVERAGE_LOG = DATA_DIR / "diamond_selective_post_coverage_runner.log"
 ENTRY_TIMING_PROSPECTIVE_LOG = DATA_DIR / "diamond_entry_timing_prospective_runner.log"
 LIST4_FUSION_LOG = DATA_DIR / "diamond_list4_fusion_runner.log"
 LIST4_ADMISSION_LOG = DATA_DIR / "diamond_list4_admission_runner.log"
@@ -177,7 +178,10 @@ def task_commands() -> Dict[str, list[str]]:
         "selective_prospective_candidate": [
             sys.executable,
             "diamond_selective_prospective_candidate_tracker.py",
-            "diamond_selective_v2_candidate_tracker.py",
+        ],
+        "selective_post_coverage": [
+            sys.executable,
+            "diamond_selective_post_coverage_tracker.py",
         ],
         "entry_timing_prospective": [
             sys.executable,
@@ -567,6 +571,16 @@ def run_forever() -> None:
 
         run_task(
             state,
+            "selective_post_coverage",
+            task_commands()["selective_post_coverage"],
+            SELECTIVE_POST_COVERAGE_LOG,
+        )
+
+        if STOP_REQUESTED:
+            break
+
+        run_task(
+            state,
             "entry_timing_prospective",
             task_commands()["entry_timing_prospective"],
             ENTRY_TIMING_PROSPECTIVE_LOG,
@@ -746,6 +760,7 @@ def self_test() -> None:
         "scanner_selective_shadow",
         "execution_quality_shadow",
         "selective_prospective_candidate",
+        "selective_post_coverage",
         "entry_timing_prospective",
         "list4_fusion",
         "list4_admission",
@@ -849,12 +864,21 @@ def self_test() -> None:
     assert (
         state["tasks"]["selective_prospective_candidate"]["command"][-1]
         == "diamond_selective_prospective_candidate_tracker.py"
-        == "diamond_selective_v2_candidate_tracker.py"
     )
 
     assert (
         SELECTIVE_PROSPECTIVE_CANDIDATE_LOG.name
         == "diamond_selective_prospective_candidate_runner.log"
+    )
+
+    assert (
+        state["tasks"]["selective_post_coverage"]["command"][-1]
+        == "diamond_selective_post_coverage_tracker.py"
+    )
+
+    assert (
+        SELECTIVE_POST_COVERAGE_LOG.name
+        == "diamond_selective_post_coverage_runner.log"
     )
 
     assert (
