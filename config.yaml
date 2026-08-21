@@ -27,7 +27,7 @@ trading:
   max_total_positions: 5
 
 risk:
-  dry_run: true
+  dry_run: false
   fixed_stake_quote: 30
   max_open_positions: 1
   eur_reserve: 1000
