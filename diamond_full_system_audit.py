@@ -98,7 +98,15 @@ for p in DATA.glob("*.log"):
             f.seek(max(0,p.stat().st_size-500000))
             txt=f.read().decode("utf-8","replace")
         for line in txt.splitlines():
-            if today in line and re.search(r"Traceback|ERROR|CRITICAL|OOM|Killed",line,re.I):
+            # Nieuwe markten hebben soms tijdelijk onvoldoende candlehistorie.
+            # Dit is datamaturiteit en geen runtimefout.
+            if "te weinig candles:" in line:
+                continue
+            if today in line and re.search(
+                r"Traceback|ERROR|CRITICAL|OOM|Killed",
+                line,
+                re.I,
+            ):
                 errs.append(f"{p.name}: {line[-180:]}")
     except:pass
 for x in errs[-6:]: problem("WARN","Runtime","Actuele logfout: "+x)
@@ -143,9 +151,22 @@ try:
     cfg=yaml.safe_load((ROOT/"config.yaml").read_text()) or {}
     s=cfg.get("scanner",{}) if isinstance(cfg,dict) else {}
     ms=cfg.get("market_scanner",{}) if isinstance(cfg,dict) else {}
-    if "top_n_markets" in s and "top_n_markets" not in ms:
-        problem("WARN","Scanner",
-            f"Config-key mismatch: scanner.top_n_markets={s.get('top_n_markets')} maar runtime gebruikt market_scanner.top_n_markets/default 20")
+    scanner_top=s.get("top_n_markets")
+    market_top=ms.get("top_n_markets")
+
+    # market_scanner.py ondersteunt scanner.top_n_markets nu als fallback.
+    # Alleen waarschuwen wanneer beide keys bestaan en elkaar tegenspreken.
+    if (
+        scanner_top is not None
+        and market_top is not None
+        and scanner_top != market_top
+    ):
+        problem(
+            "WARN",
+            "Scanner",
+            f"Tegenstrijdige top_n config: scanner={scanner_top}, "
+            f"market_scanner={market_top}",
+        )
 except Exception as e: problem("WARN","Scanner",f"Config niet gelezen: {type(e).__name__}")
 
 # POST-COVERAGE
