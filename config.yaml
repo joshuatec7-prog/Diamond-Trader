@@ -32,7 +32,7 @@ risk:
   max_open_positions: 1
   eur_reserve: 1000
   max_spread_pct: 0.25
-  min_profit_eur: 1.00
+  min_profit_eur: 0.50
   cooldown_minutes: 240
   skip_log_every_seconds: 600
 
