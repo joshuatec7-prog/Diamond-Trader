@@ -73,7 +73,7 @@ signals:
 
 scanner:
   auto_scan: false
-  top_n_markets: 5
+  top_n_markets: 20
   min_quote_volume: 250000
 
   exclude_bases:

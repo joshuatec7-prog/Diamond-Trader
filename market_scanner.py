@@ -370,7 +370,11 @@ def settings(
         raw_excluded = []
 
     configured_top = to_int(
-        get_cfg(config, "market_scanner.top_n_markets", 20),
+        get_cfg(
+            config,
+            "market_scanner.top_n_markets",
+            get_cfg(config, "scanner.top_n_markets", 20),
+        ),
         20,
     )
 
