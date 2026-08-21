@@ -835,23 +835,20 @@ class Bot:
     def legacy_spot_entry_route_enabled(self) -> bool:
         return not self.selective_execution_enabled
 
-    def selective_dry_run_candidates(self) -> List[Dict[str, Any]]:
+    def selective_execution_candidates(self) -> List[Dict[str, Any]]:
         if not self.selective_execution_enabled:
             return []
-        if not self.dry_run:
-            raise RuntimeError(
-                "SELECTIVE_EXECUTION_BLOCKED:2D_DRY_RUN_ONLY"
-            )
-
         contracts = new_execution_contracts(
             Path(self.selective_signals_file),
             Path(self.selective_execution_cursor_file),
         )
 
         for item in contracts:
-            item["execution_mode"] = "DRY_RUN_ONLY"
+            item["execution_mode"] = (
+                "DRY_RUN" if self.dry_run else "CANARY_GATED"
+            )
             LOG.info(
-                "SELECTIVE DRY-RUN | key=%s | %s | %s",
+                "SELECTIVE EXECUTION | key=%s | %s | %s",
                 item.get("candidate_key"),
                 item.get("symbol"),
                 item.get("strategy"),
@@ -896,8 +893,8 @@ class Bot:
             ),
         }
 
-    def execute_selective_contracts_dry_run(self) -> int:
-        contracts = self.selective_dry_run_candidates()
+    def execute_selective_contracts(self) -> int:
+        contracts = self.selective_execution_candidates()
 
         for contract in contracts:
             signal = self.selective_contract_to_long_signal(
@@ -6026,15 +6023,7 @@ class Bot:
             )
 
         if self.selective_execution_enabled and not block_spot_entries:
-            if self.dry_run:
-                self.execute_selective_contracts_dry_run()
-            else:
-                self.rate_limited_info(
-                    self.last_skip_log_ts,
-                    "selective_2d_live_block",
-                    300,
-                    "SELECTIVE 2D is DRY-RUN ONLY | live BUY geblokkeerd",
-                )
+            self.execute_selective_contracts()
 
         max_open_spot = int(
             to_float(
