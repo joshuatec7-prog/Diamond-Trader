@@ -839,12 +839,15 @@ class Bot:
         if not self.selective_execution_enabled:
             return []
         if not self.dry_run:
-            raise RuntimeError("SELECTIVE_EXECUTION_BLOCKED:2D_DRY_RUN_ONLY")
+            raise RuntimeError(
+                "SELECTIVE_EXECUTION_BLOCKED:2D_DRY_RUN_ONLY"
+            )
 
         contracts = new_execution_contracts(
             Path(self.selective_signals_file),
             Path(self.selective_execution_cursor_file),
         )
+
         for item in contracts:
             item["execution_mode"] = "DRY_RUN_ONLY"
             LOG.info(
@@ -853,13 +856,77 @@ class Bot:
                 item.get("symbol"),
                 item.get("strategy"),
             )
+
         return contracts
+
+    def selective_contract_to_long_signal(
+        self,
+        contract: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if str(contract.get("side") or "").upper() != "LONG":
+            raise ValueError("SELECTIVE_EXECUTION_LONG_ONLY")
+
+        entry = to_float(contract.get("entry_price"), 0.0)
+        stop = to_float(contract.get("stop_loss"), 0.0)
+        target = to_float(contract.get("take_profit"), 0.0)
+
+        if entry <= 0 or stop <= 0 or target <= 0:
+            raise ValueError("SELECTIVE_EXECUTION_INVALID_PRICES")
+
+        return {
+            "candidate_key": str(contract.get("candidate_key") or ""),
+            "signal_candle_ts": str(
+                contract.get("candle_timestamp") or ""
+            ),
+            "candle_timestamp": str(
+                contract.get("candle_timestamp") or ""
+            ),
+            "close": entry,
+            "stop_loss": stop,
+            "take_profit": target,
+            "tech_score": to_float(contract.get("score"), 0.0),
+            "rsi": 0.0,
+            "atr_pct": 0.0,
+            "strategy": str(contract.get("strategy") or ""),
+            "market_regime": str(
+                contract.get("market_regime") or ""
+            ),
+            "selection_reason": str(
+                contract.get("selection_reason") or "UNKNOWN"
+            ),
+        }
+
+    def execute_selective_contracts_dry_run(self) -> int:
+        contracts = self.selective_dry_run_candidates()
+
+        for contract in contracts:
+            signal = self.selective_contract_to_long_signal(
+                contract
+            )
+
+            self.try_buy_symbol(
+                str(contract.get("symbol") or ""),
+                precomputed_signal=signal,
+                precomputed_news_gate={
+                    "allow": True,
+                    "reason": "SELECTIVE_CONTRACT",
+                },
+            )
+
+        return len(contracts)
 
     def long_order_key(
         self,
         symbol: str,
         signal: Dict[str, Any],
     ) -> str:
+        candidate_key = str(
+            signal.get("candidate_key") or ""
+        ).strip()
+
+        if candidate_key:
+            return candidate_key
+
         candle_key = str(
             signal.get("signal_candle_ts")
             or signal.get("candle_timestamp")
@@ -1079,6 +1146,16 @@ class Bot:
             "spread_pct": float(spread_pct),
             "protected_base_amount": float(protected_base_amount),
             "signal": {
+                "candidate_key": str(
+                    signal.get("candidate_key") or ""
+                ),
+                "strategy": str(signal.get("strategy") or ""),
+                "market_regime": str(
+                    signal.get("market_regime") or ""
+                ),
+                "selection_reason": str(
+                    signal.get("selection_reason") or ""
+                ),
                 "signal_candle_ts": str(
                     signal.get("signal_candle_ts")
                     or ""
@@ -1492,6 +1569,21 @@ class Bot:
             {},
         )[symbol] = {
             "opened_by_bot": True,
+            "candidate_key": str(
+                signal.get("candidate_key")
+                or order_key
+                or ""
+            ),
+            "strategy": str(signal.get("strategy") or ""),
+            "market_regime": str(
+                signal.get("market_regime") or ""
+            ),
+            "selection_reason": str(
+                signal.get("selection_reason") or ""
+            ),
+            "signal_candle_ts": str(
+                signal.get("signal_candle_ts") or ""
+            ),
             "opened_at": to_float(
                 record.get("created_at_ts"),
                 utc_now_ts(),
@@ -4947,6 +5039,19 @@ class Bot:
 
             self.state["positions"][symbol] = {
                 "opened_by_bot": True,
+                "candidate_key": str(
+                    signal.get("candidate_key") or ""
+                ),
+                "strategy": str(signal.get("strategy") or ""),
+                "market_regime": str(
+                    signal.get("market_regime") or ""
+                ),
+                "selection_reason": str(
+                    signal.get("selection_reason") or ""
+                ),
+                "signal_candle_ts": str(
+                    signal.get("signal_candle_ts") or ""
+                ),
                 "opened_at": utc_now_ts(),
                 "entry_price": price,
                 "amount": amount,
@@ -5922,7 +6027,7 @@ class Bot:
 
         if self.selective_execution_enabled and not block_spot_entries:
             if self.dry_run:
-                self.selective_dry_run_candidates()
+                self.execute_selective_contracts_dry_run()
             else:
                 self.rate_limited_info(
                     self.last_skip_log_ts,
