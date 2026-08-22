@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 from datetime import datetime, timezone
 
+from diamond_market_crash_guard import poll_market_crash_guard
 from diamond_selective_rules import (
     execution_signal,
     selective_accepts,
@@ -74,6 +75,21 @@ def new_execution_contracts(
     now = datetime.now(timezone.utc)
     eligible = []
 
+    # REALTIME_MARKET_CRASH_GUARD
+    #
+    # Deze guard gebruikt een verse Bitvavo-marktsnapshot van BTC, ETH,
+    # SOL, XRP en ADA en vergelijkt die met een recente snapshot. Daardoor
+    # is de LONG-beslissing niet uitsluitend afhankelijk van het oudere
+    # market_regime-label dat bij het SELECTIVE-signaal hoort.
+    #
+    # WARMUP, onvolledige data en API-fouten zijn fail-closed voor nieuwe
+    # LONG-entries. Bestaande posities worden hier niet geraakt en blijven
+    # door de normale stop/trailing-logica beheerd.
+    crash_guard = poll_market_crash_guard()
+    allow_long_by_market = bool(
+        crash_guard.get("allow_long", False)
+    )
+
     for row in load_candidates(signals_path):
         key = row["candidate_key"]
         if key in seen:
@@ -114,10 +130,27 @@ def new_execution_contracts(
         }:
             continue
 
+        if not allow_long_by_market:
+            continue
+
         eligible.append(row)
 
     state["seen_keys"] = seen_order[-30000:]
     state["last_poll_at"] = now.isoformat()
+    state["crash_guard_status"] = str(
+        crash_guard.get("status") or "UNKNOWN"
+    )
+    state["crash_guard_reason"] = str(
+        crash_guard.get("reason") or ""
+    )
+    state["crash_guard_block_until"] = crash_guard.get(
+        "block_until",
+        0.0,
+    )
+    state["crash_guard_changes_pct"] = crash_guard.get(
+        "changes_pct",
+        {},
+    )
 
     cursor_path.write_text(
         json.dumps(state, indent=2),
