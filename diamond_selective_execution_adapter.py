@@ -94,6 +94,26 @@ def new_execution_contracts(
         if row.get("side") != "LONG":
             continue
 
+        # BEARISH_REGIME_LONG_BLOCK
+        #
+        # SELECTIVE zelf blijft ongewijzigd. Dit is uitsluitend
+        # een execution-gate vlak vóór een LONG-contract wordt
+        # doorgegeven aan de live bot.
+        #
+        # Ontbrekend regime is fail-closed: geen nieuwe LONG.
+        regime = str(
+            row.get("market_regime") or ""
+        ).strip().upper()
+
+        if not regime:
+            continue
+
+        if regime in {
+            "BEARISH",
+            "BEARISH_WEAK",
+        }:
+            continue
+
         eligible.append(row)
 
     state["seen_keys"] = seen_order[-30000:]
