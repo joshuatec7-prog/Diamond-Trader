@@ -158,6 +158,18 @@ files:
 execution:
   selective_contracts_enabled: true
 
+  # Fail-closed orderboekcontrole voor nieuwe echte LONG BUYs.
+  liquidity_gate_enabled: true
+  liquidity_orderbook_depth: 50
+
+  # Geschatte VWAP-impact van een market BUY mag maximaal 0.15% zijn.
+  liquidity_max_price_impact_pct: 0.15
+
+  # Binnen 0.25% boven de beste ask moet minimaal 2x de
+  # geplande inzet aan zichtbare ask-liquiditeit liggen.
+  liquidity_depth_band_pct: 0.25
+  liquidity_min_depth_multiple: 2.0
+
   # Open echte LONG-posities worden tussen de zware
   # strategiecycli door met actuele bid-prijs bewaakt.
   position_check_seconds: 20

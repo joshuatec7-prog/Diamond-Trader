@@ -18,6 +18,7 @@ import pandas as pd
 import yaml
 from dotenv import load_dotenv
 from diamond_selective_execution_adapter import new_execution_contracts
+from diamond_liquidity_gate import evaluate_buy_liquidity
 
 LOG = logging.getLogger("diamond_trader")
 
@@ -4880,6 +4881,111 @@ class Bot:
                         )
                     )
                     return
+
+                # LIVE_BUY_ORDERBOOK_LIQUIDITY_GATE
+                #
+                # Alleen nieuwe echte BUYs worden hier gefilterd.
+                # Protective SELLs worden NOOIT door deze gate geblokkeerd.
+                liquidity_gate_enabled = to_bool(
+                    get_cfg(
+                        self.cfg,
+                        "execution.liquidity_gate_enabled",
+                        True,
+                    ),
+                    True,
+                )
+
+                if (
+                    not self.dry_run
+                    and liquidity_gate_enabled
+                ):
+                    try:
+                        book_depth = max(
+                            5,
+                            min(
+                                1000,
+                                int(
+                                    to_float(
+                                        get_cfg(
+                                            self.cfg,
+                                            "execution.liquidity_orderbook_depth",
+                                            50,
+                                        ),
+                                        50,
+                                    )
+                                ),
+                            ),
+                        )
+
+                        order_book = (
+                            self.exchange.fetch_order_book(
+                                symbol,
+                                book_depth,
+                            )
+                        )
+
+                        liquidity = evaluate_buy_liquidity(
+                            order_book,
+                            stake,
+                            max_price_impact_pct=to_float(
+                                get_cfg(
+                                    self.cfg,
+                                    "execution.liquidity_max_price_impact_pct",
+                                    0.15,
+                                ),
+                                0.15,
+                            ),
+                            depth_band_pct=to_float(
+                                get_cfg(
+                                    self.cfg,
+                                    "execution.liquidity_depth_band_pct",
+                                    0.25,
+                                ),
+                                0.25,
+                            ),
+                            min_depth_multiple=to_float(
+                                get_cfg(
+                                    self.cfg,
+                                    "execution.liquidity_min_depth_multiple",
+                                    2.0,
+                                ),
+                                2.0,
+                            ),
+                        )
+                    except Exception as exc:
+                        self.rate_limited_info(
+                            self.last_skip_log_ts,
+                            f"liquidity_error:{symbol}",
+                            300,
+                            "OVERSLAAN KOPEN %s | "
+                            "liquidity gate fout: %s",
+                            symbol,
+                            type(exc).__name__,
+                        )
+                        return
+
+                    if not liquidity.get("allow", False):
+                        self.rate_limited_info(
+                            self.last_skip_log_ts,
+                            f"liquidity_block:{symbol}",
+                            300,
+                            "OVERSLAAN KOPEN %s | "
+                            "liquidity=%s | "
+                            "impact=%.4f%% | depth=%.2fx",
+                            symbol,
+                            liquidity.get("reason"),
+                            to_float(
+                                liquidity.get(
+                                    "estimated_price_impact_pct"
+                                ),
+                                0.0,
+                            ),
+                            to_float(
+                                liquidity.get("depth_multiple"),
+                                0.0,
+                            ),
+                        )
+                        return
 
                 record = self.prepare_pending_long_order(
                     order_key,

@@ -29,6 +29,22 @@ class FakeExchange:
         self.fetch_calls = []
         self.orders = {}
         self.fetch_error = None
+        self.order_book = {
+            "bids": [[99.9, 10.0]],
+            "asks": [
+                [100.0, 10.0],
+                [100.05, 10.0],
+            ],
+        }
+
+    def fetch_order_book(
+        self,
+        symbol,
+        limit=None,
+        params=None,
+    ):
+        return dict(self.order_book)
+
     def create_order(self, symbol, typ, side, amount, price, params):
         self.create_calls.append((symbol, typ, side, amount, price, dict(params or {})))
         cid = (params or {}).get('clientOrderId')
