@@ -1,7 +1,7 @@
 # Diamond Trader configuratie
-# Nieuwe longposities staan tijdelijk uit.
+# Echte LONGs vereisen altijd een geldige fail-closed approval.
 # De paper-shorttest gebruikt strategie short_breakout_v3.
-# Echte orders blijven volledig uitgeschakeld zolang risk.dry_run true is.
+# Shorts blijven paper-only; echte LONGs gaan alleen via approval + safety gates.
 
 quote: EUR
 timeframe: 15m
@@ -14,7 +14,7 @@ symbols:
   - ADA/EUR
 
 trading:
-  # Tijdelijk uitgeschakeld na de zwakke eerste longtest.
+  # Spot LONG-route actief achter approval en safety gates.
   enable_spot: true
 
   # Alleen gesimuleerde shortposities.
@@ -28,9 +28,15 @@ trading:
 
 risk:
   dry_run: false
-  fixed_stake_quote: 30
+  fixed_stake_quote: 130
   max_open_positions: 1
-  eur_reserve: 1000
+  eur_reserve: 250
+
+  # Canary blijft hard begrensd op €30.
+  canary_hard_max_stake_quote: 30.0
+
+  # Normale LIVE-modus kan nooit boven €130 per trade.
+  live_hard_max_stake_quote: 130.0
   max_spread_pct: 0.25
   min_profit_eur: 0.50
   cooldown_minutes: 240
@@ -157,6 +163,11 @@ files:
 
 execution:
   selective_contracts_enabled: true
+
+  # Normale LIVE-modus wordt pas toegelaten nadat
+  # minimaal 5 echte canary-trades zijn afgerond.
+  live_mode_enabled: true
+  require_canary_graduation_trades: 5
 
   # Fail-closed orderboekcontrole voor nieuwe echte LONG BUYs.
   liquidity_gate_enabled: true

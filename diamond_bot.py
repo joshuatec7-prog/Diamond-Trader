@@ -1000,84 +1000,263 @@ class Bot:
         stake_quote: float,
         canary_trade_number: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Fail-closed gate voor iedere nieuwe echte BUY."""
+        """
+        Fail-closed approval gate voor iedere nieuwe echte BUY.
+
+        CANARY:
+        - uitsluitend historische/afgebakende canaryfase;
+        - maximaal het goedgekeurde aantal canary-trades;
+        - aparte harde stake-limiet.
+
+        LIVE:
+        - alleen toegestaan nadat de canaryfase is afgerond;
+        - vereist expliciete LIVE approval;
+        - vereist expliciete graduated_from_canary bevestiging;
+        - behoudt expiry en harde stake-limiet.
+        """
         if self.dry_run:
-            return {"allow": True, "reason": "dry_run"}
+            return {
+                "allow": True,
+                "reason": "dry_run",
+                "mode": "DRY_RUN",
+            }
 
         approval = self.live_approval()
 
         approved = bool(
-            str(approval.get("status", "")).upper() == "APPROVED"
+            str(
+                approval.get("status", "")
+            ).upper() == "APPROVED"
             or approval.get("approved") is True
         )
+
         if not approved:
-            return {"allow": False, "reason": "approval_missing_or_revoked"}
+            return {
+                "allow": False,
+                "reason": "approval_missing_or_revoked",
+            }
 
-        if str(approval.get("mode") or "").upper() != "CANARY":
-            return {"allow": False, "reason": "approval_mode_not_canary"}
+        mode = str(
+            approval.get("mode") or ""
+        ).strip().upper()
 
-        if not to_bool(approval.get("allow_new_entries"), False):
-            return {"allow": False, "reason": "new_entries_not_allowed"}
+        if mode not in {
+            "CANARY",
+            "LIVE",
+        }:
+            return {
+                "allow": False,
+                "reason": "approval_mode_invalid",
+            }
 
-        expires_at = str(approval.get("expires_at") or "").strip()
+        if not to_bool(
+            approval.get("allow_new_entries"),
+            False,
+        ):
+            return {
+                "allow": False,
+                "reason": "new_entries_not_allowed",
+            }
+
+        expires_at = str(
+            approval.get("expires_at") or ""
+        ).strip()
+
         if not expires_at:
-            return {"allow": False, "reason": "approval_expiry_missing"}
+            return {
+                "allow": False,
+                "reason": "approval_expiry_missing",
+            }
 
         try:
             expiry = datetime.fromisoformat(
-                expires_at.replace("Z", "+00:00")
+                expires_at.replace(
+                    "Z",
+                    "+00:00",
+                )
             )
+
             if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) >= expiry.astimezone(timezone.utc):
-                return {"allow": False, "reason": "approval_expired"}
+                expiry = expiry.replace(
+                    tzinfo=timezone.utc
+                )
+
+            if (
+                expiry.astimezone(timezone.utc)
+                <= datetime.now(timezone.utc)
+            ):
+                return {
+                    "allow": False,
+                    "reason": "approval_expired",
+                }
+
         except Exception:
-            return {"allow": False, "reason": "approval_expiry_invalid"}
+            return {
+                "allow": False,
+                "reason": "approval_expiry_invalid",
+            }
 
-        max_trades = int(
-            to_float(approval.get("max_canary_trades"), 0)
-        )
-        if max_trades < 1 or max_trades > 5:
-            return {"allow": False, "reason": "invalid_max_canary_trades"}
-
-        hard_max = to_float(
-            get_cfg(
-                self.cfg,
-                "risk.canary_hard_max_stake_quote",
+        if mode == "CANARY":
+            hard_max = to_float(
+                get_cfg(
+                    self.cfg,
+                    "risk.canary_hard_max_stake_quote",
+                    30.0,
+                ),
+                30.0,
+            )
+        else:
+            hard_max = to_float(
+                get_cfg(
+                    self.cfg,
+                    "risk.live_hard_max_stake_quote",
+                    130.0,
+                ),
                 130.0,
-            ),
-            130.0,
-        )
+            )
+
         approved_max = to_float(
             approval.get("max_stake_quote"),
             0.0,
         )
-        allowed_stake = min(hard_max, approved_max)
+
+        allowed_stake = min(
+            hard_max,
+            approved_max,
+        )
 
         if allowed_stake <= 0:
-            return {"allow": False, "reason": "invalid_max_stake"}
+            return {
+                "allow": False,
+                "reason": "invalid_max_stake",
+            }
 
-        if float(stake_quote) > allowed_stake + 1e-9:
-            return {"allow": False, "reason": "stake_above_canary_limit"}
+        if float(stake_quote) > (
+            allowed_stake + 1e-9
+        ):
+            return {
+                "allow": False,
+                "reason": (
+                    "stake_above_canary_limit"
+                    if mode == "CANARY"
+                    else "stake_above_live_limit"
+                ),
+            }
 
-        trade_number = canary_trade_number
-        if trade_number is None:
-            trade_number = int(
+        if mode == "CANARY":
+            max_trades = int(
                 to_float(
-                    self.state.get("canary_trade_sequence"),
+                    approval.get(
+                        "max_canary_trades"
+                    ),
                     0,
                 )
-            ) + 1
+            )
 
-        if int(trade_number) < 1 or int(trade_number) > max_trades:
-            return {"allow": False, "reason": "canary_trade_limit_reached"}
+            if (
+                max_trades < 1
+                or max_trades > 5
+            ):
+                return {
+                    "allow": False,
+                    "reason": "invalid_max_canary_trades",
+                }
+
+            trade_number = (
+                canary_trade_number
+            )
+
+            if trade_number is None:
+                trade_number = int(
+                    to_float(
+                        self.state.get(
+                            "canary_trade_sequence"
+                        ),
+                        0,
+                    )
+                ) + 1
+
+            if (
+                int(trade_number) < 1
+                or int(trade_number)
+                > max_trades
+            ):
+                return {
+                    "allow": False,
+                    "reason": "canary_trade_limit_reached",
+                }
+
+            return {
+                "allow": True,
+                "reason": "approved_canary_entry",
+                "mode": "CANARY",
+                "trade_number": int(
+                    trade_number
+                ),
+                "allowed_stake": allowed_stake,
+            }
+
+        # Vanaf hier uitsluitend normale LIVE-modus.
+
+        if not to_bool(
+            get_cfg(
+                self.cfg,
+                "execution.live_mode_enabled",
+                False,
+            ),
+            False,
+        ):
+            return {
+                "allow": False,
+                "reason": "live_mode_disabled",
+            }
+
+        required_canary = max(
+            5,
+            int(
+                to_float(
+                    get_cfg(
+                        self.cfg,
+                        "execution.require_canary_graduation_trades",
+                        5,
+                    ),
+                    5,
+                )
+            ),
+        )
+
+        completed_canary = int(
+            to_float(
+                self.state.get(
+                    "canary_trade_sequence"
+                ),
+                0,
+            )
+        )
+
+        if completed_canary < required_canary:
+            return {
+                "allow": False,
+                "reason": "canary_graduation_incomplete",
+            }
+
+        if not to_bool(
+            approval.get(
+                "graduated_from_canary"
+            ),
+            False,
+        ):
+            return {
+                "allow": False,
+                "reason": "live_graduation_not_approved",
+            }
 
         return {
             "allow": True,
-            "reason": "approved_canary_entry",
-            "trade_number": int(trade_number),
-            "max_trades": max_trades,
-            "max_stake_quote": allowed_stake,
+            "reason": "approved_live_entry",
+            "mode": "LIVE",
+            "allowed_stake": allowed_stake,
+            "completed_canary": completed_canary,
         }
 
     def entries_blocked_by_recovery(self) -> bool:
@@ -4844,7 +5023,7 @@ class Bot:
             if not gate.get("allow", False):
                 self.rate_limited_info(
                     self.last_skip_log_ts,
-                    f"canary_gate:{symbol}:{gate.get('reason')}",
+                    f"approval_gate:{symbol}:{gate.get('reason')}",
                     300,
                     "LIVE BUY GEBLOKKEERD %s | %s",
                     symbol,

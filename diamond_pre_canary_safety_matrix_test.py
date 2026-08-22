@@ -528,6 +528,191 @@ def t24():
 test('24. Approval revoke vlak vóór exchange-submit', t24)
 
 
+
+# 25-29 Normale LIVE-graduation safety
+
+def write_live_approval(
+    bot,
+    *,
+    graduated=True,
+    max_stake=130.0,
+):
+    approval = {
+        "status": "APPROVED",
+        "mode": "LIVE",
+        "allow_new_entries": True,
+        "graduated_from_canary": graduated,
+        "expires_at": (
+            datetime.now(timezone.utc)
+            + timedelta(hours=2)
+        ).isoformat(),
+        "max_stake_quote": max_stake,
+    }
+    Path(
+        bot.live_approval_file
+    ).write_text(
+        json.dumps(approval),
+        encoding="utf-8",
+    )
+
+
+def t25():
+    with tempfile.TemporaryDirectory() as td:
+        b = mkbot(td)
+        b.cfg.setdefault(
+            "execution",
+            {},
+        )["live_mode_enabled"] = True
+        b.state["canary_trade_sequence"] = 5
+
+        write_live_approval(
+            b,
+            graduated=False,
+        )
+
+        r = b.canary_new_entry_gate(130)
+
+        assert not r["allow"]
+        assert (
+            r["reason"]
+            == "live_graduation_not_approved"
+        )
+        return r["reason"]
+
+
+test(
+    "25. LIVE zonder graduation approval wordt geblokkeerd",
+    t25,
+)
+
+
+def t26():
+    with tempfile.TemporaryDirectory() as td:
+        b = mkbot(td)
+        b.cfg.setdefault(
+            "execution",
+            {},
+        )["live_mode_enabled"] = True
+        b.state["canary_trade_sequence"] = 4
+
+        write_live_approval(
+            b,
+            graduated=True,
+        )
+
+        r = b.canary_new_entry_gate(130)
+
+        assert not r["allow"]
+        assert (
+            r["reason"]
+            == "canary_graduation_incomplete"
+        )
+        return r["reason"]
+
+
+test(
+    "26. LIVE vóór 5 canaries wordt geblokkeerd",
+    t26,
+)
+
+
+def t27():
+    with tempfile.TemporaryDirectory() as td:
+        b = mkbot(td)
+        b.cfg.setdefault(
+            "execution",
+            {},
+        )["live_mode_enabled"] = True
+        b.state["canary_trade_sequence"] = 5
+
+        write_live_approval(
+            b,
+            graduated=True,
+        )
+
+        r = b.canary_new_entry_gate(130)
+
+        assert r["allow"]
+        assert (
+            r["reason"]
+            == "approved_live_entry"
+        )
+        assert r["mode"] == "LIVE"
+
+        return (
+            "LIVE na 5 canaries toegestaan "
+            "tot €130"
+        )
+
+
+test(
+    "27. Geldige LIVE graduation staat €130 toe",
+    t27,
+)
+
+
+def t28():
+    with tempfile.TemporaryDirectory() as td:
+        b = mkbot(td)
+        b.cfg.setdefault(
+            "execution",
+            {},
+        )["live_mode_enabled"] = True
+        b.state["canary_trade_sequence"] = 5
+
+        write_live_approval(
+            b,
+            graduated=True,
+        )
+
+        r = b.canary_new_entry_gate(
+            130.01
+        )
+
+        assert not r["allow"]
+        assert (
+            r["reason"]
+            == "stake_above_live_limit"
+        )
+        return r["reason"]
+
+
+test(
+    "28. LIVE boven €130 wordt geblokkeerd",
+    t28,
+)
+
+
+def t29():
+    with tempfile.TemporaryDirectory() as td:
+        b = mkbot(td)
+        b.cfg.setdefault(
+            "execution",
+            {},
+        )["live_mode_enabled"] = False
+        b.state["canary_trade_sequence"] = 5
+
+        write_live_approval(
+            b,
+            graduated=True,
+        )
+
+        r = b.canary_new_entry_gate(130)
+
+        assert not r["allow"]
+        assert (
+            r["reason"]
+            == "live_mode_disabled"
+        )
+        return r["reason"]
+
+
+test(
+    "29. Config kill-switch blokkeert LIVE",
+    t29,
+)
+
+
 print('\n'.join(f"{'PASS' if ok else 'FAIL'} | {name} | {detail}" for name,ok,detail in results))
 print(f"\nTOTAL {sum(ok for _,ok,_ in results)}/{len(results)} PASS")
 if not all(ok for _,ok,_ in results):
