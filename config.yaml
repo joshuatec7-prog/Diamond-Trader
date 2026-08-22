@@ -158,6 +158,10 @@ files:
 execution:
   selective_contracts_enabled: true
 
+  # Open echte LONG-posities worden tussen de zware
+  # strategiecycli door met actuele bid-prijs bewaakt.
+  position_check_seconds: 20
+
 logging:
   level: INFO
   loop_sleep_seconds: 300

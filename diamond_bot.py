@@ -4367,8 +4367,16 @@ class Bot:
 
         est_pnl = self.estimated_exit_pnl_quote(symbol, position, bid)
 
-        # Veiligheidsverkopen mogen altijd doorgaan.
-        if reason in {"stop_loss", "bad_news", "hard_stop_loss"}:
+        # Beschermende exits mogen altijd doorgaan.
+        # Een trailing-stop moet ook bij een snelle koerssprong
+        # uitgevoerd kunnen worden wanneer de actuele prijs al
+        # onder het oorspronkelijk beschermde winstniveau ligt.
+        if reason in {
+            "stop_loss",
+            "bad_news",
+            "hard_stop_loss",
+            "trailing_stop",
+        }:
             return True
 
         # Take-profit, trendbreuk en trailing-stop mogen pas verkopen wanneer
@@ -5421,6 +5429,258 @@ class Bot:
                 exc,
             )
 
+    def fast_long_exit_signal(
+        self,
+        symbol: str,
+        position: Dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Lichtgewicht bescherming van een open LONG.
+
+        Gebruikt de actuele uitvoerbare bid-prijs en haalt geen OHLCV,
+        indicatoren of nieuwe entry-signalen op. Hierdoor kunnen een
+        hard-stop en winst-trailing veel vaker worden bewaakt dan de
+        normale strategiecyclus.
+        """
+        ticker = self.get_ticker(symbol)
+        bid = to_float(ticker.get("bid"), 0.0)
+        if bid <= 0:
+            return None
+
+        entry_price = to_float(
+            position.get("entry_price"),
+            0.0,
+        )
+        if entry_price <= 0:
+            return None
+
+        previous_highest = to_float(
+            position.get("highest_price"),
+            entry_price,
+        )
+        highest = max(
+            previous_highest,
+            bid,
+        )
+        position["highest_price"] = highest
+
+        stop_loss = to_float(
+            position.get("stop_loss"),
+            0.0,
+        )
+        take_profit = to_float(
+            position.get("take_profit"),
+            0.0,
+        )
+
+        min_profit_eur = max(
+            0.0,
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "min_profit_eur",
+                    0.50,
+                ),
+                0.50,
+            ),
+        )
+
+        min_profitable_exit_price = (
+            self.minimum_profitable_exit_price(
+                position,
+                min_profit_eur,
+            )
+        )
+
+        highest_profit_pct = (
+            ((highest - entry_price) / entry_price)
+            * 100.0
+        )
+
+        trigger_pct = max(
+            0.0,
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "signals.profit_trailing_trigger_pct",
+                    1.0,
+                ),
+                1.0,
+            ),
+        )
+        pullback_pct = max(
+            0.0,
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "signals.profit_trailing_pullback_pct",
+                    0.5,
+                ),
+                0.5,
+            ),
+        )
+
+        if (
+            highest_profit_pct >= trigger_pct
+            and highest > 0
+        ):
+            tight_stop = highest * (
+                1.0 - pullback_pct / 100.0
+            )
+
+            if (
+                tight_stop >= min_profitable_exit_price
+                and tight_stop > stop_loss
+            ):
+                position["stop_loss"] = tight_stop
+                stop_loss = tight_stop
+
+                self.rate_limited_info(
+                    self.last_skip_log_ts,
+                    f"fast_trail:{symbol}",
+                    60,
+                    "FAST WINST-TRAIL %s | "
+                    "bid=%.8f | hoogste=%.8f | "
+                    "stop=%.8f",
+                    symbol,
+                    bid,
+                    highest,
+                    stop_loss,
+                )
+
+        hard_sl_pct = max(
+            0.0,
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "signals.hard_stop_loss_pct",
+                    7.0,
+                ),
+                7.0,
+            ),
+        )
+        hard_stop = entry_price * (
+            1.0 - hard_sl_pct / 100.0
+        )
+
+        if bid <= hard_stop:
+            LOG.warning(
+                "FAST HARDE STOP %s | bid=%.8f | stop=%.8f",
+                symbol,
+                bid,
+                hard_stop,
+            )
+            return "hard_stop_loss"
+
+        if stop_loss > 0 and bid <= stop_loss:
+            if (
+                stop_loss >= min_profitable_exit_price
+                and highest > entry_price
+            ):
+                LOG.info(
+                    "FAST TRAILING STOP %s | "
+                    "bid=%.8f | stop=%.8f | hoogste=%.8f",
+                    symbol,
+                    bid,
+                    stop_loss,
+                    highest,
+                )
+                return "trailing_stop"
+
+            return "stop_loss"
+
+        profit_trailing_active = (
+            stop_loss >= min_profitable_exit_price
+            and min_profitable_exit_price
+            < float("inf")
+        )
+
+        if (
+            take_profit > 0
+            and bid >= take_profit
+            and not profit_trailing_active
+        ):
+            return "take_profit"
+
+        return None
+
+    def manage_open_positions_fast(self) -> None:
+        positions = list(
+            (self.state.get("positions") or {}).items()
+        )
+
+        state_changed = False
+
+        for symbol, position in positions:
+            if not to_bool(
+                position.get("opened_by_bot"),
+                False,
+            ):
+                continue
+
+            before_high = to_float(
+                position.get("highest_price"),
+                0.0,
+            )
+            before_stop = to_float(
+                position.get("stop_loss"),
+                0.0,
+            )
+
+            try:
+                reason = self.fast_long_exit_signal(
+                    symbol,
+                    position,
+                )
+
+                after_high = to_float(
+                    position.get("highest_price"),
+                    0.0,
+                )
+                after_stop = to_float(
+                    position.get("stop_loss"),
+                    0.0,
+                )
+
+                if (
+                    after_high != before_high
+                    or after_stop != before_stop
+                ):
+                    state_changed = True
+
+                if reason:
+                    # Nieuwe peak/stop eerst persistent opslaan.
+                    save_state(
+                        self.state_file,
+                        self.state,
+                    )
+                    state_changed = False
+
+                    if self.sell_allowed_by_profit(
+                        symbol,
+                        position,
+                        reason,
+                    ):
+                        self.try_sell_symbol(
+                            symbol,
+                            position,
+                            reason,
+                        )
+
+            except Exception as exc:
+                LOG.warning(
+                    "FAST positiecontrole overgeslagen "
+                    "voor %s: %s",
+                    symbol,
+                    exc,
+                )
+
+        if state_changed:
+            save_state(
+                self.state_file,
+                self.state,
+            )
+
     def manage_open_positions(self) -> None:
         positions = list((self.state.get("positions") or {}).items())
         for symbol, position in positions:
@@ -6115,13 +6375,82 @@ class Bot:
                 )
 
     def run_forever(self) -> None:
-        sleep_s = int(to_float(get_cfg(self.cfg, "loop_sleep_seconds", 600), 600))
+        full_cycle_s = max(
+            30,
+            int(
+                to_float(
+                    get_cfg(
+                        self.cfg,
+                        "loop_sleep_seconds",
+                        300,
+                    ),
+                    300,
+                )
+            ),
+        )
+
+        position_check_s = max(
+            5,
+            int(
+                to_float(
+                    get_cfg(
+                        self.cfg,
+                        "execution.position_check_seconds",
+                        20,
+                    ),
+                    20,
+                )
+            ),
+        )
+
+        LOG.info(
+            "LOOP | volledige cyclus=%ss | "
+            "open-positiecontrole=%ss",
+            full_cycle_s,
+            position_check_s,
+        )
+
+        next_full_cycle = 0.0
+
         while True:
             try:
-                self.run_once()
-            except Exception as e:
-                LOG.exception("Hoofdloop fout: %s", e)
-            time.sleep(sleep_s)
+                now = time.monotonic()
+
+                if now >= next_full_cycle:
+                    self.run_once()
+                    next_full_cycle = (
+                        time.monotonic()
+                        + full_cycle_s
+                    )
+
+                elif self.state.get("positions"):
+                    self.manage_open_positions_fast()
+
+            except Exception as exc:
+                LOG.exception(
+                    "Hoofdloop fout: %s",
+                    exc,
+                )
+
+            seconds_until_full = max(
+                0.0,
+                next_full_cycle - time.monotonic(),
+            )
+
+            if seconds_until_full <= 0:
+                continue
+
+            if self.state.get("positions"):
+                sleep_s = min(
+                    float(position_check_s),
+                    seconds_until_full,
+                )
+            else:
+                sleep_s = seconds_until_full
+
+            time.sleep(
+                max(1.0, sleep_s)
+            )
 
 
 def main() -> None:
