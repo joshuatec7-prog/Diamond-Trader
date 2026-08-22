@@ -545,6 +545,8 @@ def write_live_approval(
         "mode": "LIVE",
         "allow_new_entries": True,
         "graduated_from_canary": graduated,
+        "entry_sequence_start": 5,
+        "max_live_entries": 1,
         "expires_at": (
             datetime.now(timezone.utc)
             + timedelta(hours=2)
@@ -714,6 +716,108 @@ test(
     "29. Config kill-switch blokkeert LIVE",
     t29,
 )
+
+
+# 30-32 ONE-SHOT LIVE approval
+
+def t30():
+    with tempfile.TemporaryDirectory() as td:
+        b = mkbot(td)
+        b.cfg.setdefault(
+            "execution", {}
+        )["live_mode_enabled"] = True
+        b.cfg["execution"][
+            "live_max_entries_per_approval"
+        ] = 1
+
+        b.state["canary_trade_sequence"] = 6
+        write_live_approval(b)
+
+        r = b.canary_new_entry_gate(130)
+
+        assert not r["allow"]
+        assert (
+            r["reason"]
+            == "live_entry_limit_reached"
+        )
+        return r["reason"]
+
+test(
+    "30. Tweede LIVE entry met dezelfde approval wordt geblokkeerd",
+    t30,
+)
+
+
+def t31():
+    with tempfile.TemporaryDirectory() as td:
+        b = mkbot(td)
+        b.cfg.setdefault(
+            "execution", {}
+        )["live_mode_enabled"] = True
+        b.cfg["execution"][
+            "live_max_entries_per_approval"
+        ] = 1
+
+        # Na prepare_pending_long_order staat de state al op 6.
+        # De submit-recheck voor precies diezelfde entry moet wel doorgaan.
+        b.state["canary_trade_sequence"] = 6
+        write_live_approval(b)
+
+        r = b.canary_new_entry_gate(
+            130,
+            canary_trade_number=6,
+        )
+
+        assert r["allow"]
+        assert r["entry_sequence"] == 6
+        return "eerste LIVE entry blijft geldig bij submit-recheck"
+
+test(
+    "31. Eerste LIVE entry blijft geldig bij submit-recheck",
+    t31,
+)
+
+
+def t32():
+    with tempfile.TemporaryDirectory() as td:
+        b = mkbot(td)
+        b.cfg.setdefault(
+            "execution", {}
+        )["live_mode_enabled"] = True
+        b.cfg["execution"][
+            "live_max_entries_per_approval"
+        ] = 1
+        b.state["canary_trade_sequence"] = 5
+
+        write_live_approval(b)
+
+        a = json.loads(
+            Path(
+                b.live_approval_file
+            ).read_text()
+        )
+        a["max_live_entries"] = 2
+        Path(
+            b.live_approval_file
+        ).write_text(
+            json.dumps(a),
+            encoding="utf-8",
+        )
+
+        r = b.canary_new_entry_gate(130)
+
+        assert not r["allow"]
+        assert (
+            r["reason"]
+            == "invalid_max_live_entries"
+        )
+        return r["reason"]
+
+test(
+    "32. Approval voor meer dan één LIVE entry wordt geblokkeerd",
+    t32,
+)
+
 
 
 print('\n'.join(f"{'PASS' if ok else 'FAIL'} | {name} | {detail}" for name,ok,detail in results))

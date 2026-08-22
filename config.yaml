@@ -169,6 +169,9 @@ execution:
   live_mode_enabled: true
   require_canary_graduation_trades: 5
 
+  # Voorlopig maximaal één nieuwe LIVE BUY per handmatige approval.
+  live_max_entries_per_approval: 1
+
   # Fail-closed orderboekcontrole voor nieuwe echte LONG BUYs.
   liquidity_gate_enabled: true
   liquidity_orderbook_depth: 50

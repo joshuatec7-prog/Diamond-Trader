@@ -1251,12 +1251,82 @@ class Bot:
                 "reason": "live_graduation_not_approved",
             }
 
+        # ONE_SHOT_LIVE_APPROVAL
+        #
+        # Iedere LIVE approval heeft een sequence-start en een hard
+        # maximum aantal nieuwe entries. De huidige productieconfig
+        # begrenst dit op precies één entry per approval.
+        sequence_start = int(
+            to_float(
+                approval.get("entry_sequence_start"),
+                -1,
+            )
+        )
+
+        max_live_entries = int(
+            to_float(
+                approval.get("max_live_entries"),
+                0,
+            )
+        )
+
+        hard_entry_cap = int(
+            to_float(
+                get_cfg(
+                    self.cfg,
+                    "execution.live_max_entries_per_approval",
+                    1,
+                ),
+                1,
+            )
+        )
+
+        if (
+            max_live_entries < 1
+            or max_live_entries > hard_entry_cap
+        ):
+            return {
+                "allow": False,
+                "reason": "invalid_max_live_entries",
+            }
+
+        if (
+            sequence_start < required_canary
+            or sequence_start > completed_canary
+        ):
+            return {
+                "allow": False,
+                "reason": "invalid_live_entry_sequence_start",
+            }
+
+        candidate_sequence = (
+            int(canary_trade_number)
+            if canary_trade_number is not None
+            else completed_canary + 1
+        )
+
+        first_allowed = sequence_start + 1
+        last_allowed = (
+            sequence_start + max_live_entries
+        )
+
+        if (
+            candidate_sequence < first_allowed
+            or candidate_sequence > last_allowed
+        ):
+            return {
+                "allow": False,
+                "reason": "live_entry_limit_reached",
+            }
+
         return {
             "allow": True,
             "reason": "approved_live_entry",
             "mode": "LIVE",
             "allowed_stake": allowed_stake,
             "completed_canary": completed_canary,
+            "entry_sequence": candidate_sequence,
+            "max_live_entries": max_live_entries,
         }
 
     def entries_blocked_by_recovery(self) -> bool:
