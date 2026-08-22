@@ -79,7 +79,7 @@ def mkbot(root, exchange=None, state=None):
         'quote': 'EUR',
         'risk': {
             'dry_run': False,
-            'fixed_stake_quote': 35,
+            'fixed_stake_quote': 30,
             'max_open_positions': 5,
             'eur_reserve': 250,
             'taker_fee_pct': 0.25,
@@ -164,6 +164,7 @@ def t1():
             b.try_buy_symbol('BTC/EUR', precomputed_signal=signal, precomputed_news_gate={'allow':True}, precomputed_ticker={'bid':99.9,'ask':100.0}, precomputed_spread_pct=0.05)
         finally:
             mod.save_state=real_save
+        assert calls['n'] >= 1
         assert len(ex.create_calls)==0, ex.create_calls
         return 'state-save fout vóór submit -> 0 exchange orders'
 
@@ -482,16 +483,18 @@ def t22():
     with tempfile.TemporaryDirectory() as td:
         b=mkbot(td)
         b.state['canary_trade_sequence']=5
-        r=b.canary_new_entry_gate(35)
+        r=b.canary_new_entry_gate(30)
         assert not r['allow']
+        assert r['reason']=='canary_trade_limit_reached'
         return r['reason']
 test('22. Canary trade 6 van 5 wordt geblokkeerd', t22)
 
 def t23():
     with tempfile.TemporaryDirectory() as td:
         b=mkbot(td)
-        r=b.canary_new_entry_gate(35)
+        r=b.canary_new_entry_gate(30)
         assert r['allow'] and r['trade_number']==1
+        assert r['allowed_stake']==30.0
         return 'geldige canary trade 1'
 test('23. Geldige canary approval staat trade 1 toe', t23)
 
@@ -502,7 +505,7 @@ def t24():
 
         key=b.long_order_key('BTC/EUR',signal)
         rec=b.prepare_pending_long_order(
-            key,'BTC/EUR',signal,35,0.05,0.0
+            key,'BTC/EUR',signal,30,0.05,0.0
         )
 
         set_approval(
@@ -515,7 +518,7 @@ def t24():
         try:
             b.place_market_buy(
                 'BTC/EUR',
-                35,
+                30,
                 client_order_id=rec['clientOrderId'],
                 order_key=key,
             )
