@@ -5,7 +5,7 @@ from datetime import datetime,timedelta,timezone
 from pathlib import Path
 import ccxt,yaml
 
-VERSION='1.0'; DATA=Path('/var/data'); PROJ=Path('/opt/render/project/src')
+VERSION='1.1'; DATA=Path('/var/data'); PROJ=Path('/opt/render/project/src')
 TRADES=DATA/'diamond_scanner_selective_shadow_trades.csv'; CFG=PROJ/'config.yaml'
 TF='15m'; TFMS=900000; ATR_LEN=14; MAX_HOLD_MIN=2880; MULTS=(0.8,1.2,1.6,2.0)
 ROUTES={('LONG','trend_breakout'):'LONG_TREND',('LONG','momentum'):'LONG_MOM',('SHORT','momentum'):'SHORT_MOM'}
@@ -72,7 +72,9 @@ def atrs(c,n=ATR_LEN):
     return out
 
 def sim(t,c,a,m,fee):
-    start=next((i for i,r in enumerate(c) if int(r[0])+TFMS>t['entry_ms']),None)
+    # Gebruik alleen volledig post-entry candles; zo lekt geen high/low van vóór de entry in de replay.
+    first_full=((t['entry_ms']+TFMS-1)//TFMS)*TFMS
+    start=next((i for i,r in enumerate(c) if int(r[0])>=first_full),None)
     if start is None:return None
     end=t['entry_ms']+MAX_HOLD_MIN*60000; side=t['side']; entry=t['entry']; stop=t['stop']; hiw=entry; loww=entry; px=None
     for i in range(start,len(c)):
@@ -92,7 +94,7 @@ def sim(t,c,a,m,fee):
             if side=='LONG' and lo<=stop:px=stop;break
             if side=='SHORT' and hi>=stop:px=stop;break
     if px is None:
-        elig=[r for r in c if t['entry_ms']<=int(r[0])<=end]
+        elig=[r for r in c if first_full<=int(r[0])<=end]
         if not elig:return None
         px=elig[-1][4]
     amt=t['amount']; gross=(px-entry)*amt if side=='LONG' else (entry-px)*amt
@@ -109,7 +111,7 @@ def show(name,vals):
 
 def self_test():
     c=[[0,100,101,99.5,100.5,1],[TFMS,100.5,102,100,101.5,1],[2*TFMS,101.5,103,101,102.5,1],[3*TFMS,102.5,103.5,101.8,102,1]]; a=[1]*4
-    t={'entry_ms':0,'side':'LONG','entry':100.0,'stop':95.0,'amount':1.0}
+    t={'entry_ms':1,'side':'LONG','entry':100.0,'stop':95.0,'amount':1.0}
     assert sim(t,c,a,1.0,0.0) is not None; assert abs(pf([2,-1])-2)<1e-12
     print('DIAMOND_ADAPTIVE_ATR_TRAILING_EXIT_RESEARCH_SELF_TEST_OK'); return 0
 
@@ -132,6 +134,7 @@ def run(days):
         if ok:ev.append(r)
     print('='*108);print(f'DIAMOND ADAPTIVE ATR TRAILING EXIT RESEARCH v{VERSION}');print('='*108)
     print(f'Periode: {days}d | bron={len(trades)} | beoordeeld={len(ev)} | markten={len(syms)} | fee/side={fee:.3f}% | ATR=Wilder14 15m | maxhold=48h')
+    print('Replay start: eerste volledige 15m candle NA entry (geen pre-entry intrabar leakage)')
     show('CURRENT',[x['recorded'] for x in ev])
     for m in MULTS:show(f'ATR_{m:.1f}',[x[f'a{m:.1f}'] for x in ev])
     print('\n=== DELTA ==='); cur=sum(x['recorded'] for x in ev)
