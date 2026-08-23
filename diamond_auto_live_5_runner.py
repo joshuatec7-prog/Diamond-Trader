@@ -8,8 +8,10 @@ import os
 os.environ["DIAMOND_AUTO_LIVE_5_ENABLED"] = "1"
 
 from diamond_auto_live_5_patch import install_auto_live_5_patch
+from diamond_auto_live_5_guard import install_auto_live_5_guard
 
 install_auto_live_5_patch()
+install_auto_live_5_guard()
 
 from closed_candle_runner import run_bot
 
