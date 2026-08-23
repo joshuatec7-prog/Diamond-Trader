@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 
-# Diamond Trader startscript v2.8
+# Diamond Trader startscript v2.9
 # - Repo-versie van `chat` wordt na iedere deploy automatisch actief.
 # - LIVE-kandidaatmailer draait adviserend en plaatst nooit orders.
 # - LONG momentum prospective tracker draait research-only.
 # - SHORT momentum prospective tracker draait research-only.
+# - Periodieke analyse start uitgelijnd op 15m candle-closes.
 # - Geen strategie-, stake- of livewijzigingen.
 
 set -Eeuo pipefail
@@ -161,7 +162,7 @@ PIDS+=("$STRATEGY_LAB_PID")
 echo "        PID $STRATEGY_LAB_PID"
 
 echo "[START] Diamond Periodieke Analyse"
-python3 periodic_analysis_runner.py \
+python3 diamond_quarter_aligned_periodic_runner.py \
     >> "$PERIODIC_LOG" 2>&1 &
 PERIODIC_PID=$!
 PIDS+=("$PERIODIC_PID")
