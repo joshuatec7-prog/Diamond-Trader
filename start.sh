@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# Diamond Trader startscript v2.5
+# Diamond Trader startscript v2.6
 # - Repo-versie van `chat` wordt na iedere deploy automatisch actief.
+# - LIVE-kandidaatmailer draait adviserend en plaatst nooit orders.
 # - Geen strategie-, stake- of livewijzigingen.
 
 set -Eeuo pipefail
@@ -11,6 +12,7 @@ DATA_DIR="/var/data"
 PERIODIC_LOG="$DATA_DIR/diamond_periodic_analysis_runner.log"
 STRATEGY_LAB_LOG="$DATA_DIR/diamond_strategy_lab_runner.log"
 EARLY_ENTRY_LOG="$DATA_DIR/diamond_early_entry/collector_v1_3_1_runner.log"
+LIVE_CANDIDATE_LOG="$DATA_DIR/diamond_live_candidate_mailer.log"
 
 cd "$PROJECT_DIR"
 mkdir -p "$DATA_DIR" "$DATA_DIR/diamond_early_entry"
@@ -74,6 +76,7 @@ SH
 setup_shell_helpers
 
 PIDS=()
+OPTIONAL_PIDS=()
 
 start_process() {
     local display_name="$1"
@@ -92,7 +95,8 @@ cleanup() {
     echo
     echo "[STOP] Diamond Trader-processen afsluiten"
 
-    for pid in "${PIDS[@]:-}"; do
+    for pid in "${PIDS[@]:-}" "${OPTIONAL_PIDS[@]:-}"; do
+        [ -n "$pid" ] || continue
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
         fi
@@ -100,7 +104,8 @@ cleanup() {
 
     sleep 2
 
-    for pid in "${PIDS[@]:-}"; do
+    for pid in "${PIDS[@]:-}" "${OPTIONAL_PIDS[@]:-}"; do
+        [ -n "$pid" ] || continue
         if kill -0 "$pid" 2>/dev/null; then
             kill -9 "$pid" 2>/dev/null || true
         fi
@@ -120,6 +125,13 @@ echo "============================================================"
 start_process "Diamond Agent" python3 agent.py
 start_process "Diamond Supervisor" python3 supervisor_agent.py
 start_process "Diamond Bot" python3 closed_candle_runner.py bot
+
+echo "[START] Diamond LIVE Candidate Mailer"
+python3 diamond_live_candidate_mailer.py \
+    >> "$LIVE_CANDIDATE_LOG" 2>&1 &
+LIVE_CANDIDATE_PID=$!
+OPTIONAL_PIDS+=("$LIVE_CANDIDATE_PID")
+echo "        PID $LIVE_CANDIDATE_PID"
 
 echo "[START] Diamond Strategy Lab"
 python3 strategy_lab.py --loop --interval-minutes 360 --no-print \
