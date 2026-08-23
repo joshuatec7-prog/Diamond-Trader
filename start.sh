@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 
-# Diamond Trader startscript v2.9
+# Diamond Trader startscript v3.0
 # - Repo-versie van `chat` wordt na iedere deploy automatisch actief.
-# - LIVE-kandidaatmailer draait adviserend en plaatst nooit orders.
+# - Diamond Bot draait tijdelijk via de hard-begrensde AUTO LIVE 5 runner.
+# - LIVE-kandidaatmailer blijft adviserend en plaatst nooit orders.
 # - LONG momentum prospective tracker draait research-only.
 # - SHORT momentum prospective tracker draait research-only.
 # - Periodieke analyse start uitgelijnd op 15m candle-closes.
-# - Geen strategie-, stake- of livewijzigingen.
+# - AUTO LIVE 5 gebruikt maximaal vijf bevestigde BUYs van max €130.
 
 set -Eeuo pipefail
 
@@ -129,7 +130,7 @@ echo "============================================================"
 
 start_process "Diamond Agent" python3 agent.py
 start_process "Diamond Supervisor" python3 supervisor_agent.py
-start_process "Diamond Bot" python3 closed_candle_runner.py bot
+start_process "Diamond Bot AUTO LIVE 5" python3 diamond_auto_live_5_runner.py
 
 echo "[START] Diamond LIVE Candidate Mailer"
 python3 diamond_live_candidate_mailer.py \
