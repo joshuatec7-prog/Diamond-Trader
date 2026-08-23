@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Diamond Trader SHORT Momentum Prospective Tracker v1.0
+Diamond Trader SHORT Momentum Prospective Tracker v1.1
 
 Research-only tracker:
 - vanaf een vaste baseline alleen NIEUWE afgesloten CURRENT shadow-trades volgen;
 - alleen SHORT + momentum met entry spread <= 0.10%;
+- dezelfde prospectieve trades uitsplitsen naar BEARISH/BEARISH_WEAK;
 - doel: 20 nieuwe gesloten trades;
 - geen strategie-, config-, stake- of LIVE-wijzigingen;
 - geen private API, netwerkcalls of orders.
@@ -26,9 +27,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-VERSION = "1.0"
+VERSION = "1.1"
 TARGET = 20
 SPREAD_MAX = 0.10
+REGIME_LABELS = ("BEARISH", "BEARISH_WEAK")
 
 DATA = Path(os.getenv("DIAMOND_DATA_DIR", "/var/data"))
 SOURCE = DATA / "diamond_scanner_selective_shadow_trades.csv"
@@ -107,7 +109,7 @@ def load_source(path: Path) -> List[Dict[str, Any]]:
         reader = csv.DictReader(handle)
         required = {
             "variant", "candidate_key", "detected_at", "closed_at", "symbol",
-            "strategy", "side", "entry_spread_pct", "net_pnl_eur",
+            "strategy", "side", "market_regime", "entry_spread_pct", "net_pnl_eur",
             "total_fees_eur", "exit_reason",
         }
         missing = required - set(reader.fieldnames or [])
@@ -187,6 +189,17 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def regime_breakdown(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for label in REGIME_LABELS:
+        selected = [
+            row for row in rows
+            if str(row.get("market_regime") or "").strip().upper() == label
+        ]
+        result[label] = summarize(selected)
+    return result
+
+
 def build_report(rows: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str, Any]:
     cutoff = parse_dt(state.get("baseline_cutoff")) or parse_dt(state.get("created_at"))
     if cutoff is None:
@@ -198,6 +211,7 @@ def build_report(rows: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str,
     recent = [{
         "closed_at": row.get("closed_at"),
         "symbol": row.get("symbol"),
+        "market_regime": row.get("market_regime"),
         "spread_pct": round(f(row.get("entry_spread_pct")), 6),
         "reward_risk": round(f(row.get("reward_risk")), 3),
         "exit_reason": row.get("exit_reason"),
@@ -210,6 +224,7 @@ def build_report(rows: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str,
         "baseline_cutoff": cutoff.isoformat(),
         "rule": "CURRENT SHORT momentum + entry spread <= 0.10%",
         **summarize(prospective),
+        "regime_breakdown": regime_breakdown(prospective),
         "recent_closed": recent,
         "safety": SAFETY,
     }
@@ -243,6 +258,17 @@ def print_report(report: Dict[str, Any]) -> None:
             f"Gem/trade=€{report['average_trade_eur']:+.4f} | Fees=€{report['total_fees_eur']:.4f}"
         )
         print(f"TP/SL/TIME   : {report['take_profit']}/{report['stop_loss']}/{report['time_exit']}")
+
+    print("Regime split :")
+    for label in REGIME_LABELS:
+        item = report.get("regime_breakdown", {}).get(label, {})
+        print(
+            f"  {label:12} n={int(item.get('closed', 0)):2d} "
+            f"W/L={int(item.get('wins', 0))}/{int(item.get('losses', 0))} "
+            f"PnL=€{float(item.get('net_pnl_eur', 0.0)):+.4f} "
+            f"PF={pf_text(item.get('profit_factor'))}"
+        )
+
     print("Status       : " + ("EINDREVIEW MOGELIJK" if report["target_reached"] else "DOORLOPEN"))
     print("SHORT LIVE   : NEE - RESEARCH ONLY")
     print("LIVE/config  : ONGEWIJZIGD")
@@ -264,13 +290,26 @@ def run_once(print_output: bool = True) -> int:
 def self_test() -> int:
     baseline = datetime(2026, 8, 23, tzinfo=timezone.utc)
     rows = [
-        {"_pnl": 2.0, "_fees": 0.65, "exit_reason": "take_profit"},
-        {"_pnl": -1.0, "_fees": 0.65, "exit_reason": "stop_loss"},
+        {
+            "_pnl": 2.0,
+            "_fees": 0.65,
+            "exit_reason": "take_profit",
+            "market_regime": "BEARISH_WEAK",
+        },
+        {
+            "_pnl": -1.0,
+            "_fees": 0.65,
+            "exit_reason": "stop_loss",
+            "market_regime": "BEARISH",
+        },
     ]
     report = summarize(rows)
+    split = regime_breakdown(rows)
     assert report["closed"] == 2 and report["wins"] == 1 and report["losses"] == 1
     assert abs(report["net_pnl_eur"] - 1.0) < 1e-9
     assert abs(float(report["profit_factor"]) - 2.0) < 1e-9
+    assert split["BEARISH_WEAK"]["closed"] == 1
+    assert split["BEARISH"]["closed"] == 1
     print("DIAMOND_SHORT_MOMENTUM_PROSPECTIVE_SELF_TEST_OK")
     return 0
 
