@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
-# Diamond Trader startscript v2.7
+# Diamond Trader startscript v2.8
 # - Repo-versie van `chat` wordt na iedere deploy automatisch actief.
 # - LIVE-kandidaatmailer draait adviserend en plaatst nooit orders.
 # - LONG momentum prospective tracker draait research-only.
+# - SHORT momentum prospective tracker draait research-only.
 # - Geen strategie-, stake- of livewijzigingen.
 
 set -Eeuo pipefail
@@ -15,6 +16,7 @@ STRATEGY_LAB_LOG="$DATA_DIR/diamond_strategy_lab_runner.log"
 EARLY_ENTRY_LOG="$DATA_DIR/diamond_early_entry/collector_v1_3_1_runner.log"
 LIVE_CANDIDATE_LOG="$DATA_DIR/diamond_live_candidate_mailer.log"
 LONG_MOMENTUM_LOG="$DATA_DIR/diamond_long_momentum_prospective.log"
+SHORT_MOMENTUM_LOG="$DATA_DIR/diamond_short_momentum_prospective.log"
 
 cd "$PROJECT_DIR"
 mkdir -p "$DATA_DIR" "$DATA_DIR/diamond_early_entry"
@@ -142,6 +144,14 @@ python3 diamond_long_momentum_prospective_tracker.py \
 LONG_MOMENTUM_PID=$!
 OPTIONAL_PIDS+=("$LONG_MOMENTUM_PID")
 echo "        PID $LONG_MOMENTUM_PID"
+
+echo "[START] Diamond SHORT Momentum Prospective Tracker"
+python3 diamond_short_momentum_prospective_tracker.py \
+    --loop --interval-seconds 900 --no-print \
+    >> "$SHORT_MOMENTUM_LOG" 2>&1 &
+SHORT_MOMENTUM_PID=$!
+OPTIONAL_PIDS+=("$SHORT_MOMENTUM_PID")
+echo "        PID $SHORT_MOMENTUM_PID"
 
 echo "[START] Diamond Strategy Lab"
 python3 strategy_lab.py --loop --interval-minutes 360 --no-print \
