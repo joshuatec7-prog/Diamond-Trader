@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
-# Diamond Trader startscript v2.6
+# Diamond Trader startscript v2.7
 # - Repo-versie van `chat` wordt na iedere deploy automatisch actief.
 # - LIVE-kandidaatmailer draait adviserend en plaatst nooit orders.
+# - LONG momentum prospective tracker draait research-only.
 # - Geen strategie-, stake- of livewijzigingen.
 
 set -Eeuo pipefail
@@ -13,6 +14,7 @@ PERIODIC_LOG="$DATA_DIR/diamond_periodic_analysis_runner.log"
 STRATEGY_LAB_LOG="$DATA_DIR/diamond_strategy_lab_runner.log"
 EARLY_ENTRY_LOG="$DATA_DIR/diamond_early_entry/collector_v1_3_1_runner.log"
 LIVE_CANDIDATE_LOG="$DATA_DIR/diamond_live_candidate_mailer.log"
+LONG_MOMENTUM_LOG="$DATA_DIR/diamond_long_momentum_prospective.log"
 
 cd "$PROJECT_DIR"
 mkdir -p "$DATA_DIR" "$DATA_DIR/diamond_early_entry"
@@ -132,6 +134,14 @@ python3 diamond_live_candidate_mailer.py \
 LIVE_CANDIDATE_PID=$!
 OPTIONAL_PIDS+=("$LIVE_CANDIDATE_PID")
 echo "        PID $LIVE_CANDIDATE_PID"
+
+echo "[START] Diamond LONG Momentum Prospective Tracker"
+python3 diamond_long_momentum_prospective_tracker.py \
+    --loop --interval-seconds 900 --no-print \
+    >> "$LONG_MOMENTUM_LOG" 2>&1 &
+LONG_MOMENTUM_PID=$!
+OPTIONAL_PIDS+=("$LONG_MOMENTUM_PID")
+echo "        PID $LONG_MOMENTUM_PID"
 
 echo "[START] Diamond Strategy Lab"
 python3 strategy_lab.py --loop --interval-minutes 360 --no-print \
