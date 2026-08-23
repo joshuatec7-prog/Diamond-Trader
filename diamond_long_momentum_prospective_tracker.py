@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Diamond Trader LONG Momentum Prospective Tracker v1.0
+Diamond Trader LONG Momentum Prospective Tracker v1.1
 
 Doel:
 - Vanaf een vaste baseline alleen NIEUWE afgesloten CURRENT shadow-trades volgen
   die LONG + momentum zijn met entry spread <= 0.10%.
+- Dezelfde prospectieve trades tevens uitsplitsen naar BULLISH/BULLISH_WEAK.
 - Geen strategie-, config-, stake- of LIVE-wijzigingen.
 - Geen private API en geen orders.
-- Bronnen zijn alleen bestaande lokale researchbestanden.
 
 Bron:
   /var/data/diamond_scanner_selective_shadow_trades.csv
@@ -32,9 +32,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-VERSION = "1.0"
+VERSION = "1.1"
 TARGET = 20
 SPREAD_MAX = 0.10
+REGIME_LABELS = ("BULLISH", "BULLISH_WEAK")
 
 DATA = Path(os.getenv("DIAMOND_DATA_DIR", "/var/data"))
 SOURCE = DATA / "diamond_scanner_selective_shadow_trades.csv"
@@ -123,6 +124,7 @@ def load_source(path: Path) -> List[Dict[str, Any]]:
             "symbol",
             "strategy",
             "side",
+            "market_regime",
             "entry_spread_pct",
             "net_pnl_eur",
             "total_fees_eur",
@@ -221,6 +223,17 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def regime_breakdown(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for label in REGIME_LABELS:
+        selected = [
+            row for row in rows
+            if str(row.get("market_regime") or "").strip().upper() == label
+        ]
+        result[label] = summarize(selected)
+    return result
+
+
 def build_report(rows: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str, Any]:
     cutoff = parse_dt(state.get("baseline_cutoff")) or parse_dt(state.get("created_at"))
     if cutoff is None:
@@ -242,6 +255,7 @@ def build_report(rows: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str,
         recent.append({
             "closed_at": row.get("closed_at"),
             "symbol": row.get("symbol"),
+            "market_regime": row.get("market_regime"),
             "spread_pct": round(f(row.get("entry_spread_pct")), 6),
             "reward_risk": round(f(row.get("reward_risk")), 3),
             "exit_reason": row.get("exit_reason"),
@@ -254,6 +268,7 @@ def build_report(rows: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str,
         "baseline_cutoff": cutoff.isoformat(),
         "rule": "CURRENT LONG momentum + entry spread <= 0.10%",
         **summarize(prospective),
+        "regime_breakdown": regime_breakdown(prospective),
         "recent_closed": recent,
         "safety": SAFETY,
     }
@@ -292,6 +307,17 @@ def print_report(report: Dict[str, Any]) -> None:
             f"TP/SL/TIME   : {report['take_profit']}/"
             f"{report['stop_loss']}/{report['time_exit']}"
         )
+
+    print("Regime split :")
+    for label in REGIME_LABELS:
+        item = report.get("regime_breakdown", {}).get(label, {})
+        print(
+            f"  {label:12} n={int(item.get('closed', 0)):2d} "
+            f"W/L={int(item.get('wins', 0))}/{int(item.get('losses', 0))} "
+            f"PnL=€{float(item.get('net_pnl_eur', 0.0)):+.4f} "
+            f"PF={pf_text(item.get('profit_factor'))}"
+        )
+
     print(
         "Status       : "
         + ("EINDREVIEW MOGELIJK" if report["target_reached"] else "DOORLOPEN")
@@ -325,6 +351,7 @@ def self_test() -> int:
             "exit_reason": "take_profit",
             "closed_at": baseline.isoformat(),
             "symbol": "AAA/EUR",
+            "market_regime": "BULLISH_WEAK",
             "entry_spread_pct": "0.05",
             "reward_risk": "1.5",
         },
@@ -336,12 +363,14 @@ def self_test() -> int:
             "exit_reason": "stop_loss",
             "closed_at": baseline.isoformat(),
             "symbol": "BBB/EUR",
+            "market_regime": "BULLISH",
             "entry_spread_pct": "0.08",
             "reward_risk": "1.4",
         },
     ]
     report = {
         **summarize(rows),
+        "regime_breakdown": regime_breakdown(rows),
         "baseline_cutoff": baseline.isoformat(),
         "rule": "test",
     }
@@ -350,6 +379,8 @@ def self_test() -> int:
     assert report["losses"] == 1
     assert abs(report["net_pnl_eur"] - 1.0) < 1e-9
     assert abs(float(report["profit_factor"]) - 2.0) < 1e-9
+    assert report["regime_breakdown"]["BULLISH_WEAK"]["closed"] == 1
+    assert report["regime_breakdown"]["BULLISH"]["closed"] == 1
     print("DIAMOND_LONG_MOMENTUM_PROSPECTIVE_SELF_TEST_OK")
     return 0
 
