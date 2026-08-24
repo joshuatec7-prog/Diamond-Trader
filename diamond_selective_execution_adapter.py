@@ -1,6 +1,8 @@
 import argparse
 import csv
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List
 from datetime import datetime, timezone
@@ -18,6 +20,7 @@ DEFAULT_CURSOR = Path(
     "/var/data/diamond_selective_execution_cursor.json"
 )
 MAX_EXECUTION_AGE_MINUTES = 20
+HISTORY_LIMIT = 30000
 
 
 def parse_time(value: str):
@@ -32,6 +35,23 @@ def parse_time(value: str):
         return None
 
 
+def write_cursor_atomic(
+    cursor_path: Path,
+    state: Dict[str, Any],
+) -> None:
+    cursor_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=str(cursor_path.parent),
+        delete=False,
+    ) as handle:
+        json.dump(state, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+        tmp_name = handle.name
+    os.replace(tmp_name, cursor_path)
+
+
 def initialize_execution_baseline(
     signals_path: Path = DEFAULT_SIGNALS,
     cursor_path: Path = DEFAULT_CURSOR,
@@ -40,18 +60,52 @@ def initialize_execution_baseline(
     keys = [row["candidate_key"] for row in contracts]
 
     state = {
-        "version": 2,
+        "version": 3,
         "initialized_at": datetime.now(timezone.utc).isoformat(),
-        "seen_keys": keys[-30000:],
+        "seen_keys": keys[-HISTORY_LIMIT:],
         "baseline_count": len(keys),
     }
 
-    cursor_path.parent.mkdir(parents=True, exist_ok=True)
-    cursor_path.write_text(
-        json.dumps(state, indent=2),
-        encoding="utf-8",
-    )
+    write_cursor_atomic(cursor_path, state)
     return state
+
+
+def mark_execution_contract_seen(
+    candidate_key: str,
+    cursor_path: Path = DEFAULT_CURSOR,
+    reason: str = "consumed",
+) -> bool:
+    """Markeer uitsluitend een definitief afgehandelde kandidaat als gezien.
+
+    Tijdelijke BUY-blokkades horen deze functie niet aan te roepen. Een
+    bevestigde echte BUY wel, zodat dezelfde kandidaat na een snelle exit niet
+    opnieuw kan worden gekocht terwijl het oorspronkelijke signaal nog vers is.
+    """
+    key = str(candidate_key or "").strip()
+    if not key or not cursor_path.exists():
+        return False
+
+    try:
+        state = json.loads(cursor_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    if not isinstance(state, dict):
+        return False
+
+    seen_order = list(dict.fromkeys(
+        str(x) for x in state.get("seen_keys", []) if str(x)
+    ))
+    if key not in seen_order:
+        seen_order.append(key)
+
+    state["version"] = max(3, int(state.get("version", 1) or 1))
+    state["seen_keys"] = seen_order[-HISTORY_LIMIT:]
+    state["last_consumed_key"] = key
+    state["last_consumed_at"] = datetime.now(timezone.utc).isoformat()
+    state["last_consumed_reason"] = str(reason or "consumed")
+    write_cursor_atomic(cursor_path, state)
+    return True
 
 
 def new_execution_contracts(
@@ -61,10 +115,10 @@ def new_execution_contracts(
 ) -> List[Dict[str, Any]]:
     """Geef verse uitvoerbare contracten terug zonder tijdelijke blockers weg te gooien.
 
-    Belangrijk: een kandidaat wordt pas definitief als gezien gemarkeerd wanneer
-    hij structureel ongeldig of verlopen is. Tijdelijke blokkades zoals crash
-    guard, open positie, spread/liquiditeit of recovery worden elders opnieuw
-    beoordeeld zolang het signaal jonger is dan max_age_minutes.
+    Een kandidaat wordt pas definitief als gezien gemarkeerd wanneer hij
+    structureel ongeldig/verlopen is of nadat een echte BUY is bevestigd.
+    Tijdelijke blokkades zoals crash guard, open positie, spread/liquiditeit,
+    cooldown, budget of recovery blijven retryable zolang het signaal vers is.
     """
     if not cursor_path.exists():
         initialize_execution_baseline(
@@ -74,7 +128,7 @@ def new_execution_contracts(
         return []
 
     state = json.loads(cursor_path.read_text(encoding="utf-8"))
-    state["version"] = max(2, int(state.get("version", 1) or 1))
+    state["version"] = max(3, int(state.get("version", 1) or 1))
     seen_order = list(dict.fromkeys(
         str(x) for x in state.get("seen_keys", [])
     ))
@@ -139,11 +193,11 @@ def new_execution_contracts(
             continue
 
         # NIET als gezien markeren: de daadwerkelijke LIVE-route kan hem nog
-        # tijdelijk blokkeren door positie, cooldown, spread, liquidity, budget,
-        # approval of recovery. Daardoor blijft hij opnieuw probeerbaar.
+        # tijdelijk blokkeren. Bij een bevestigde BUY markeert AUTO LIVE hem
+        # daarna expliciet als consumed.
         eligible.append(row)
 
-    state["seen_keys"] = seen_order[-30000:]
+    state["seen_keys"] = seen_order[-HISTORY_LIMIT:]
     state["last_poll_at"] = now.isoformat()
     state["retryable_count"] = len(eligible)
     state["crash_guard_status"] = str(
@@ -161,13 +215,9 @@ def new_execution_contracts(
         {},
     )
 
-    cursor_path.write_text(
-        json.dumps(state, indent=2),
-        encoding="utf-8",
-    )
+    write_cursor_atomic(cursor_path, state)
 
     return eligible
-
 
 
 def load_candidates(
@@ -213,6 +263,19 @@ def self_test() -> None:
     assert contract["side"] == "LONG"
     assert contract["strategy"] == "trend_breakout"
     assert contract["entry_price"] == 0.5
+
+    with tempfile.TemporaryDirectory() as td:
+        cursor = Path(td) / "cursor.json"
+        write_cursor_atomic(cursor, {"version": 3, "seen_keys": []})
+        key = contract["candidate_key"]
+        assert mark_execution_contract_seen(
+            key,
+            cursor_path=cursor,
+            reason="self_test",
+        )
+        saved = json.loads(cursor.read_text(encoding="utf-8"))
+        assert key in saved["seen_keys"]
+        assert saved["last_consumed_reason"] == "self_test"
 
 
 def main() -> None:
