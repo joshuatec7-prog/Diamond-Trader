@@ -40,7 +40,7 @@ def initialize_execution_baseline(
     keys = [row["candidate_key"] for row in contracts]
 
     state = {
-        "version": 1,
+        "version": 2,
         "initialized_at": datetime.now(timezone.utc).isoformat(),
         "seen_keys": keys[-30000:],
         "baseline_count": len(keys),
@@ -59,6 +59,13 @@ def new_execution_contracts(
     cursor_path: Path = DEFAULT_CURSOR,
     max_age_minutes: int = MAX_EXECUTION_AGE_MINUTES,
 ) -> List[Dict[str, Any]]:
+    """Geef verse uitvoerbare contracten terug zonder tijdelijke blockers weg te gooien.
+
+    Belangrijk: een kandidaat wordt pas definitief als gezien gemarkeerd wanneer
+    hij structureel ongeldig of verlopen is. Tijdelijke blokkades zoals crash
+    guard, open positie, spread/liquiditeit of recovery worden elders opnieuw
+    beoordeeld zolang het signaal jonger is dan max_age_minutes.
+    """
     if not cursor_path.exists():
         initialize_execution_baseline(
             signals_path,
@@ -67,24 +74,23 @@ def new_execution_contracts(
         return []
 
     state = json.loads(cursor_path.read_text(encoding="utf-8"))
+    state["version"] = max(2, int(state.get("version", 1) or 1))
     seen_order = list(dict.fromkeys(
         str(x) for x in state.get("seen_keys", [])
     ))
     seen = set(seen_order)
 
+    def mark_seen(key: str) -> None:
+        if key and key not in seen:
+            seen.add(key)
+            seen_order.append(key)
+
     now = datetime.now(timezone.utc)
     eligible = []
 
     # REALTIME_MARKET_CRASH_GUARD
-    #
-    # Deze guard gebruikt een verse Bitvavo-marktsnapshot van BTC, ETH,
-    # SOL, XRP en ADA en vergelijkt die met een recente snapshot. Daardoor
-    # is de LONG-beslissing niet uitsluitend afhankelijk van het oudere
-    # market_regime-label dat bij het SELECTIVE-signaal hoort.
-    #
-    # WARMUP, onvolledige data en API-fouten zijn fail-closed voor nieuwe
-    # LONG-entries. Bestaande posities worden hier niet geraakt en blijven
-    # door de normale stop/trailing-logica beheerd.
+    # Een crash-guard blokkade is tijdelijk. Daarom wordt een verse kandidaat
+    # bij een blok NIET als gezien opgeslagen en mag hij later opnieuw proberen.
     crash_guard = poll_market_crash_guard()
     allow_long_by_market = bool(
         crash_guard.get("allow_long", False)
@@ -95,48 +101,51 @@ def new_execution_contracts(
         if key in seen:
             continue
 
-        seen.add(key)
-        seen_order.append(key)
-
         detected = parse_time(row.get("detected_at", ""))
         if detected is None:
+            mark_seen(key)
             continue
 
         age_min = (now - detected).total_seconds() / 60.0
-        if age_min < 0 or age_min > max_age_minutes:
+
+        # Een klokverschil/future timestamp kan vanzelf herstellen.
+        if age_min < 0:
+            continue
+
+        # Na expiry is opnieuw proberen niet meer toegestaan.
+        if age_min > max_age_minutes:
+            mark_seen(key)
             continue
 
         # Spot execution ondersteunt voorlopig uitsluitend LONG.
         if row.get("side") != "LONG":
+            mark_seen(key)
             continue
 
-        # BEARISH_REGIME_LONG_BLOCK
-        #
-        # SELECTIVE zelf blijft ongewijzigd. Dit is uitsluitend
-        # een execution-gate vlak vóór een LONG-contract wordt
-        # doorgegeven aan de live bot.
-        #
-        # Ontbrekend regime is fail-closed: geen nieuwe LONG.
+        # Ontbrekend/bearish regime is structureel ongeschikt voor deze LONG.
         regime = str(
             row.get("market_regime") or ""
         ).strip().upper()
 
-        if not regime:
-            continue
-
-        if regime in {
+        if not regime or regime in {
             "BEARISH",
             "BEARISH_WEAK",
         }:
+            mark_seen(key)
             continue
 
+        # Tijdelijke marktblock: kandidaat blijft retryable tot expiry.
         if not allow_long_by_market:
             continue
 
+        # NIET als gezien markeren: de daadwerkelijke LIVE-route kan hem nog
+        # tijdelijk blokkeren door positie, cooldown, spread, liquidity, budget,
+        # approval of recovery. Daardoor blijft hij opnieuw probeerbaar.
         eligible.append(row)
 
     state["seen_keys"] = seen_order[-30000:]
     state["last_poll_at"] = now.isoformat()
+    state["retryable_count"] = len(eligible)
     state["crash_guard_status"] = str(
         crash_guard.get("status") or "UNKNOWN"
     )
