@@ -2,3 +2,4 @@ ccxt
 pandas
 pyyaml
 python-dotenv
+websocket-client
