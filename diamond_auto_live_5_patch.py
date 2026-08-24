@@ -268,7 +268,10 @@ def reconcile_state(bot: Any, state: Dict[str, Any]) -> Dict[str, Any]:
         state["failed_sequences"] = sorted(set(failed))
         state["last_reason"] = f"no_confirmed_open_sequence_{expected}"
     else:
-        state["last_reason"] = "candidate_blocked_before_order_prepare"
+        state["last_reason"] = str(
+            state.get("last_block_reason")
+            or "candidate_blocked_before_order_prepare"
+        )
 
     state["active_candidate_key"] = None
     state["active_symbol"] = None
@@ -472,6 +475,12 @@ def _install_patch(diamond_bot_module: Any) -> None:
             signal = self.selective_contract_to_long_signal(contract)
             signal["auto_live_5"] = True
             signal["auto_live_5_slot"] = slot
+
+            state = ensure_state(self)
+            state.pop("last_block_reason", None)
+            state.pop("last_block_symbol", None)
+            state.pop("last_block_at", None)
+            write_json_atomic(AUTO_STATE_FILE, state)
 
             try:
                 self.try_buy_symbol(

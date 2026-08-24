@@ -3,7 +3,14 @@
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any
+
+from diamond_auto_live_5_patch import (
+    AUTO_STATE_FILE,
+    read_json,
+    write_json_atomic,
+)
 
 LOG = logging.getLogger("diamond_auto_live_5_guard")
 HARD_AUTO_SPREAD_PCT = 0.10
@@ -13,6 +20,21 @@ def _enabled() -> bool:
     return str(os.getenv("DIAMOND_AUTO_LIVE_5_ENABLED", "")).strip().lower() in {
         "1", "true", "yes", "ja", "on", "aan"
     }
+
+
+def _record_block(symbol: str, reason: str) -> None:
+    """Bewaar exacte AUTO LIVE blokkadereden zonder handelslogica te wijzigen."""
+    try:
+        state = read_json(AUTO_STATE_FILE)
+        state["last_block_reason"] = str(reason)
+        state["last_block_symbol"] = str(symbol).upper()
+        state["last_block_at"] = datetime.now(timezone.utc).isoformat()
+        write_json_atomic(AUTO_STATE_FILE, state)
+    except Exception as exc:
+        LOG.warning(
+            "AUTO LIVE 5 kon blokkadereden niet bewaren | %s",
+            type(exc).__name__,
+        )
 
 
 def install_auto_live_5_guard() -> None:
@@ -42,6 +64,11 @@ def install_auto_live_5_guard() -> None:
                     else float(self.estimate_spread_pct(ticker))
                 )
             except Exception as exc:
+                reason = (
+                    "blocked_current_spread_check_error_"
+                    f"{type(exc).__name__}"
+                )
+                _record_block(symbol, reason)
                 LOG.warning(
                     "AUTO LIVE 5 GEBLOKKEERD %s | actuele spreadcontrole fout: %s",
                     symbol,
@@ -50,6 +77,11 @@ def install_auto_live_5_guard() -> None:
                 return
 
             if spread > HARD_AUTO_SPREAD_PCT:
+                reason = (
+                    f"blocked_current_spread_{spread:.4f}"
+                    f"_gt_{HARD_AUTO_SPREAD_PCT:.4f}"
+                )
+                _record_block(symbol, reason)
                 LOG.warning(
                     "AUTO LIVE 5 GEBLOKKEERD %s | actuele spread %.4f%% > %.4f%%",
                     symbol,
