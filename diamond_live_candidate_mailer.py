@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mail nieuwe LIVE-geschikte SELECTIVE LONG-kandidaten.
+"""Mail nieuwe LIVE-geschikte AUTO LIVE 5-kandidaten.
 
 Veiligheid:
 - plaatst nooit orders;
@@ -116,6 +116,8 @@ def is_live_candidate(row: Dict[str, Any]) -> bool:
         return False
     if str(row.get("side") or "").strip().upper() != "LONG":
         return False
+    if str(row.get("strategy") or "").strip() != "trend_breakout":
+        return False
     regime = str(row.get("market_regime") or "").strip().upper()
     if not regime or regime in {"BEARISH", "BEARISH_WEAK"}:
         return False
@@ -124,12 +126,23 @@ def is_live_candidate(row: Dict[str, Any]) -> bool:
 
 def bot_has_open_position() -> bool:
     state = read_json(BOT_STATE_FILE, {})
-    positions = state.get("open_positions")
+
+    # diamond_bot.py gebruikt 'positions'. Houd 'open_positions' alleen als
+    # backwards-compatible fallback voor oudere statebestanden.
+    positions = state.get("positions")
     if isinstance(positions, dict):
         return bool(positions)
     if isinstance(positions, list):
         return bool(positions)
-    return bool(positions)
+    if positions:
+        return True
+
+    legacy = state.get("open_positions")
+    if isinstance(legacy, dict):
+        return bool(legacy)
+    if isinstance(legacy, list):
+        return bool(legacy)
+    return bool(legacy)
 
 
 def liquidity_settings(cfg: Dict[str, Any]) -> Dict[str, float]:
@@ -172,7 +185,7 @@ def send_email(row: Dict[str, Any], crash: Dict[str, Any], liquidity: Dict[str, 
     subject = f"Diamond Trader LIVE kandidaat | {symbol}"
 
     body = "\n".join([
-        "DIAMOND TRADER - NIEUWE LIVE KANDIDAAT",
+        "DIAMOND TRADER - NIEUWE AUTO LIVE KANDIDAAT",
         "=" * 52,
         f"Markt          : {symbol}",
         f"Richting       : {row.get('side') or '-'}",
@@ -193,9 +206,9 @@ def send_email(row: Dict[str, Any], crash: Dict[str, Any], liquidity: Dict[str, 
         f"Depth multiple : {to_float(liquidity.get('depth_multiple'), 0.0):.2f}x",
         f"Geplande inzet : €{settings['stake']:.2f}",
         "",
-        "Er is GEEN Bitvavo-order geplaatst.",
-        "Handmatige LIVE-approval blijft verplicht.",
-        "De bot controleert alle safety gates opnieuw vlak voor een echte BUY.",
+        "Deze mail plaatst zelf GEEN Bitvavo-order.",
+        "AUTO LIVE kan deze kandidaat automatisch kopen zolang het signaal vers is.",
+        "Vlak voor een echte BUY worden spread, liquidity, budget, approval en recovery opnieuw gecontroleerd.",
         "=" * 52,
     ])
 
@@ -303,10 +316,13 @@ def self_test() -> None:
         "shadow_eligible": "true",
         "candle_timestamp": "2026-08-23T03:00:00+00:00",
     }
-    bad = dict(good)
-    bad["market_regime"] = "BEARISH"
+    bad_regime = dict(good)
+    bad_regime["market_regime"] = "BEARISH"
+    bad_strategy = dict(good)
+    bad_strategy["strategy"] = "momentum"
     assert is_live_candidate(good)
-    assert not is_live_candidate(bad)
+    assert not is_live_candidate(bad_regime)
+    assert not is_live_candidate(bad_strategy)
     print("DIAMOND_LIVE_CANDIDATE_MAILER_SELF_TEST_OK")
 
 
