@@ -3365,6 +3365,15 @@ class Bot:
         last = df.iloc[-1]
 
         price = to_float(last["close"], 0.0)
+
+        # Strategie blijft closed-candle gebaseerd, maar echte
+        # prijsdrempels mogen nooit tegen een candle van vóór de BUY
+        # worden getest. Gebruik daarvoor de actuele uitvoerbare bid.
+        live_ticker = self.get_ticker(symbol)
+        live_bid = to_float(live_ticker.get("bid"), 0.0)
+        if live_bid <= 0:
+            raise RuntimeError(f"Geen geldige live bid voor {symbol}")
+
         atr = to_float(last["atr"], 0.0)
         fast = to_float(last["sma_fast"], 0.0)
         slow = to_float(last["sma_slow"], 0.0)
@@ -3458,18 +3467,18 @@ class Bot:
         )
         if entry_price > 0:
             hard_stop = entry_price * (1.0 - hard_sl_pct / 100.0)
-            if price <= hard_stop:
+            if live_bid <= hard_stop:
                 LOG.warning(
-                    "HARDE STOP-LOSS geraakt voor %s | prijs=%.8f | "
+                    "HARDE STOP-LOSS geraakt voor %s | live_bid=%.8f | "
                     "hard_stop=%.8f (-%.2f%%)",
                     symbol,
-                    price,
+                    live_bid,
                     hard_stop,
                     hard_sl_pct,
                 )
                 return "hard_stop_loss"
 
-        if stop_loss > 0 and price <= stop_loss:
+        if stop_loss > 0 and live_bid <= stop_loss:
             if (
                 stop_loss >= min_profitable_exit_price
                 and highest > entry_price
@@ -3483,7 +3492,7 @@ class Bot:
         )
         if (
             take_profit > 0
-            and price >= take_profit
+            and live_bid >= take_profit
             and not profit_trailing_active
         ):
             return "take_profit"
