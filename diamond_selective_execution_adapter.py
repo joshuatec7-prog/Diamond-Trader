@@ -18,6 +18,9 @@ DEFAULT_SIGNALS = Path("/var/data/diamond_market_signals.csv")
 EARLY_MOVER_SIGNALS = Path(
     "/var/data/diamond_early_mover_selective_signals.csv"
 )
+HOT_WATCH_SIGNALS = Path(
+    "/var/data/diamond_hot_watch_selective_signals.csv"
+)
 
 DEFAULT_CURSOR = Path(
     "/var/data/diamond_selective_execution_cursor.json"
@@ -261,11 +264,13 @@ def load_candidate_sources(
     primary = Path(path)
     sources = [primary]
 
-    if (
-        primary == DEFAULT_SIGNALS
-        and EARLY_MOVER_SIGNALS.exists()
-    ):
-        sources.append(EARLY_MOVER_SIGNALS)
+    if primary == DEFAULT_SIGNALS:
+        for extra in (
+            EARLY_MOVER_SIGNALS,
+            HOT_WATCH_SIGNALS,
+        ):
+            if extra.exists():
+                sources.append(extra)
 
     merged: List[Dict[str, Any]] = []
     seen = set()

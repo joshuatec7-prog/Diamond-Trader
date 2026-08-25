@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse, csv, json, os, tempfile, time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -19,6 +19,10 @@ BRIDGE_SIGNALS = Path(
 BRIDGE_STATE = Path(
     "/var/data/diamond_early_mover_selective_bridge_state.json"
 )
+HOT_WATCH_QUEUE = Path(
+    "/var/data/diamond_early_mover_hot_watch.json"
+)
+HOT_WATCH_TTL_SECONDS = 15 * 60
 
 BRIDGE_HEADER = list(ms.CSV_HEADER)
 if "selection_reason" not in BRIDGE_HEADER:
@@ -190,6 +194,130 @@ def publish_bridge_signals(signals):
     }
 
 
+
+def parse_dt(value):
+    try:
+        dt=datetime.fromisoformat(
+            str(value).replace("Z","+00:00")
+        )
+        if dt.tzinfo is None:
+            dt=dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def spread_only_hot_watch_signal(signal, min_reward_risk):
+    if str(signal.get("side") or "").upper() != "LONG":
+        return False
+    if str(signal.get("strategy") or "") != "trend_breakout":
+        return False
+    if bool(signal.get("shadow_eligible")):
+        return False
+
+    reasons=[
+        str(x).strip().lower()
+        for x in (
+            signal.get("shadow_rejection_reasons") or []
+        )
+        if str(x).strip()
+    ]
+    if not reasons:
+        return False
+
+    # HOT WATCH mag uitsluitend een tijdelijke spread-blocker
+    # overbruggen. Geen RR/volume/regime/score-fouten.
+    if not all("spread" in reason for reason in reasons):
+        return False
+
+    eco=signal.get("economics") or {}
+    try:
+        rr=float(eco.get("reward_risk") or 0)
+    except Exception:
+        rr=0.0
+
+    return rr + 1e-12 >= float(min_reward_risk)
+
+
+def update_hot_watch(signals):
+    now=datetime.now(timezone.utc)
+
+    try:
+        old=json.loads(HOT_WATCH_QUEUE.read_text())
+        if not isinstance(old,dict):
+            old={}
+    except Exception:
+        old={}
+
+    items={}
+
+    for item in old.get("items",[]) or []:
+        if not isinstance(item,dict):
+            continue
+        key=str(item.get("candidate_key") or "")
+        expires=parse_dt(item.get("expires_at"))
+        if key and expires and expires > now:
+            items[key]=item
+
+    before=set(items)
+
+    for signal in signals:
+        key=selective_candidate_key(signal)
+        symbol=str(signal.get("symbol") or "").upper()
+        if not key or not symbol:
+            continue
+
+        existing=items.get(key)
+
+        if existing:
+            existing["last_seen_at"]=now.isoformat()
+            existing["blocked_spread_pct"]=signal.get(
+                "spread_pct"
+            )
+            continue
+
+        eco=signal.get("economics") or {}
+
+        items[key]={
+            "candidate_key":key,
+            "symbol":symbol,
+            "detected_at":signal.get("detected_at"),
+            "candle_timestamp":
+                signal.get("candle_timestamp"),
+            "first_seen_at":now.isoformat(),
+            "last_seen_at":now.isoformat(),
+            "expires_at":(
+                now
+                + timedelta(
+                    seconds=HOT_WATCH_TTL_SECONDS
+                )
+            ).isoformat(),
+            "reward_risk":eco.get("reward_risk"),
+            "blocked_spread_pct":
+                signal.get("spread_pct"),
+            "reason":"spread_only",
+        }
+
+    state={
+        "version":1,
+        "updated_at":now.isoformat(),
+        "ttl_seconds":HOT_WATCH_TTL_SECONDS,
+        "count":len(items),
+        "items":sorted(
+            items.values(),
+            key=lambda x:str(
+                x.get("first_seen_at") or ""
+            ),
+        ),
+    }
+    atomic(HOT_WATCH_QUEUE,state)
+
+    return {
+        "active":len(items),
+        "added":len(set(items)-before),
+    }
+
+
 def self_test():
     rows=[
         {"symbol":"A/EUR","liquidity":"LOW","priority":9},
@@ -244,6 +372,24 @@ def self_test():
         "TEST/EUR|trend_breakout|LONG|"
     )
 
+    blocked=dict(fake)
+    blocked["shadow_eligible"]=False
+    blocked["shadow_rejection_reasons"]=[
+        "spread 0.3452% hoger dan 0.1000%"
+    ]
+    assert spread_only_hot_watch_signal(
+        blocked,1.20
+    )
+
+    blocked_bad=dict(blocked)
+    blocked_bad["shadow_rejection_reasons"]=[
+        "spread 0.3452% hoger dan 0.1000%",
+        "risico/winst 0.900 lager dan 1.200",
+    ]
+    assert not spread_only_hot_watch_signal(
+        blocked_bad,1.20
+    )
+
     print("SELF TEST: PASS")
 
 def run():
@@ -281,6 +427,7 @@ def run():
     results=[]
     errors=[]
     bridge_candidates=[]
+    hot_watch_candidates=[]
 
     for early in candidates:
         symbol=early["symbol"]
@@ -294,12 +441,16 @@ def run():
             record["selection_reason"] = "EARLY_MOVER_1M"
 
             base = str(record.get("base") or "").upper()
-            execution_prefilter = bool(
+            execution_prefilter_except_spread = bool(
                 base
                 and base not in cfg["exclude_bases"]
                 and not ms.leveraged_token(base)
                 and float(record.get("quote_volume") or 0)
                     >= float(cfg["min_quote_volume"])
+            )
+
+            execution_prefilter = bool(
+                execution_prefilter_except_spread
                 and float(record.get("spread_pct") or 999)
                     <= float(cfg["max_spread_pct"])
             )
@@ -314,6 +465,17 @@ def run():
             full_signals=analysis.get("signals",[])
 
             for s in full_signals:
+                s["selection_reason"]="EARLY_MOVER_1M"
+
+                if (
+                    execution_prefilter_except_spread
+                    and spread_only_hot_watch_signal(
+                        s,
+                        cfg["min_reward_risk"],
+                    )
+                ):
+                    hot_watch_candidates.append(s)
+
                 if (
                     execution_prefilter
                     and selective_accepts(s)
@@ -363,7 +525,12 @@ def run():
                 "error":f"{type(e).__name__}: {e}",
             })
 
-    bridge=publish_bridge_signals(bridge_candidates)
+    hot_watch=update_hot_watch(
+        hot_watch_candidates
+    )
+    bridge=publish_bridge_signals(
+        bridge_candidates
+    )
 
     now=datetime.now(timezone.utc)
     report={
@@ -379,6 +546,7 @@ def run():
         "orders_placed_by_this_process":False,
         "live_rules_changed":False,
         "bridge":bridge,
+        "hot_watch":hot_watch,
         "results":results,
     }
     atomic(OUTPUT,report)
@@ -391,6 +559,8 @@ def run():
     print("bridge mode  :", bridge["mode"])
     print("bridge valid :", bridge["eligible"])
     print("bridge nieuw :", bridge["emitted"])
+    print("hot watch    :", hot_watch["active"])
+    print("hot nieuw    :", hot_watch["added"])
     print()
 
     for r in results:
