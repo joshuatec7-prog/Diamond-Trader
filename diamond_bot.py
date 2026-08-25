@@ -6771,14 +6771,34 @@ class Bot:
             ),
         )
 
+        selective_check_s = max(
+            10,
+            min(
+                60,
+                int(
+                    to_float(
+                        get_cfg(
+                            self.cfg,
+                            "execution.selective_check_seconds",
+                            30,
+                        ),
+                        30,
+                    )
+                ),
+            ),
+        )
+
         LOG.info(
             "LOOP | volledige cyclus=%ss | "
-            "open-positiecontrole=%ss",
+            "open-positiecontrole=%ss | "
+            "SELECTIVE-controle=%ss",
             full_cycle_s,
             position_check_s,
+            selective_check_s,
         )
 
         next_full_cycle = 0.0
+        next_selective_check = 0.0
 
         while True:
             try:
@@ -6790,9 +6810,48 @@ class Bot:
                         time.monotonic()
                         + full_cycle_s
                     )
+                    next_selective_check = (
+                        time.monotonic()
+                        + selective_check_s
+                    )
 
                 elif self.state.get("positions"):
                     self.manage_open_positions_fast()
+
+                elif (
+                    self.selective_execution_enabled
+                    and now >= next_selective_check
+                ):
+                    # Alleen de bestaande SELECTIVE/AUTO-route
+                    # opnieuw controleren. Geen zware market scan.
+                    self.state = load_state(
+                        self.state_file
+                    )
+
+                    if self.state.get("pending_orders"):
+                        self.reconcile_pending_orders()
+
+                    control = load_control(
+                        self.control_file
+                    )
+
+                    paused = to_bool(
+                        control.get("paused"),
+                        False,
+                    )
+
+                    recovery_block = (
+                        self.entries_blocked_by_recovery()
+                    )
+
+                    if not paused and not recovery_block:
+                        self.refresh_balance_cache()
+                        self.execute_selective_contracts()
+
+                    next_selective_check = (
+                        time.monotonic()
+                        + selective_check_s
+                    )
 
             except Exception as exc:
                 LOG.exception(
@@ -6813,6 +6872,18 @@ class Bot:
                     float(position_check_s),
                     seconds_until_full,
                 )
+
+            elif self.selective_execution_enabled:
+                seconds_until_selective = max(
+                    0.0,
+                    next_selective_check
+                    - time.monotonic(),
+                )
+                sleep_s = min(
+                    seconds_until_full,
+                    seconds_until_selective,
+                )
+
             else:
                 sleep_s = seconds_until_full
 

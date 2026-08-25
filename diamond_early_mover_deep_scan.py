@@ -485,10 +485,10 @@ def update_signal_watch_item(
     if not symbol:
         return
 
-    if has_valid_tb:
-        items.pop(symbol,None)
-        return
-
+    # Ook een geldige TB-LONG blijft tijdelijk gevolgd.
+    # Het individuele execution-contract mag na 20 minuten
+    # verlopen, maar op een volgende afgesloten 15m-candle
+    # krijgt de munt opnieuw de volledige strategiecheck.
     regime=str(
         analysis.get("market_regime") or ""
     ).upper()

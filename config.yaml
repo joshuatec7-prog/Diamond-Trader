@@ -188,6 +188,11 @@ execution:
   # strategiecycli door met actuele bid-prijs bewaakt.
   position_check_seconds: 20
 
+  # Verse SELECTIVE/AUTO-kandidaten worden tussen de
+  # zware 5-minutencycli opnieuw op tijdelijke blockers
+  # gecontroleerd. Dit draait GEEN nieuwe zware market scan.
+  selective_check_seconds: 30
+
 logging:
   level: INFO
   loop_sleep_seconds: 300
