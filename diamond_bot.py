@@ -3364,9 +3364,7 @@ class Bot:
         df = enrich_indicators(df, sma_fast, sma_slow, rsi_len, atr_len)
         last = df.iloc[-1]
 
-        price = to_float(last["close"], 0.0)
-
-        # Strategie blijft closed-candle gebaseerd, maar echte
+        # ATR/SMA/trendlogica blijft closed-candle gebaseerd, maar echte
         # prijsdrempels mogen nooit tegen een candle van vóór de BUY
         # worden getest. Gebruik daarvoor de actuele uitvoerbare bid.
         live_ticker = self.get_ticker(symbol)
@@ -3380,11 +3378,17 @@ class Bot:
         stop_loss = to_float(position.get("stop_loss"), 0.0)
         take_profit = to_float(position.get("take_profit"), 0.0)
         entry_price = to_float(position.get("entry_price"), 0.0)
-        highest = max(to_float(position.get("highest_price", 0.0), 0.0), price)
+        highest = max(
+            to_float(
+                position.get("highest_price"),
+                entry_price,
+            ),
+            live_bid,
+        )
         position["highest_price"] = highest
 
         profit_pct = (
-            ((price - entry_price) / entry_price) * 100.0
+            ((live_bid - entry_price) / entry_price) * 100.0
             if entry_price > 0
             else 0.0
         )
@@ -3399,7 +3403,7 @@ class Bot:
         estimated_net_profit = self.estimated_exit_pnl_quote(
             symbol,
             position,
-            price,
+            live_bid,
         )
 
         # Een trailing stop mag pas worden verhoogd naar winstgebied wanneer
