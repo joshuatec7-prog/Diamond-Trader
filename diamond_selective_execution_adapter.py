@@ -15,6 +15,9 @@ from diamond_selective_rules import (
 )
 
 DEFAULT_SIGNALS = Path("/var/data/diamond_market_signals.csv")
+EARLY_MOVER_SIGNALS = Path(
+    "/var/data/diamond_early_mover_selective_signals.csv"
+)
 
 DEFAULT_CURSOR = Path(
     "/var/data/diamond_selective_execution_cursor.json"
@@ -56,7 +59,7 @@ def initialize_execution_baseline(
     signals_path: Path = DEFAULT_SIGNALS,
     cursor_path: Path = DEFAULT_CURSOR,
 ) -> Dict[str, Any]:
-    contracts = load_candidates(signals_path)
+    contracts = load_candidate_sources(signals_path)
     keys = [row["candidate_key"] for row in contracts]
 
     state = {
@@ -150,7 +153,7 @@ def new_execution_contracts(
         crash_guard.get("allow_long", False)
     )
 
-    for row in load_candidates(signals_path):
+    for row in load_candidate_sources(signals_path):
         key = row["candidate_key"]
         if key in seen:
             continue
@@ -244,6 +247,49 @@ def load_candidates(
     return result
 
 
+
+def load_candidate_sources(
+    path: Path = DEFAULT_SIGNALS,
+) -> List[Dict[str, Any]]:
+    """
+    Combineer de bestaande SELECTIVE scannerbron met de
+    market-wide early-mover bron.
+
+    Beide bronnen gaan daarna door exact dezelfde execution-
+    en AUTO-gates en delen exact dezelfde seen-cursor.
+    """
+    primary = Path(path)
+    sources = [primary]
+
+    if (
+        primary == DEFAULT_SIGNALS
+        and EARLY_MOVER_SIGNALS.exists()
+    ):
+        sources.append(EARLY_MOVER_SIGNALS)
+
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+
+    for source in sources:
+        for row in load_candidates(source):
+            key = str(row.get("candidate_key") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+
+    merged.sort(
+        key=lambda row: (
+            parse_time(row.get("detected_at", ""))
+            or epoch
+        )
+    )
+
+    return merged
+
+
 def self_test() -> None:
     row = {
         "symbol": "ENA/EUR",
@@ -289,7 +335,7 @@ def main() -> None:
         print("DIAMOND_SELECTIVE_EXECUTION_ADAPTER_SELF_TEST_OK")
         return
 
-    rows = load_candidates()
+    rows = load_candidate_sources()
 
     print(f"SELECTIVE execution-contracts: {len(rows)}")
 
