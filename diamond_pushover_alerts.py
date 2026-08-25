@@ -19,10 +19,12 @@ import argparse
 import json
 import logging
 import os
+import smtplib
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional, Tuple
+from email.mime.text import MIMEText
 
 from diamond_auto_live_5_patch import (
     AUTO_STATE_FILE,
@@ -205,6 +207,175 @@ def _fmt_price(value: Any) -> str:
     return f"{number:.8f}"
 
 
+def _gmail_credentials() -> Tuple[str, str]:
+    user = os.getenv(
+        "GMAIL_USER",
+        "joshuatec7@gmail.com",
+    ).strip()
+    password = os.getenv(
+        "GMAIL_APP_PASSWORD",
+        "",
+    ).strip()
+    return user, password
+
+
+def _send_trade_email(subject: str, body: str) -> None:
+    user, password = _gmail_credentials()
+    if not user or not password:
+        raise RuntimeError("GMAIL_NOT_CONFIGURED")
+
+    message = MIMEText(body, "plain", "utf-8")
+    message["Subject"] = subject
+    message["From"] = user
+    message["To"] = user
+
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com",
+        465,
+        timeout=30,
+    ) as smtp:
+        smtp.login(user, password)
+        smtp.sendmail(
+            user,
+            [user],
+            message.as_string(),
+        )
+
+
+def notify_auto_open_email(
+    symbol: str,
+    position: Dict[str, Any],
+) -> bool:
+    is_auto, state, sequence, slot = _open_auto_info(
+        position
+    )
+    if not is_auto:
+        return False
+
+    if sequence in _alerted(
+        state,
+        "email_open_alerted_sequences",
+    ):
+        return True
+
+    target = max(
+        1,
+        int(to_float(state.get("target_buys"), 5)),
+    )
+
+    quote_amount = to_float(
+        position.get("quote_amount"),
+        0.0,
+    )
+    fee = to_float(
+        position.get("fees_buy_quote"),
+        0.0,
+    )
+
+    subject = (
+        f"Diamond Trader AUTO BUY "
+        f"{slot}/{target} | {symbol}"
+    )
+
+    body = "\n".join([
+        "DIAMOND TRADER - BEVESTIGDE AUTO BUY",
+        "=" * 48,
+        f"Markt     : {symbol}",
+        f"BUY       : {slot}/{target}",
+        f"Inzet     : €{quote_amount:.2f}",
+        f"Buy fee   : €{fee:.2f}",
+        f"Entry     : {_fmt_price(position.get('entry_price'))}",
+        f"Stop-loss : {_fmt_price(position.get('stop_loss'))}",
+        f"Target    : {_fmt_price(position.get('take_profit'))}",
+        f"Strategie : {position.get('strategy') or '-'}",
+        f"Regime    : {position.get('market_regime') or '-'}",
+        "",
+        "De BUY is bevestigd door de exchange.",
+        "Geen handmatige actie nodig.",
+        "=" * 48,
+    ])
+
+    _send_trade_email(subject, body)
+
+    _mark_alerted(
+        state,
+        "email_open_alerted_sequences",
+        sequence,
+    )
+
+    LOG.warning(
+        "EMAIL AUTO BUY verzonden | %s | slot=%d/%d | seq=%d",
+        symbol,
+        slot,
+        target,
+        sequence,
+    )
+    return True
+
+
+def notify_auto_close_email(
+    symbol: str,
+    position: Dict[str, Any],
+    reason: str,
+    actual_net_pnl_quote: float,
+    holding_time_min: float,
+) -> bool:
+    is_auto, state, sequence, slot = _close_auto_info(
+        position
+    )
+    if not is_auto:
+        return False
+
+    if sequence in _alerted(
+        state,
+        "email_close_alerted_sequences",
+    ):
+        return True
+
+    target = max(
+        1,
+        int(to_float(state.get("target_buys"), 5)),
+    )
+
+    pnl = to_float(actual_net_pnl_quote, 0.0)
+    sign = "+" if pnl > 0 else ""
+
+    subject = (
+        f"Diamond Trader SELL {slot}/{target} | "
+        f"{symbol} | {sign}€{pnl:.2f}"
+    )
+
+    body = "\n".join([
+        "DIAMOND TRADER - BEVESTIGDE SELL",
+        "=" * 48,
+        f"Markt          : {symbol}",
+        f"Trade          : {slot}/{target}",
+        f"Netto resultaat: {sign}€{pnl:.2f}",
+        f"Reden          : {reason or '-'}",
+        f"Houdtijd       : {to_float(holding_time_min, 0.0):.1f} min",
+        "",
+        "De SELL is bevestigd door de exchange.",
+        "=" * 48,
+    ])
+
+    _send_trade_email(subject, body)
+
+    _mark_alerted(
+        state,
+        "email_close_alerted_sequences",
+        sequence,
+    )
+
+    LOG.warning(
+        "EMAIL SELL verzonden | %s | slot=%d/%d | pnl=%+.2f",
+        symbol,
+        slot,
+        target,
+        pnl,
+    )
+    return True
+
+
 def notify_auto_open(symbol: str, position: Dict[str, Any]) -> bool:
     is_auto, state, sequence, slot = _open_auto_info(position)
     if not is_auto:
@@ -294,6 +465,11 @@ def install_pushover_hooks() -> None:
         except Exception as exc:
             LOG.warning("PUSHOVER BUY waarschuwing mislukt | %s | %s", symbol, exc)
 
+        try:
+            notify_auto_open_email(symbol, position)
+        except Exception as exc:
+            LOG.warning("EMAIL BUY waarschuwing mislukt | %s | %s", symbol, exc)
+
     def canary_close_event_with_push(
         self: Any,
         symbol: str,
@@ -334,6 +510,17 @@ def install_pushover_hooks() -> None:
             )
         except Exception as exc:
             LOG.warning("PUSHOVER SELL waarschuwing mislukt | %s | %s", symbol, exc)
+
+        try:
+            notify_auto_close_email(
+                symbol,
+                position,
+                reason,
+                actual_net_pnl_quote,
+                holding_time_min,
+            )
+        except Exception as exc:
+            LOG.warning("EMAIL SELL waarschuwing mislukt | %s | %s", symbol, exc)
 
     Bot.canary_open_event = canary_open_event_with_push
     Bot.canary_close_event = canary_close_event_with_push
