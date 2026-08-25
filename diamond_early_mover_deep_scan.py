@@ -23,6 +23,10 @@ HOT_WATCH_QUEUE = Path(
     "/var/data/diamond_early_mover_hot_watch.json"
 )
 HOT_WATCH_TTL_SECONDS = 15 * 60
+LIQUIDITY_PROMOTIONS = Path(
+    "/var/data/diamond_early_mover_liquidity_promotions.json"
+)
+MAX_LIQUIDITY_PROMOTIONS = 8
 
 BRIDGE_HEADER = list(ms.CSV_HEADER)
 if "selection_reason" not in BRIDGE_HEADER:
@@ -318,6 +322,74 @@ def update_hot_watch(signals):
     }
 
 
+
+def load_liquidity_promotions():
+    now=datetime.now(timezone.utc)
+
+    try:
+        data=json.loads(
+            LIQUIDITY_PROMOTIONS.read_text()
+        )
+        if not isinstance(data,dict):
+            return []
+    except Exception:
+        return []
+
+    rows=[]
+
+    for item in (
+        data.get("items",{}) or {}
+    ).values():
+        if not isinstance(item,dict):
+            continue
+
+        ready_until=parse_dt(
+            item.get("ready_until")
+        )
+        if (
+            ready_until is None
+            or ready_until <= now
+        ):
+            continue
+
+        row=dict(item)
+        row["liquidity_promoted"]=True
+        rows.append(row)
+
+    rows.sort(
+        key=lambda x:(
+            -float(x.get("priority") or 0),
+            str(x.get("promoted_at") or ""),
+        )
+    )
+
+    return rows[
+        :MAX_LIQUIDITY_PROMOTIONS
+    ]
+
+
+def merge_promoted_candidates(
+    normal,
+    promoted,
+):
+    result=list(normal)
+    seen={
+        str(x.get("symbol") or "").upper()
+        for x in result
+    }
+
+    for row in promoted:
+        symbol=str(
+            row.get("symbol") or ""
+        ).upper()
+        if not symbol or symbol in seen:
+            continue
+        result.append(row)
+        seen.add(symbol)
+
+    return result
+
+
 def self_test():
     rows=[
         {"symbol":"A/EUR","liquidity":"LOW","priority":9},
@@ -390,6 +462,23 @@ def self_test():
         blocked_bad,1.20
     )
 
+    merged=merge_promoted_candidates(
+        [{"symbol":"AAA/EUR"}],
+        [
+            {
+                "symbol":"AAA/EUR",
+                "liquidity_promoted":True,
+            },
+            {
+                "symbol":"BBB/EUR",
+                "liquidity_promoted":True,
+            },
+        ],
+    )
+    assert [
+        x["symbol"] for x in merged
+    ] == ["AAA/EUR","BBB/EUR"]
+
     print("SELF TEST: PASS")
 
 def run():
@@ -415,6 +504,14 @@ def run():
     )
     candidates=candidates[:MAX_MARKETS]
 
+    liquidity_promotions=(
+        load_liquidity_promotions()
+    )
+    candidates=merge_promoted_candidates(
+        candidates,
+        liquidity_promotions,
+    )
+
     ex=ccxt.bitvavo({
         "enableRateLimit":True,
         "timeout":30000,
@@ -438,7 +535,16 @@ def run():
             if record is None:
                 raise RuntimeError("geen geldige markt/ticker")
 
-            record["selection_reason"] = "EARLY_MOVER_1M"
+            selection_reason=(
+                "EARLY_MOVER_LIQUIDITY_PROMOTION"
+                if early.get(
+                    "liquidity_promoted"
+                )
+                else "EARLY_MOVER_1M"
+            )
+            record["selection_reason"] = (
+                selection_reason
+            )
 
             base = str(record.get("base") or "").upper()
             execution_prefilter_except_spread = bool(
@@ -465,7 +571,9 @@ def run():
             full_signals=analysis.get("signals",[])
 
             for s in full_signals:
-                s["selection_reason"]="EARLY_MOVER_1M"
+                s["selection_reason"]=(
+                    selection_reason
+                )
 
                 if (
                     execution_prefilter_except_spread
@@ -516,6 +624,11 @@ def run():
                     analysis.get("atr_pct_15m"),
                 "signal_count":len(signals),
                 "execution_prefilter":execution_prefilter,
+                "liquidity_promoted":bool(
+                    early.get(
+                        "liquidity_promoted"
+                    )
+                ),
                 "signals":signals,
             })
 
@@ -541,6 +654,13 @@ def run():
             source.get("candidate_count",0),
         "pass_watch_candidates":len(candidates),
         "deep_scanned":len(results),
+        "liquidity_promotions_scanned":
+            sum(
+                1 for x in results
+                if x.get(
+                    "liquidity_promoted"
+                )
+            ),
         "errors":errors,
         "auto_candidate_bridge":True,
         "orders_placed_by_this_process":False,
@@ -555,6 +675,12 @@ def run():
     print("early movers :", report["source_candidates"])
     print("PASS/WATCH   :", len(candidates))
     print("deep scanned :", len(results))
+    print(
+        "liq promoted :",
+        report[
+            "liquidity_promotions_scanned"
+        ],
+    )
     print("errors       :", len(errors))
     print("bridge mode  :", bridge["mode"])
     print("bridge valid :", bridge["eligible"])

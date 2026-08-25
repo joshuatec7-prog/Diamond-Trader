@@ -22,6 +22,7 @@ SHORT_MOMENTUM_LOG="$DATA_DIR/diamond_short_momentum_prospective.log"
 MARKETWIDE_1M_LOG="$DATA_DIR/diamond_marketwide_1m_early_mover.log"
 EARLY_MOVER_DEEP_LOG="$DATA_DIR/diamond_early_mover_deep_scan.log"
 EARLY_MOVER_HOT_LOG="$DATA_DIR/diamond_early_mover_hot_watch.log"
+EARLY_MOVER_LIQUIDITY_LOG="$DATA_DIR/diamond_early_mover_liquidity_watch.log"
 
 cd "$PROJECT_DIR"
 mkdir -p "$DATA_DIR" "$DATA_DIR/diamond_early_entry"
@@ -185,6 +186,13 @@ python3 diamond_marketwide_1m_early_mover.py --loop \
 MARKETWIDE_1M_PID=$!
 OPTIONAL_PIDS+=("$MARKETWIDE_1M_PID")
 echo "        PID $MARKETWIDE_1M_PID"
+
+echo "[START] Diamond Early Mover Liquidity Watch"
+python3 diamond_early_mover_liquidity_watch.py --loop \
+    >> "$EARLY_MOVER_LIQUIDITY_LOG" 2>&1 &
+EARLY_MOVER_LIQUIDITY_PID=$!
+OPTIONAL_PIDS+=("$EARLY_MOVER_LIQUIDITY_PID")
+echo "        PID $EARLY_MOVER_LIQUIDITY_PID"
 
 echo "[START] Diamond Early Mover Deep Scan"
 python3 diamond_early_mover_deep_scan.py --loop \
