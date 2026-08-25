@@ -6,6 +6,7 @@
 # - LIVE-kandidaatmailer blijft adviserend en plaatst nooit orders.
 # - LONG momentum prospective tracker draait research-only.
 # - SHORT momentum prospective tracker draait research-only.
+# - RR MID prospective shadow tracker draait research-only.
 # - Periodieke analyse start uitgelijnd op 15m candle-closes.
 # - AUTO LIVE 5 gebruikt maximaal vijf bevestigde BUYs van max €130.
 
@@ -19,6 +20,7 @@ EARLY_ENTRY_LOG="$DATA_DIR/diamond_early_entry/collector_v1_3_1_runner.log"
 LIVE_CANDIDATE_LOG="$DATA_DIR/diamond_live_candidate_mailer.log"
 LONG_MOMENTUM_LOG="$DATA_DIR/diamond_long_momentum_prospective.log"
 SHORT_MOMENTUM_LOG="$DATA_DIR/diamond_short_momentum_prospective.log"
+RR_MID_LOG="$DATA_DIR/diamond_rr_mid_135_150_shadow.log"
 MARKETWIDE_1M_LOG="$DATA_DIR/diamond_marketwide_1m_early_mover.log"
 EARLY_MOVER_DEEP_LOG="$DATA_DIR/diamond_early_mover_deep_scan.log"
 EARLY_MOVER_HOT_LOG="$DATA_DIR/diamond_early_mover_hot_watch.log"
@@ -158,6 +160,14 @@ python3 diamond_short_momentum_prospective_tracker.py \
 SHORT_MOMENTUM_PID=$!
 OPTIONAL_PIDS+=("$SHORT_MOMENTUM_PID")
 echo "        PID $SHORT_MOMENTUM_PID"
+
+echo "[START] Diamond RR MID Prospective Shadow Tracker"
+python3 diamond_rr_mid_prospective_tracker.py \
+    --loop --interval-seconds 300 --no-print \
+    >> "$RR_MID_LOG" 2>&1 &
+RR_MID_PID=$!
+OPTIONAL_PIDS+=("$RR_MID_PID")
+echo "        PID $RR_MID_PID"
 
 echo "[START] Diamond Strategy Lab"
 python3 strategy_lab.py --loop --interval-minutes 360 --no-print \
