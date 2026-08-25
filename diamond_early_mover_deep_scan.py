@@ -28,6 +28,12 @@ LIQUIDITY_PROMOTIONS = Path(
 )
 MAX_LIQUIDITY_PROMOTIONS = 8
 
+SIGNAL_WATCH_STATE = Path(
+    "/var/data/diamond_early_mover_signal_watch.json"
+)
+SIGNAL_WATCH_TTL_SECONDS = 75 * 60
+MAX_SIGNAL_WATCH_DUE = 8
+
 BRIDGE_HEADER = list(ms.CSV_HEADER)
 if "selection_reason" not in BRIDGE_HEADER:
     BRIDGE_HEADER.append("selection_reason")
@@ -390,6 +396,160 @@ def merge_promoted_candidates(
     return result
 
 
+
+def next_15m_check(now=None):
+    now=now or datetime.now(timezone.utc)
+    ts=int(now.timestamp())
+    next_close=((ts // 900) + 1) * 900
+    return datetime.fromtimestamp(
+        next_close + 30,
+        tz=timezone.utc,
+    )
+
+
+def load_signal_watch_due():
+    now=datetime.now(timezone.utc)
+
+    try:
+        state=json.loads(
+            SIGNAL_WATCH_STATE.read_text()
+        )
+        if not isinstance(state,dict):
+            state={}
+    except Exception:
+        state={}
+
+    items=state.get("items")
+    if not isinstance(items,dict):
+        items={}
+
+    due=[]
+
+    for symbol in list(items):
+        item=items[symbol]
+
+        expires=parse_dt(
+            item.get("expires_at")
+        )
+        if expires is None or expires <= now:
+            del items[symbol]
+            continue
+
+        check=parse_dt(
+            item.get("next_check_at")
+        )
+
+        if check is not None and check <= now:
+            row=dict(item.get("source") or {})
+            row["symbol"]=symbol
+            row["signal_watch"]=True
+            due.append(row)
+
+    due.sort(
+        key=lambda x:float(
+            x.get("priority") or 0
+        ),
+        reverse=True,
+    )
+
+    return state,items,due[:MAX_SIGNAL_WATCH_DUE]
+
+
+def save_signal_watch(
+    state,
+    items,
+):
+    state["version"]=1
+    state["updated_at"]=datetime.now(
+        timezone.utc
+    ).isoformat()
+    state["ttl_seconds"] = (
+        SIGNAL_WATCH_TTL_SECONDS
+    )
+    state["count"]=len(items)
+    state["items"]=items
+    atomic(SIGNAL_WATCH_STATE,state)
+
+
+def update_signal_watch_item(
+    items,
+    early,
+    analysis,
+    execution_prefilter_except_spread,
+    has_valid_tb,
+):
+    symbol=str(
+        early.get("symbol") or ""
+    ).upper()
+
+    if not symbol:
+        return
+
+    if has_valid_tb:
+        items.pop(symbol,None)
+        return
+
+    regime=str(
+        analysis.get("market_regime") or ""
+    ).upper()
+
+    # Alleen een liquide early mover in een
+    # bullish hoger-timeframe regime vasthouden.
+    if (
+        not execution_prefilter_except_spread
+        or not regime.startswith("BULLISH")
+    ):
+        return
+
+    now=datetime.now(timezone.utc)
+    existing=items.get(symbol)
+
+    if existing is None:
+        existing={
+            "symbol":symbol,
+            "first_seen_at":now.isoformat(),
+            "expires_at":(
+                now
+                + timedelta(
+                    seconds=
+                        SIGNAL_WATCH_TTL_SECONDS
+                )
+            ).isoformat(),
+        }
+        items[symbol]=existing
+
+    source={
+        "symbol":symbol,
+        "liquidity":early.get(
+            "liquidity","PASS"
+        ),
+        "priority":early.get(
+            "priority",0
+        ),
+        "move_1m_pct":early.get(
+            "move_1m_pct"
+        ),
+        "move_5m_pct":early.get(
+            "move_5m_pct"
+        ),
+        "move_15m_pct":early.get(
+            "move_15m_pct"
+        ),
+        "volume_quote_24h":
+            early.get("volume_quote_24h"),
+        "spread_pct":early.get(
+            "spread_pct"
+        ),
+    }
+
+    existing["source"]=source
+    existing["last_scanned_at"]=now.isoformat()
+    existing["last_regime"]=regime
+    existing["next_check_at"]=(
+        next_15m_check(now).isoformat()
+    )
+
+
 def self_test():
     rows=[
         {"symbol":"A/EUR","liquidity":"LOW","priority":9},
@@ -479,6 +639,16 @@ def self_test():
         x["symbol"] for x in merged
     ] == ["AAA/EUR","BBB/EUR"]
 
+    test_now=datetime(
+        2026,8,25,12,13,0,
+        tzinfo=timezone.utc,
+    )
+    assert next_15m_check(
+        test_now
+    ).isoformat() == (
+        "2026-08-25T12:15:30+00:00"
+    )
+
     print("SELF TEST: PASS")
 
 def run():
@@ -512,6 +682,14 @@ def run():
         liquidity_promotions,
     )
 
+    signal_watch_state,signal_watch_items,signal_watch_due=(
+        load_signal_watch_due()
+    )
+    candidates=merge_promoted_candidates(
+        candidates,
+        signal_watch_due,
+    )
+
     ex=ccxt.bitvavo({
         "enableRateLimit":True,
         "timeout":30000,
@@ -535,13 +713,20 @@ def run():
             if record is None:
                 raise RuntimeError("geen geldige markt/ticker")
 
-            selection_reason=(
-                "EARLY_MOVER_LIQUIDITY_PROMOTION"
-                if early.get(
-                    "liquidity_promoted"
+            if early.get("signal_watch"):
+                selection_reason=(
+                    "EARLY_MOVER_SIGNAL_WATCH"
                 )
-                else "EARLY_MOVER_1M"
-            )
+            elif early.get(
+                "liquidity_promoted"
+            ):
+                selection_reason=(
+                    "EARLY_MOVER_LIQUIDITY_PROMOTION"
+                )
+            else:
+                selection_reason=(
+                    "EARLY_MOVER_1M"
+                )
             record["selection_reason"] = (
                 selection_reason
             )
@@ -569,6 +754,25 @@ def run():
 
             signals=[]
             full_signals=analysis.get("signals",[])
+
+            has_valid_tb=any(
+                selective_accepts(s)
+                and str(
+                    s.get("side") or ""
+                ).upper()=="LONG"
+                and str(
+                    s.get("strategy") or ""
+                )=="trend_breakout"
+                for s in full_signals
+            )
+
+            update_signal_watch_item(
+                signal_watch_items,
+                early,
+                analysis,
+                execution_prefilter_except_spread,
+                has_valid_tb,
+            )
 
             for s in full_signals:
                 s["selection_reason"]=(
@@ -629,6 +833,11 @@ def run():
                         "liquidity_promoted"
                     )
                 ),
+                "signal_watch":bool(
+                    early.get(
+                        "signal_watch"
+                    )
+                ),
                 "signals":signals,
             })
 
@@ -637,6 +846,11 @@ def run():
                 "symbol":symbol,
                 "error":f"{type(e).__name__}: {e}",
             })
+
+    save_signal_watch(
+        signal_watch_state,
+        signal_watch_items,
+    )
 
     hot_watch=update_hot_watch(
         hot_watch_candidates
@@ -661,6 +875,13 @@ def run():
                     "liquidity_promoted"
                 )
             ),
+        "signal_watch_active":
+            len(signal_watch_items),
+        "signal_watch_scanned":
+            sum(
+                1 for x in results
+                if x.get("signal_watch")
+            ),
         "errors":errors,
         "auto_candidate_bridge":True,
         "orders_placed_by_this_process":False,
@@ -680,6 +901,14 @@ def run():
         report[
             "liquidity_promotions_scanned"
         ],
+    )
+    print(
+        "signal watch :",
+        report["signal_watch_active"],
+    )
+    print(
+        "watch scan   :",
+        report["signal_watch_scanned"],
     )
     print("errors       :", len(errors))
     print("bridge mode  :", bridge["mode"])
