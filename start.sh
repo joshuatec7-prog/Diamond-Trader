@@ -19,6 +19,8 @@ EARLY_ENTRY_LOG="$DATA_DIR/diamond_early_entry/collector_v1_3_1_runner.log"
 LIVE_CANDIDATE_LOG="$DATA_DIR/diamond_live_candidate_mailer.log"
 LONG_MOMENTUM_LOG="$DATA_DIR/diamond_long_momentum_prospective.log"
 SHORT_MOMENTUM_LOG="$DATA_DIR/diamond_short_momentum_prospective.log"
+MARKETWIDE_1M_LOG="$DATA_DIR/diamond_marketwide_1m_early_mover.log"
+EARLY_MOVER_DEEP_LOG="$DATA_DIR/diamond_early_mover_deep_scan.log"
 
 cd "$PROJECT_DIR"
 mkdir -p "$DATA_DIR" "$DATA_DIR/diamond_early_entry"
@@ -175,6 +177,20 @@ python3 early_entry_collector_runner_v1_1.py \
 EARLY_ENTRY_RUNNER_PID=$!
 PIDS+=("$EARLY_ENTRY_RUNNER_PID")
 echo "        Runner PID $EARLY_ENTRY_RUNNER_PID"
+
+echo "[START] Diamond Market-Wide 1M Early Mover"
+python3 diamond_marketwide_1m_early_mover.py --loop \
+    >> "$MARKETWIDE_1M_LOG" 2>&1 &
+MARKETWIDE_1M_PID=$!
+OPTIONAL_PIDS+=("$MARKETWIDE_1M_PID")
+echo "        PID $MARKETWIDE_1M_PID"
+
+echo "[START] Diamond Early Mover Deep Scan"
+python3 diamond_early_mover_deep_scan.py --loop \
+    >> "$EARLY_MOVER_DEEP_LOG" 2>&1 &
+EARLY_MOVER_DEEP_PID=$!
+OPTIONAL_PIDS+=("$EARLY_MOVER_DEEP_PID")
+echo "        PID $EARLY_MOVER_DEEP_PID"
 
 set +e
 
