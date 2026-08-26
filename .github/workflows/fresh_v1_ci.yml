@@ -28,3 +28,14 @@ jobs:
       - name: Compile check
         working-directory: fresh_v1
         run: python -m compileall -q .
+
+      - name: Public Bitvavo smoke cycle
+        working-directory: fresh_v1
+        env:
+          DB_PATH: /tmp/cryptobot_fresh_ci.db
+          LOOP_ENABLED: "false"
+        run: python main.py --once
+
+      - name: Current sanity backtest
+        working-directory: fresh_v1
+        run: python backtest.py --limit 500
