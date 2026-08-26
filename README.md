@@ -50,4 +50,6 @@ Readiness maakt bewust onderscheid tussen:
 
 Als marktdata geblokkeerd is, blijft de worker actief zonder te handelen en registreert hij de datastatus in SQLite en de diagnose in de logs.
 
+`READY` wordt alleen gezet als de volledige vastgezette marktset in dezelfde cyclus gezond verwerkt is; gedeeltelijke marktdata blijft `PARTIAL` en kan de paper-observatie niet vrijgeven.
+
 GitHub CI voert dezelfde deterministische tests, compilecontrole, offline paperketen en lokale readiness-check uit zonder externe marktdata nodig te hebben.
