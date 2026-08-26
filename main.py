@@ -43,7 +43,9 @@ def ensure_universe(api: BitvavoPublic, db: Storage, s: Settings) -> list[str]:
 
 
 def log_public_probe(api: BitvavoPublic) -> None:
-    for result in api.probe_public_endpoints():
+    results = api.probe_public_endpoints()
+    results.append(api.probe_websocket_handshake())
+    for result in results:
         logger.error(
             'BITVAVO PUBLIC PROBE | %s | status=%s | %s',
             result['name'], result['status'], result['body'] or '-',
