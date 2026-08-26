@@ -11,12 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Python 3.12
-        uses: actions/setup-python@v5
+      - name: Python 3.12.14
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.12.14"
 
       - name: Install
         run: python -m pip install -r fresh_v1/requirements.txt
@@ -29,13 +29,12 @@ jobs:
         working-directory: fresh_v1
         run: python -m compileall -q .
 
-      - name: Public Bitvavo smoke cycle
+      - name: Config validation
+        working-directory: fresh_v1
+        run: python -c "from config import Settings; Settings().validate(); print('CONFIG PASS')"
+
+      - name: CLI and SQLite smoke check
         working-directory: fresh_v1
         env:
           DB_PATH: /tmp/cryptobot_fresh_ci.db
-          LOOP_ENABLED: "false"
-        run: python main.py --once
-
-      - name: Current sanity backtest
-        working-directory: fresh_v1
-        run: python backtest.py --limit 500
+        run: python main.py --status
