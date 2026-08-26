@@ -165,7 +165,12 @@ class Storage:
 
     def save_signal(self, market: str, timestamp_ms: int, signal: Signal) -> None:
         self.conn.execute(
-            "INSERT OR IGNORE INTO signals (market, timestamp_ms, action, reason, metrics_json) VALUES (?, ?, ?, ?, ?)",
+            """INSERT INTO signals (market, timestamp_ms, action, reason, metrics_json)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(market, timestamp_ms) DO UPDATE SET
+                action=excluded.action,
+                reason=excluded.reason,
+                metrics_json=excluded.metrics_json""",
             (market, timestamp_ms, signal.action, signal.reason, json.dumps(signal.metrics, sort_keys=True)),
         )
         self.conn.commit()
