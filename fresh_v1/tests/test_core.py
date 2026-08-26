@@ -33,10 +33,17 @@ class FakeSession:
 
 
 class CoreTests(unittest.TestCase):
-    def test_indicators(self):
+    def test_ema(self):
         values = [float(i) for i in range(1, 31)]
-        self.assertGreater(ema(values, 5)[-1], ema(values, 5)[-2])
+        out = ema(values, 5)
+        self.assertEqual(len(out), len(values))
+        self.assertGreater(out[-1], out[-2])
+
+    def test_rsi(self):
+        values = [float(i) for i in range(1, 31)]
         self.assertEqual(rsi(values, 14)[-1], 100.0)
+
+    def test_atr(self):
         candles = [Candle(i * 60000, 100+i, 102+i, 99+i, 101+i, 10) for i in range(30)]
         self.assertGreater(atr(candles, 14)[-1], 0)
 
@@ -72,6 +79,22 @@ class CoreTests(unittest.TestCase):
             db2 = Storage(path, 1000)
             self.assertIsNotNone(db2.get_position("BTC-EUR"))
             db2.close()
+
+    def test_paper_take_profit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = replace(Settings(), db_path=str(Path(tmp) / "db.sqlite"), paper_start_eur=1000,
+                        stake_eur=100, stop_atr_mult=1.0, take_atr_mult=2.0)
+            db = Storage(s.db_path, s.paper_start_eur)
+            trader = PaperTrader(s, db)
+            trader.open_long("BTC-EUR", Book(99.9, 100.0), 2.0, 1000, now_ms=1000)
+            p = db.get_position("BTC-EUR")
+            event = trader.process_candle(
+                "BTC-EUR",
+                Candle(2000, 100, p.take_price + 0.1, p.stop_price + 0.1, 102, 10),
+            )
+            self.assertEqual(event.reason, "take_profit")
+            self.assertIsNone(db.get_position("BTC-EUR"))
+            db.close()
 
     def test_paper_same_candle_stop_first(self):
         with tempfile.TemporaryDirectory() as tmp:
