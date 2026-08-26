@@ -1,0 +1,29 @@
+CRYPTOBOT FRESH v1 - BUILD REPORT
+Datum: 2026-08-26
+
+GEREED
+- Nieuwe afgescheiden architectuur
+- Openbare Bitvavo candles + bid/ask
+- Gesloten-candle filter
+- Eén trend/breakoutstrategie
+- Paper trading
+- Fees, spread en slippage-model
+- Stop, take-profit en trailing
+- SQLite persistentie
+- Atomaire open/close boekingen
+- Statusrapport
+- No-lookahead sanity-backtest
+- Render start.sh
+- Offline regressietests
+
+LOKALE VALIDATIE VOOR GITHUB-UPLOAD
+- unittest: 9/9 PASS
+- python compileall: PASS
+
+VEILIGHEID
+- Geen echte orders
+- Geen private Bitvavo endpoints
+- Geen API keys/secrets nodig
+- Bestaande main-branch niet gewijzigd
+- Nieuwe branch: fresh-start-20260826
+- Nieuwe map: fresh_v1/
