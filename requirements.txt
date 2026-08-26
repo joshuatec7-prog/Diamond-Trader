@@ -1,5 +1,1 @@
-ccxt
-pandas
-pyyaml
-python-dotenv
-websocket-client
+requests==2.34.2
