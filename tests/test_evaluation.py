@@ -125,6 +125,24 @@ class EvaluationTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_span_uses_first_and_last_close_not_first_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Settings()
+            db = Storage(str(Path(tmp)/'x.db'), s.paper_start_eur)
+            try:
+                insert_trade(db, 0, 1.0, total=2)
+                insert_trade(db, 1, 1.0, total=2)
+                # Maak de eerste houdtijd kunstmatig extreem lang. Dit mag de
+                # prospectieve meetperiode niet vergroten.
+                db.conn.execute('UPDATE trades SET opened_at_ms=? WHERE id=1', (-100 * DAY,))
+                db.conn.execute('UPDATE trades SET closed_at_ms=? WHERE id=1', (0,))
+                db.conn.execute('UPDATE trades SET opened_at_ms=?, closed_at_ms=? WHERE id=2', (DAY-1000, DAY))
+                db.conn.commit()
+                p = performance(db, s.paper_start_eur)
+                self.assertAlmostEqual(p.span_days, 1.0, places=9)
+            finally:
+                db.close()
+
 
 if __name__ == '__main__':
     unittest.main()
