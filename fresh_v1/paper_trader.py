@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -46,11 +47,22 @@ class PaperTrader:
             return False, "onvoldoende_paper_cash"
         return True, "ok"
 
-    def open_long(self, market: str, book: Book, atr_value: float, candle_ts: int, now_ms: int | None = None) -> Optional[TradeEvent]:
+    def open_long(
+        self,
+        market: str,
+        book: Book,
+        atr_value: float,
+        candle_ts: int,
+        now_ms: int | None = None,
+    ) -> Optional[TradeEvent]:
+        if not math.isfinite(atr_value) or atr_value <= 0:
+            logger.error("%s BUY geblokkeerd: ongeldige_atr", market)
+            return None
         allowed, reason = self.can_open(market, book)
         if not allowed:
             logger.info("%s BUY geblokkeerd: %s", market, reason)
             return None
+
         entry_price = book.ask * (1.0 + self.slippage_rate)
         entry_notional = self.s.stake_eur
         amount = entry_notional / entry_price
@@ -65,7 +77,7 @@ class PaperTrader:
             entry_notional=entry_notional,
             entry_fee=entry_fee,
             atr_at_entry=atr_value,
-            stop_price=entry_price - (atr_value * self.s.stop_atr_mult),
+            stop_price=max(1e-12, entry_price - (atr_value * self.s.stop_atr_mult)),
             take_price=entry_price + (atr_value * self.s.take_atr_mult),
             highest_price=entry_price,
             trailing_active=False,
