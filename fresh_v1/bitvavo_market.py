@@ -121,4 +121,8 @@ class BitvavoMarket:
             item = payload[0]
         else:
             item = payload
-        return Book(bid=float(item["bid"]), ask=float(item["ask"]))
+        bid = float(item["bid"])
+        ask = float(item["ask"])
+        if bid <= 0 or ask <= 0 or ask < bid:
+            raise RuntimeError(f"Ongeldig orderboek voor {market}: bid={bid} ask={ask}")
+        return Book(bid=bid, ask=ask)
