@@ -47,6 +47,12 @@ class Settings:
     candle_limit: int = _env_int("CANDLE_LIMIT", 500)
     max_entry_delay_seconds: int = _env_int("MAX_ENTRY_DELAY_SECONDS", 180)
     max_consecutive_failed_cycles: int = _env_int("MAX_CONSECUTIVE_FAILED_CYCLES", 5)
+
+    eval_min_trades: int = _env_int("EVAL_MIN_TRADES", 30)
+    eval_min_span_days: float = _env_float("EVAL_MIN_SPAN_DAYS", 7.0)
+    eval_min_profit_factor: float = _env_float("EVAL_MIN_PROFIT_FACTOR", 1.20)
+    eval_max_drawdown_pct: float = _env_float("EVAL_MAX_DRAWDOWN_PCT", 5.0)
+
     db_path: str = os.getenv("DB_PATH", default_db_path())
 
     paper_start_eur: float = _env_float("PAPER_START_EUR", 1000.0)
@@ -93,6 +99,14 @@ class Settings:
             raise ValueError("MAX_ENTRY_DELAY_SECONDS moet tussen 30 en 3600 liggen")
         if not (1 <= self.max_consecutive_failed_cycles <= 60):
             raise ValueError("MAX_CONSECUTIVE_FAILED_CYCLES moet tussen 1 en 60 liggen")
+        if not (10 <= self.eval_min_trades <= 500):
+            raise ValueError("EVAL_MIN_TRADES moet tussen 10 en 500 liggen")
+        if not (1 <= self.eval_min_span_days <= 90):
+            raise ValueError("EVAL_MIN_SPAN_DAYS moet tussen 1 en 90 liggen")
+        if not (1.0 <= self.eval_min_profit_factor <= 5.0):
+            raise ValueError("EVAL_MIN_PROFIT_FACTOR moet tussen 1.0 en 5.0 liggen")
+        if not (0.5 <= self.eval_max_drawdown_pct <= 50):
+            raise ValueError("EVAL_MAX_DRAWDOWN_PCT moet tussen 0.5 en 50 liggen")
         if self.paper_start_eur <= 0 or self.stake_eur <= 0:
             raise ValueError("Paperkapitaal en stake moeten positief zijn")
         if self.max_open_positions < 1:
