@@ -106,6 +106,8 @@ class BitvavoPublic:
 
     def trading_markets(self, quote: str = 'EUR') -> List[str]:
         payload = self._get('/markets')
+        if not isinstance(payload, list):
+            raise RuntimeError('ongeldig /markets antwoord')
         result: List[str] = []
         for item in payload:
             if not isinstance(item, dict):
@@ -119,6 +121,8 @@ class BitvavoPublic:
     def top_markets_by_quote_volume(self, quote: str, limit: int) -> List[str]:
         allowed = set(self.trading_markets(quote))
         payload = self._get('/ticker/24h')
+        if not isinstance(payload, list):
+            raise RuntimeError('ongeldig /ticker/24h antwoord')
         ranked: List[tuple[float, str]] = []
         for item in payload:
             if not isinstance(item, dict):
@@ -140,15 +144,20 @@ class BitvavoPublic:
 
     def candles(self, market: str, interval: str, limit: int) -> List[Candle]:
         payload = self._get(f'/{market}/candles', {'interval': interval, 'limit': limit})
+        if not isinstance(payload, list):
+            raise RuntimeError(f'ongeldig candles-antwoord voor {market}')
         parsed: Dict[int, Candle] = {}
         for row in payload:
             if not isinstance(row, (list, tuple)) or len(row) < 6:
                 continue
-            candle = Candle(
-                timestamp_ms=int(row[0]), open=float(row[1]), high=float(row[2]),
-                low=float(row[3]), close=float(row[4]), volume=float(row[5]),
-            )
-            if candle.open > 0 and candle.high > 0 and candle.low > 0 and candle.close > 0:
+            try:
+                candle = Candle(
+                    timestamp_ms=int(row[0]), open=float(row[1]), high=float(row[2]),
+                    low=float(row[3]), close=float(row[4]), volume=float(row[5]),
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if candle.is_valid:
                 parsed[candle.timestamp_ms] = candle
         return [parsed[key] for key in sorted(parsed)]
 
@@ -162,11 +171,13 @@ class BitvavoPublic:
 
     def book(self, market: str) -> Book:
         payload = self._get('/ticker/book', {'market': market})
-        item = payload[0] if isinstance(payload, list) else payload
+        item = payload[0] if isinstance(payload, list) and payload else payload
         if not isinstance(item, dict):
             raise RuntimeError('ongeldig ticker/book antwoord')
-        bid = float(item['bid'])
-        ask = float(item['ask'])
-        if bid <= 0 or ask <= 0 or ask < bid:
+        try:
+            book = Book(bid=float(item['bid']), ask=float(item['ask']))
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(f'ongeldig ticker/book antwoord voor {market}') from exc
+        if not book.is_valid:
             raise RuntimeError(f'ongeldige bid/ask voor {market}')
-        return Book(bid=bid, ask=ask)
+        return book

@@ -56,6 +56,12 @@ class CleanRoomTests(unittest.TestCase):
         result = api.closed_candles('AAA-EUR','1h',10,now_ms=5_000_000)
         self.assertEqual([c.timestamp_ms for c in result],[0])
 
+    def test_invalid_exchange_candle_is_discarded(self):
+        payload = [[0,'10','9','11','10','2'],[3_600_000,'11','12','10','11','2']]
+        api = BitvavoPublic('https://x', session=FakeSession([FakeResponse(payload)]))
+        result = api.candles('AAA-EUR','1h',10)
+        self.assertEqual([c.timestamp_ms for c in result],[3_600_000])
+
     def test_permanent_4xx_not_retried(self):
         sess = FakeSession([FakeResponse({},403)])
         api = BitvavoPublic('https://x', retries=3, session=sess)
@@ -107,7 +113,7 @@ class CleanRoomTests(unittest.TestCase):
             trader = PaperTrader(s,db)
             trader.open_long('AAA-EUR',Book(99.9,100),1,now_ms=1)
             p = db.get_position('AAA-EUR')
-            event = trader.process_candle('AAA-EUR',Candle(2,100,p.take_price+1,p.stop_price-1,100,1))
+            event = trader.process_candle('AAA-EUR',Candle(2,100,p.take_price+1,p.stop_price-1,100,1),now_ms=2)
             self.assertEqual(event.reason,'stop_loss')
             db.close()
 

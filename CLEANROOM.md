@@ -1,22 +1,30 @@
 # Clean-room verklaring
 
-Deze codebasis is opnieuw opgebouwd vanuit drie toegestane bestaande randvoorwaarden:
+Deze codebasis is opnieuw opgebouwd vanuit uitsluitend drie infrastructuurrandvoorwaarden: Render-hosting, GitHub-broncodebeheer en Bitvavo als exchange.
 
-- hosting op Render;
-- broncodebeheer via GitHub;
-- Bitvavo als exchange.
+Geen eerdere handelsstrategie, eerder symbooluniversum, eerdere indicatorinstellingen, eerdere stake-instellingen, eerdere onderzoeksresultaten of eerdere evaluatieresultaten zijn als input gebruikt.
 
-Geen eerdere handelsstrategie, eerder symbooluniversum, eerdere indicatorinstellingen, eerdere stake-instellingen, eerdere onderzoeksresultaten of eerdere evaluatieresultaten zijn als input gebruikt voor deze codebasis.
+## Onafhankelijke ontwerpkeuzes
 
-## Nieuwe keuzes
-
-- De marktselectie is niet hard-coded. Bij de eerste start worden actieve EUR-markten via de publieke Bitvavo-marktenlijst opgehaald en gerangschikt op actueel 24-uurs quotevolume. De gekozen universe wordt daarna in SQLite vastgezet.
-- De eerste strategie is een statistische lower-band re-entry op 1-uurscandles.
-- De strategie gebruikt alleen een rollend gemiddelde en standaarddeviatie. Er zijn geen aanvullende richtingsfilters.
-- Exitregels zijn vooraf vastgezet: vaste procentuele stop, vaste procentuele winstdoelstelling en een maximale houdtijd.
-- Paper trading gebruikt een eigen fictief startkapitaal en heeft geen koppeling met een bestaand rekeningbedrag.
+- De runtime accepteert uitsluitend `RUN_MODE=PAPER`.
+- Er is geen private API-authenticatie en geen echte orderfunctie aanwezig.
+- Marktdata is via `MarketDataSource` losgekoppeld van strategie en paper-execution.
+- De eerste marktselectie is niet hard-coded. Publieke EUR-markten worden op actueel 24-uurs quotevolume gerangschikt; de eerste selectie wordt daarna in de eigen SQLite-database vastgezet.
+- De eerste strategie is een statistische lower-band re-entry op 1-uurscandles met alleen een rollend gemiddelde en standaarddeviatie.
+- Exitregels zijn vooraf vastgezet: procentuele stop, procentueel winstdoel en maximale houdtijd.
+- Paper trading gebruikt een eigen fictief startkapitaal en geen bestaand rekeningbedrag.
 - Evaluatiegrenzen zijn vóór de eerste paper trade vastgezet.
 
-## Bronnen voor exchangegedrag
+## Veiligheids- en integriteitscontroles
 
-Alle exchange-endpoints in deze code komen uit de actuele publieke Bitvavo REST-documentatie. De standaard taker fee voor EUR-markten gebruikt de publiek vermelde eerste volumetier en blijft configureerbaar.
+- inkomende candles en orderboekwaarden worden op eindigheid en prijsstructuur gevalideerd;
+- cash en positie-mutaties gebeuren transactioneel in SQLite;
+- een positie kan niet tweemaal worden gesloten en paper-cash kan daardoor niet dubbel worden gecrediteerd;
+- SQLite `quick_check` en schema-versie zijn onderdeel van readiness/status;
+- paper-tradetijden gebruiken de prospectieve runtime-tijd, zodat historische candle-timestamps de minimale observatieperiode niet kunnen versnellen;
+- CI scant de runtime op private trading-capabilities;
+- `offline_check.py` test de volledige paperketen deterministisch zonder netwerk.
+
+## Marktdata bij storing
+
+Een publieke API-storing of netwerkblokkade veroorzaakt geen crash/restart-lus. De worker blijft veilig zonder trading actief, registreert de datastatus en voert alleen publieke REST/WebSocket-diagnose uit.

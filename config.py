@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,7 @@ def default_db_path() -> str:
 
 @dataclass(frozen=True)
 class Settings:
+    run_mode: str = os.getenv('RUN_MODE', 'PAPER').upper()
     api_base_url: str = os.getenv('BITVAVO_API_BASE_URL', 'https://api.bitvavo.com/v2')
     quote_currency: str = os.getenv('QUOTE_CURRENCY', 'EUR').upper()
     universe_size: int = _env_int('UNIVERSE_SIZE', 3)
@@ -38,6 +40,7 @@ class Settings:
     interval: str = os.getenv('CANDLE_INTERVAL', '1h')
     candle_limit: int = _env_int('CANDLE_LIMIT', 240)
     poll_seconds: int = _env_int('POLL_SECONDS', 120)
+    degraded_retry_seconds: int = _env_int('DEGRADED_RETRY_SECONDS', 300)
     max_signal_age_seconds: int = _env_int('MAX_SIGNAL_AGE_SECONDS', 900)
     max_consecutive_failed_cycles: int = _env_int('MAX_CONSECUTIVE_FAILED_CYCLES', 5)
 
@@ -68,6 +71,20 @@ class Settings:
     db_path: str = os.getenv('DB_PATH', default_db_path())
 
     def validate(self) -> None:
+        if self.run_mode != 'PAPER':
+            raise ValueError('Clean-room v1 staat uitsluitend RUN_MODE=PAPER toe')
+        if not self.api_base_url.startswith('https://'):
+            raise ValueError('BITVAVO_API_BASE_URL moet HTTPS gebruiken')
+
+        numeric_floats = (
+            self.paper_start_eur, self.position_eur, self.taker_fee_pct, self.slippage_pct,
+            self.max_spread_pct, self.backtest_assumed_spread_pct, self.band_stddev,
+            self.stop_loss_pct, self.take_profit_pct, self.eval_min_span_days,
+            self.eval_min_profit_factor, self.eval_max_drawdown_pct,
+        )
+        if not all(math.isfinite(v) for v in numeric_floats):
+            raise ValueError('Configuratie bevat niet-eindige numerieke waarde')
+
         allowed_intervals = {'1m','5m','15m','30m','1h','2h','4h','6h','8h','12h','1d'}
         if self.interval not in allowed_intervals:
             raise ValueError(f'Ongeldig CANDLE_INTERVAL: {self.interval}')
@@ -79,6 +96,8 @@ class Settings:
             raise ValueError('CANDLE_LIMIT moet tussen 60 en 1440 liggen')
         if self.poll_seconds < 30:
             raise ValueError('POLL_SECONDS moet minimaal 30 zijn')
+        if not (60 <= self.degraded_retry_seconds <= 3600):
+            raise ValueError('DEGRADED_RETRY_SECONDS buiten bereik')
         if not (60 <= self.max_signal_age_seconds <= 7200):
             raise ValueError('MAX_SIGNAL_AGE_SECONDS buiten bereik')
         if not (1 <= self.max_consecutive_failed_cycles <= 60):

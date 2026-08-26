@@ -20,11 +20,13 @@ class BacktestResult:
 
 
 def run_backtest(market: str, candles: list[Candle], s: Settings) -> BacktestResult:
+    if any(not c.is_valid for c in candles):
+        raise ValueError(f'{market}: backtest bevat ongeldige candle')
     strategy = BandReentryStrategy(s)
     fee = s.taker_fee_pct/100.0
     slip = s.slippage_pct/100.0
     half_spread = s.backtest_assumed_spread_pct/200.0
-    wins = losses = 0
+    trades = wins = losses = 0
     pnl_total = gross_profit = gross_loss = 0.0
     i = s.band_window
 
@@ -62,6 +64,7 @@ def run_backtest(market: str, candles: list[Candle], s: Settings) -> BacktestRes
         exit_notional = amount * exit_price
         exit_fee = exit_notional * fee
         pnl = exit_notional - exit_fee - notional - entry_fee
+        trades += 1
         pnl_total += pnl
         if pnl > 0:
             wins += 1
@@ -71,7 +74,6 @@ def run_backtest(market: str, candles: list[Candle], s: Settings) -> BacktestRes
             gross_loss += -pnl
         i = max(i+1, exit_idx)
 
-    trades = wins + losses
     pf = gross_profit/gross_loss if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
     return BacktestResult(market, trades, wins, losses, pnl_total, pf)
 

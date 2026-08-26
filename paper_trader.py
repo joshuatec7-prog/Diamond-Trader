@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 
 from config import Settings
@@ -21,6 +22,8 @@ class PaperTrader:
         return self.s.slippage_pct / 100.0
 
     def can_open(self, market: str, book: Book) -> tuple[bool, str]:
+        if not book.is_valid:
+            return False, 'ongeldig_orderboek'
         if self.db.get_position(market) is not None:
             return False, 'positie_bestaat_al'
         if len(self.db.all_positions()) >= self.s.max_open_positions:
@@ -28,6 +31,8 @@ class PaperTrader:
         if book.spread_pct > self.s.max_spread_pct:
             return False, 'spread_te_hoog'
         needed = self.s.position_eur * (1.0 + self.fee_rate)
+        if not math.isfinite(needed) or needed <= 0:
+            return False, 'ongeldige_paper_inzet'
         if self.db.cash_eur() + 1e-9 < needed:
             return False, 'onvoldoende_paper_cash'
         return True, 'ok'
@@ -56,17 +61,21 @@ class PaperTrader:
         self.db.open_position_atomic(p, entry_notional + entry_fee)
         return TradeEvent('OPEN', market, entry_price, 'lower_band_reentry')
 
-    def process_candle(self, market: str, candle: Candle) -> TradeEvent | None:
+    def process_candle(self, market: str, candle: Candle,
+                       now_ms: int | None = None) -> TradeEvent | None:
+        if not candle.is_valid:
+            raise ValueError(f'ongeldige candle voor {market}')
         p = self.db.get_position(market)
         if p is None or candle.timestamp_ms <= p.entry_candle_ts:
             return None
         p.bars_held += 1
+        closed_at_ms = int(time.time()*1000) if now_ms is None else now_ms
         if candle.low <= p.stop_price:
-            return self._close(p, p.stop_price, 'stop_loss', candle.timestamp_ms)
+            return self._close(p, p.stop_price, 'stop_loss', closed_at_ms)
         if candle.high >= p.take_price:
-            return self._close(p, p.take_price, 'take_profit', candle.timestamp_ms)
+            return self._close(p, p.take_price, 'take_profit', closed_at_ms)
         if p.bars_held >= self.s.max_hold_bars:
-            return self._close(p, candle.close, 'time_exit', candle.timestamp_ms)
+            return self._close(p, candle.close, 'time_exit', closed_at_ms)
         self.db.update_position(p)
         return None
 

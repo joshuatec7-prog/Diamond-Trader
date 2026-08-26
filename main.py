@@ -8,6 +8,7 @@ import time
 
 from bitvavo_public import BitvavoPublic, INTERVAL_MS
 from config import Settings
+from market_data import MarketDataSource
 from models import Decision
 from paper_trader import PaperTrader
 from report import print_report
@@ -32,7 +33,7 @@ def setup_logging(level: str) -> None:
     )
 
 
-def ensure_universe(api: BitvavoPublic, db: Storage, s: Settings) -> list[str]:
+def ensure_universe(api: MarketDataSource, db: Storage, s: Settings) -> list[str]:
     existing = db.universe()
     if existing:
         return existing
@@ -54,15 +55,20 @@ def log_public_probe(api: BitvavoPublic) -> None:
 
 def acquire_universe(api: BitvavoPublic, db: Storage, s: Settings,
                      once: bool) -> list[str] | None:
+    db.set_data_health('STARTING', 'marktuniversum initialiseren')
     while not STOP:
         try:
-            return ensure_universe(api, db, s)
+            markets = ensure_universe(api, db, s)
+            db.set_data_health('READY', f'universe beschikbaar: {len(markets)} markten')
+            return markets
         except Exception as exc:
+            detail = f'{type(exc).__name__}: {exc}'
+            db.set_data_health('BLOCKED', detail)
             logger.error('universe initialisatie mislukt: %s', exc)
             log_public_probe(api)
             if once:
                 return None
-            wait_seconds = max(300, s.poll_seconds)
+            wait_seconds = s.degraded_retry_seconds
             logger.warning(
                 'worker blijft actief zonder trading; nieuwe publieke API-poging over %s seconden',
                 wait_seconds,
@@ -74,7 +80,7 @@ def acquire_universe(api: BitvavoPublic, db: Storage, s: Settings,
     return None
 
 
-def process_market(market: str, api: BitvavoPublic, db: Storage,
+def process_market(market: str, api: MarketDataSource, db: Storage,
                    strategy: BandReentryStrategy, trader: PaperTrader,
                    s: Settings) -> bool:
     candles = api.closed_candles(market, s.interval, s.candle_limit)
@@ -122,20 +128,22 @@ def process_market(market: str, api: BitvavoPublic, db: Storage,
     return True
 
 
-def run_cycle(api: BitvavoPublic, db: Storage, strategy: BandReentryStrategy,
-              trader: PaperTrader, s: Settings, markets: list[str]) -> tuple[int, int]:
+def run_cycle(api: MarketDataSource, db: Storage, strategy: BandReentryStrategy,
+              trader: PaperTrader, s: Settings, markets: list[str]) -> tuple[int, int, str]:
     ok = 0
     failed = 0
+    last_error = ''
     for market in markets:
         if STOP:
             break
         try:
             process_market(market, api, db, strategy, trader, s)
             ok += 1
-        except Exception:
+        except Exception as exc:
             failed += 1
+            last_error = f'{market}: {type(exc).__name__}: {exc}'
             logger.exception('%s: cyclus mislukt', market)
-    return ok, failed
+    return ok, failed, last_error
 
 
 def main() -> int:
@@ -143,6 +151,7 @@ def main() -> int:
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--status', action='store_true')
     parser.add_argument('--report', action='store_true')
+    parser.add_argument('--readiness', action='store_true')
     args = parser.parse_args()
 
     s = Settings()
@@ -156,6 +165,10 @@ def main() -> int:
             return 0
         if args.report:
             print_report(db, s)
+            return 0
+        if args.readiness:
+            from readiness import print_readiness
+            print_readiness(db, s)
             return 0
 
         api = BitvavoPublic(s.api_base_url, s.request_timeout_seconds, s.request_retries)
@@ -173,11 +186,13 @@ def main() -> int:
         loop = not args.once and s.loop_enabled
         consecutive_total_failures = 0
         while True:
-            ok, failed = run_cycle(api, db, strategy, trader, s, markets)
-            if ok == 0:
-                consecutive_total_failures += 1
-            else:
+            ok, failed, last_error = run_cycle(api, db, strategy, trader, s, markets)
+            if ok > 0:
                 consecutive_total_failures = 0
+                db.set_data_health('READY', f'cyclus ok={ok} failed={failed}')
+            else:
+                consecutive_total_failures += 1
+                db.set_data_health('DEGRADED', last_error or f'alle {failed} marktcycli mislukt')
             if consecutive_total_failures >= s.max_consecutive_failed_cycles:
                 logger.error('marktdata volledig onbereikbaar gedurende %s cycli; publieke API-diagnose volgt', consecutive_total_failures)
                 log_public_probe(api)
