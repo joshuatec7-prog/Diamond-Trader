@@ -37,7 +37,9 @@ def performance(db: Storage, paper_start_eur: float) -> Performance:
 
     span_days = 0.0
     if len(rows) >= 2:
-        span_days = (int(rows[-1]['closed_at_ms']) - int(rows[0]['opened_at_ms'])) / 86_400_000.0
+        # Prospectieve meetduur loopt van eerste close tot laatste close;
+        # de houdtijd van de eerste trade mag de observatieperiode niet verlengen.
+        span_days = (int(rows[-1]['closed_at_ms']) - int(rows[0]['closed_at_ms'])) / 86_400_000.0
     return Performance(len(rows), wins, losses, pnl, pf, max_dd, span_days)
 
 
