@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import base64
 import logging
+import os
+import socket
+import ssl
 import time
 from typing import Any, Dict, List
 
@@ -73,6 +77,32 @@ class BitvavoPublic:
             except requests.RequestException as exc:
                 results.append({'name': name, 'status': 'ERROR', 'body': f'{type(exc).__name__}: {exc}'})
         return results
+
+    def probe_websocket_handshake(self) -> Dict[str, Any]:
+        host = 'ws.bitvavo.com'
+        key = base64.b64encode(os.urandom(16)).decode('ascii')
+        request = (
+            'GET /v2/ HTTP/1.1\r\n'
+            f'Host: {host}\r\n'
+            'Upgrade: websocket\r\n'
+            'Connection: Upgrade\r\n'
+            f'Sec-WebSocket-Key: {key}\r\n'
+            'Sec-WebSocket-Version: 13\r\n'
+            'User-Agent: CryptoBot-CleanRoom/1.0\r\n'
+            '\r\n'
+        ).encode('ascii')
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((host, 443), timeout=self.timeout_seconds) as raw:
+                with context.wrap_socket(raw, server_hostname=host) as tls:
+                    tls.settimeout(self.timeout_seconds)
+                    tls.sendall(request)
+                    response = tls.recv(2048).decode('latin-1', errors='replace')
+            first_line = response.splitlines()[0] if response else 'geen antwoord'
+            status = 101 if ' 101 ' in first_line else first_line
+            return {'name': 'websocket', 'status': status, 'body': first_line[:160]}
+        except (OSError, ssl.SSLError) as exc:
+            return {'name': 'websocket', 'status': 'ERROR', 'body': f'{type(exc).__name__}: {exc}'}
 
     def trading_markets(self, quote: str = 'EUR') -> List[str]:
         payload = self._get('/markets')
