@@ -10,7 +10,7 @@ class TreeTests(unittest.TestCase):
             'backtest.py','bitvavo_public.py','config.py','main.py','models.py','paper_trader.py',
             'report.py','requirements.txt','start.sh','status.py','storage.py','strategy.py','tests'
         }
-        actual = {p.name for p in root.iterdir() if p.name != '__pycache__'}
+        actual = {p.name for p in root.iterdir() if p.name not in {'__pycache__', '.git'}}
         self.assertEqual(actual, allowed_top)
 
 
