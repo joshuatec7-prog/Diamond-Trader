@@ -55,6 +55,25 @@ class BitvavoPublic:
                 time.sleep(min(2 ** (attempt - 1), 4))
         raise RuntimeError(f'publieke marktrequest definitief mislukt: {last_error}')
 
+    def probe_public_endpoints(self) -> List[Dict[str, Any]]:
+        probes = [
+            ('markets', '/markets'),
+            ('ticker24h', '/ticker/24h'),
+            ('book', '/ticker/book'),
+        ]
+        results: List[Dict[str, Any]] = []
+        for name, path in probes:
+            try:
+                response = self.session.get(
+                    f'{self.base_url}{path}', params={}, timeout=self.timeout_seconds
+                )
+                text = str(getattr(response, 'text', '') or '')
+                body = ' '.join(text.split())[:160]
+                results.append({'name': name, 'status': int(response.status_code), 'body': body})
+            except requests.RequestException as exc:
+                results.append({'name': name, 'status': 'ERROR', 'body': f'{type(exc).__name__}: {exc}'})
+        return results
+
     def trading_markets(self, quote: str = 'EUR') -> List[str]:
         payload = self._get('/markets')
         result: List[str] = []
