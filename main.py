@@ -42,6 +42,36 @@ def ensure_universe(api: BitvavoPublic, db: Storage, s: Settings) -> list[str]:
     return selected
 
 
+def log_public_probe(api: BitvavoPublic) -> None:
+    for result in api.probe_public_endpoints():
+        logger.error(
+            'BITVAVO PUBLIC PROBE | %s | status=%s | %s',
+            result['name'], result['status'], result['body'] or '-',
+        )
+
+
+def acquire_universe(api: BitvavoPublic, db: Storage, s: Settings,
+                     once: bool) -> list[str] | None:
+    while not STOP:
+        try:
+            return ensure_universe(api, db, s)
+        except Exception as exc:
+            logger.error('universe initialisatie mislukt: %s', exc)
+            log_public_probe(api)
+            if once:
+                return None
+            wait_seconds = max(300, s.poll_seconds)
+            logger.warning(
+                'worker blijft actief zonder trading; nieuwe publieke API-poging over %s seconden',
+                wait_seconds,
+            )
+            for _ in range(wait_seconds):
+                if STOP:
+                    return None
+                time.sleep(1)
+    return None
+
+
 def process_market(market: str, api: BitvavoPublic, db: Storage,
                    strategy: BandReentryStrategy, trader: PaperTrader,
                    s: Settings) -> bool:
@@ -131,7 +161,11 @@ def main() -> int:
         trader = PaperTrader(s, db)
         signal.signal(signal.SIGTERM, _stop)
         signal.signal(signal.SIGINT, _stop)
-        markets = ensure_universe(api, db, s)
+
+        markets = acquire_universe(api, db, s, args.once)
+        if markets is None:
+            return 2 if args.once else 0
+
         logger.info('gestart | PAPER ONLY | interval=%s | universe=%s | db=%s', s.interval, ','.join(markets), s.db_path)
 
         loop = not args.once and s.loop_enabled
@@ -143,8 +177,9 @@ def main() -> int:
             else:
                 consecutive_total_failures = 0
             if consecutive_total_failures >= s.max_consecutive_failed_cycles:
-                logger.error('marktdata volledig onbereikbaar gedurende %s cycli; stop voor platform-restart', consecutive_total_failures)
-                return 2
+                logger.error('marktdata volledig onbereikbaar gedurende %s cycli; publieke API-diagnose volgt', consecutive_total_failures)
+                log_public_probe(api)
+                consecutive_total_failures = 0
             if not loop or STOP:
                 return 0 if ok > 0 else 2
             for _ in range(s.poll_seconds):
