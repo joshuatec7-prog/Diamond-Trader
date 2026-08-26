@@ -44,7 +44,9 @@ class Settings:
     markets: Tuple[str, ...] = _env_markets("MARKETS", "BTC-EUR,ETH-EUR,SOL-EUR")
     interval: str = os.getenv("CANDLE_INTERVAL", "15m")
     poll_seconds: int = _env_int("POLL_SECONDS", 60)
-    candle_limit: int = _env_int("CANDLE_LIMIT", 250)
+    candle_limit: int = _env_int("CANDLE_LIMIT", 500)
+    max_entry_delay_seconds: int = _env_int("MAX_ENTRY_DELAY_SECONDS", 180)
+    max_consecutive_failed_cycles: int = _env_int("MAX_CONSECUTIVE_FAILED_CYCLES", 5)
     db_path: str = os.getenv("DB_PATH", default_db_path())
 
     paper_start_eur: float = _env_float("PAPER_START_EUR", 1000.0)
@@ -87,6 +89,10 @@ class Settings:
             raise ValueError("POLL_SECONDS moet minimaal 10 zijn")
         if not (60 <= self.candle_limit <= 1440):
             raise ValueError("CANDLE_LIMIT moet tussen 60 en 1440 liggen")
+        if not (30 <= self.max_entry_delay_seconds <= 3600):
+            raise ValueError("MAX_ENTRY_DELAY_SECONDS moet tussen 30 en 3600 liggen")
+        if not (1 <= self.max_consecutive_failed_cycles <= 60):
+            raise ValueError("MAX_CONSECUTIVE_FAILED_CYCLES moet tussen 1 en 60 liggen")
         if self.paper_start_eur <= 0 or self.stake_eur <= 0:
             raise ValueError("Paperkapitaal en stake moeten positief zijn")
         if self.max_open_positions < 1:
