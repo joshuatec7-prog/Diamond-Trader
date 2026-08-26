@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import os
 import socket
 import ssl
@@ -134,7 +135,7 @@ class BitvavoPublic:
                 volume_quote = float(item.get('volumeQuote', 0) or 0)
             except (TypeError, ValueError):
                 continue
-            if volume_quote > 0:
+            if math.isfinite(volume_quote) and volume_quote > 0:
                 ranked.append((volume_quote, market))
         ranked.sort(reverse=True)
         selected = [market for _, market in ranked[:limit]]

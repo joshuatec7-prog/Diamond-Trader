@@ -59,7 +59,7 @@ def acquire_universe(api: BitvavoPublic, db: Storage, s: Settings,
     while not STOP:
         try:
             markets = ensure_universe(api, db, s)
-            db.set_data_health('READY', f'universe beschikbaar: {len(markets)} markten')
+            db.set_data_health('UNIVERSE_READY', f'universe beschikbaar: {len(markets)} markten')
             return markets
         except Exception as exc:
             detail = f'{type(exc).__name__}: {exc}'
@@ -187,9 +187,12 @@ def main() -> int:
         consecutive_total_failures = 0
         while True:
             ok, failed, last_error = run_cycle(api, db, strategy, trader, s, markets)
-            if ok > 0:
+            if ok == len(markets) and failed == 0:
                 consecutive_total_failures = 0
-                db.set_data_health('READY', f'cyclus ok={ok} failed={failed}')
+                db.set_data_health('READY', f'volledige cyclus ok={ok}')
+            elif ok > 0:
+                consecutive_total_failures = 0
+                db.set_data_health('PARTIAL', f'cyclus ok={ok} failed={failed}; {last_error}')
             else:
                 consecutive_total_failures += 1
                 db.set_data_health('DEGRADED', last_error or f'alle {failed} marktcycli mislukt')

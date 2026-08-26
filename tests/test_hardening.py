@@ -109,6 +109,35 @@ class HardeningTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_corrupt_universe_blocks_readiness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = replace(Settings(), db_path=str(Path(tmp)/'x.db'), universe_size=1)
+            db = Storage(s.db_path, s.paper_start_eur)
+            try:
+                db.set_state('universe_json', '{broken')
+                health = db.health()
+                self.assertFalse(health['ok'])
+                self.assertIn('universe_ongeldig', health['errors'])
+                r = readiness(db, s)
+                self.assertFalse(r['local_ok'])
+                self.assertFalse(r['paper_observation_ready'])
+            finally:
+                db.close()
+
+    def test_partial_data_is_not_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = replace(Settings(), db_path=str(Path(tmp)/'x.db'), universe_size=1)
+            db = Storage(s.db_path, s.paper_start_eur)
+            try:
+                db.set_universe(['SIM-EUR'])
+                db.set_data_health('PARTIAL', '1 markt faalt')
+                r = readiness(db, s)
+                self.assertTrue(r['local_ok'])
+                self.assertFalse(r['data_ok'])
+                self.assertFalse(r['paper_observation_ready'])
+            finally:
+                db.close()
+
     def test_full_pipeline_offline(self):
         result = run_offline_check()
         self.assertTrue(result['ok'])

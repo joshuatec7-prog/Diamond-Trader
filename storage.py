@@ -132,16 +132,30 @@ class Storage:
         if not raw:
             return []
         value = json.loads(raw)
-        return [str(x) for x in value]
+        if not isinstance(value, list):
+            raise RuntimeError('universe_json is geen lijst')
+        result = [str(x).strip().upper() for x in value]
+        if not result or any(not x for x in result) or len(result) != len(set(result)):
+            raise RuntimeError('universe_json is ongeldig')
+        return result
 
     def set_universe(self, markets: List[str]) -> None:
-        if self.universe():
-            raise RuntimeError('universe is al vastgezet')
         cleaned = [str(m).strip().upper() for m in markets if str(m).strip()]
         if not cleaned or len(cleaned) != len(set(cleaned)):
             raise ValueError('universe moet niet-leeg en uniek zijn')
-        self.set_state('universe_json', json.dumps(cleaned))
-        self.set_state('universe_selected_at_ms', time.time_ns() // 1_000_000)
+        with self.conn:
+            existing = self.conn.execute("SELECT value FROM state WHERE key='universe_json'").fetchone()
+            if existing is not None and str(existing['value']).strip():
+                raise RuntimeError('universe is al vastgezet')
+            now_ms = time.time_ns() // 1_000_000
+            self.conn.execute(
+                "INSERT INTO state(key,value) VALUES('universe_json',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(cleaned),),
+            )
+            self.conn.execute(
+                "INSERT INTO state(key,value) VALUES('universe_selected_at_ms',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(now_ms),),
+            )
 
     def last_processed(self, market: str) -> int:
         return int(self.get_state(f'last_candle:{market}', '0') or 0)
@@ -271,6 +285,10 @@ class Storage:
             cash = float('nan')
         if not math.isfinite(cash) or cash < 0:
             errors.append('cash_ongeldig')
+        try:
+            self.universe() if self.get_state('universe_json') else []
+        except (ValueError, TypeError, RuntimeError, json.JSONDecodeError):
+            errors.append('universe_ongeldig')
         for p in self.all_positions():
             values = (p.entry_price, p.amount, p.entry_notional, p.entry_fee, p.stop_price, p.take_price)
             if not all(math.isfinite(v) and v > 0 for v in values):

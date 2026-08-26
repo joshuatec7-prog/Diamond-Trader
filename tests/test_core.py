@@ -50,6 +50,18 @@ class CleanRoomTests(unittest.TestCase):
         api = BitvavoPublic('https://x', session=FakeSession([FakeResponse(market_payload), FakeResponse(ticker_payload)]))
         self.assertEqual(api.top_markets_by_quote_volume('EUR', 2), ['BBB-EUR','AAA-EUR'])
 
+    def test_non_finite_quote_volume_is_ignored(self):
+        market_payload = [
+            {'market':'AAA-EUR','status':'trading','quote':'EUR'},
+            {'market':'BBB-EUR','status':'trading','quote':'EUR'},
+        ]
+        ticker_payload = [
+            {'market':'AAA-EUR','volumeQuote':'inf'},
+            {'market':'BBB-EUR','volumeQuote':'100'},
+        ]
+        api = BitvavoPublic('https://x', session=FakeSession([FakeResponse(market_payload), FakeResponse(ticker_payload)]))
+        self.assertEqual(api.top_markets_by_quote_volume('EUR', 1), ['BBB-EUR'])
+
     def test_closed_candle_filter(self):
         payload = [[0,'10','11','9','10','2'],[3_600_000,'11','12','10','11','2']]
         api = BitvavoPublic('https://x', session=FakeSession([FakeResponse(payload)]))

@@ -15,7 +15,10 @@ def readiness(db: Storage, s: Settings) -> dict[str, object]:
 
     health = db.health()
     data_status, data_detail, data_at_ms = db.data_health()
-    universe = db.universe()
+    try:
+        universe = db.universe()
+    except Exception:
+        universe = []
     local_ok = config_ok and bool(health['ok']) and s.run_mode == 'PAPER'
     data_ok = data_status == 'READY' and len(universe) == s.universe_size
     return {
