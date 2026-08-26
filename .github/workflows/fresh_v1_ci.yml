@@ -1,0 +1,30 @@
+name: Fresh v1 CI
+
+on:
+  push:
+    branches:
+      - fresh-start-20260826
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python -m pip install -r fresh_v1/requirements.txt
+
+      - name: Unit tests
+        working-directory: fresh_v1
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile check
+        working-directory: fresh_v1
+        run: python -m compileall -q .
