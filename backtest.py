@@ -46,8 +46,10 @@ def run_backtest(market: str, candles: list[Candle], s: Settings) -> BacktestRes
 
         exit_price = None
         exit_idx = None
-        max_end = min(len(candles)-1, i+1+s.max_hold_bars)
-        for j in range(i+2, max_end+1):
+        # Entry gebeurt op de open van candle i+1. Diezelfde candle is dus de
+        # eerste blootstellingsbar en moet direct op stop/take worden gecontroleerd.
+        max_end = min(len(candles)-1, i+s.max_hold_bars)
+        for j in range(i+1, max_end+1):
             c = candles[j]
             if c.low <= stop:
                 exit_price = stop * (1.0-half_spread-slip)
