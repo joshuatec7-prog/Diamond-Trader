@@ -49,3 +49,5 @@ Readiness maakt bewust onderscheid tussen:
 - gereedheid om de prospectieve paper-observatie te starten.
 
 Als marktdata geblokkeerd is, blijft de worker actief zonder te handelen en registreert hij de datastatus in SQLite en de diagnose in de logs.
+
+GitHub CI voert dezelfde deterministische tests, compilecontrole, offline paperketen en lokale readiness-check uit zonder externe marktdata nodig te hebben.
