@@ -169,6 +169,16 @@ RR_MID_PID=$!
 OPTIONAL_PIDS+=("$RR_MID_PID")
 echo "        PID $RR_MID_PID"
 
+TB_LONG_LOG="/var/data/diamond_tb_long_prospective.log"
+echo "[START] Diamond TB-LONG Prospective Research Tracker"
+python3 diamond_tb_long_prospective_tracker.py \
+    --loop --interval-seconds 300 --no-print \
+    >> "$TB_LONG_LOG" 2>&1 &
+TB_LONG_PID=$!
+OPTIONAL_PIDS+=("$TB_LONG_PID")
+echo "         PID $TB_LONG_PID"
+echo ""
+
 echo "[START] Diamond Strategy Lab"
 python3 strategy_lab.py --loop --interval-minutes 360 --no-print \
     >> "$STRATEGY_LAB_LOG" 2>&1 &
