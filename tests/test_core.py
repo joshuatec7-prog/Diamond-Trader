@@ -13,10 +13,11 @@ from strategy import BandReentryStrategy
 
 
 class FakeResponse:
-    def __init__(self, payload, status=200):
+    def __init__(self, payload, status=200, text=''):
         self.payload = payload
         self.status_code = status
         self.headers = {}
+        self.text = text
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(str(self.status_code))
@@ -61,6 +62,17 @@ class CleanRoomTests(unittest.TestCase):
         with self.assertRaises(PermanentHTTPError):
             api.trading_markets('EUR')
         self.assertEqual(sess.calls,1)
+
+    def test_public_probe_reports_status_without_raising(self):
+        sess = FakeSession([
+            FakeResponse({},403,'blocked'),
+            FakeResponse([],200,'[]'),
+            FakeResponse([],200,'[]'),
+        ])
+        api = BitvavoPublic('https://x', session=sess)
+        results = api.probe_public_endpoints()
+        self.assertEqual([r['status'] for r in results], [403,200,200])
+        self.assertEqual(sess.calls,3)
 
     def test_strategy_reentry(self):
         s = replace(Settings(), band_window=5, band_stddev=1.0)
