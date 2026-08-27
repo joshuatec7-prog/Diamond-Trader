@@ -11,7 +11,7 @@ class TreeTests(unittest.TestCase):
             'offline_check.py','paper_trader.py','readiness.py','report.py','requirements.txt',
             'start.sh','status.py','storage.py','strategy.py','tests'
         }
-        actual = {p.name for p in root.iterdir() if p.name not in {'__pycache__', '.git'}}
+        actual = {p.name for p in root.iterdir() if p.name not in {'__pycache__', '.git', '.venv'}}
         self.assertEqual(actual, allowed_top)
 
     def test_no_private_trading_capability_in_runtime_code(self):

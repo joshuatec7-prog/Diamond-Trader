@@ -35,7 +35,7 @@ class Settings:
     run_mode: str = os.getenv('RUN_MODE', 'PAPER').upper()
     api_base_url: str = os.getenv('BITVAVO_API_BASE_URL', 'https://api.bitvavo.com/v2')
     quote_currency: str = os.getenv('QUOTE_CURRENCY', 'EUR').upper()
-    universe_size: int = _env_int('UNIVERSE_SIZE', 3)
+    universe_size: int = _env_int('UNIVERSE_SIZE', 20)
 
     interval: str = os.getenv('CANDLE_INTERVAL', '15m')
     candle_limit: int = _env_int('CANDLE_LIMIT', 240)
@@ -92,8 +92,8 @@ class Settings:
             raise ValueError(f'Ongeldig CANDLE_INTERVAL: {self.interval}')
         if self.quote_currency != 'EUR':
             raise ValueError('Clean-room v1 ondersteunt alleen EUR-markten')
-        if not (1 <= self.universe_size <= 10):
-            raise ValueError('UNIVERSE_SIZE moet tussen 1 en 10 liggen')
+        if not (1 <= self.universe_size <= 20):
+            raise ValueError('UNIVERSE_SIZE moet tussen 1 en 20 liggen')
         if not (60 <= self.candle_limit <= 1440):
             raise ValueError('CANDLE_LIMIT moet tussen 60 en 1440 liggen')
         if self.poll_seconds < 30:
