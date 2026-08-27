@@ -12,7 +12,9 @@ Zelfstandige paper-trading bot met een harde scheiding tussen marktdata, strateg
 
 ## Strategie
 
-De eerste, vooraf vastgezette strategie is een long-only statistische lower-band re-entry op 1-uurscandles. De strategie gebruikt een rollend gemiddelde en standaarddeviatie. Stop, winstdoel en maximale houdtijd zijn vooraf vastgezet.
+De huidige vooraf vastgezette paperstrategie is een long-only statistische lower-band re-entry op 15-minutencandles. De strategie gebruikt een rollend gemiddelde en standaarddeviatie. Met 80 candles blijft de statistische lookback circa 20 uur; met maximaal 96 bars blijft de maximale houdtijd circa 24 uur. Stop en winstdoel zijn vooraf vastgezet.
+
+De worker pollt standaard iedere 120 seconden. Nieuwe entries worden alleen op basis van een nieuwe gesloten 15-minutencandle beoordeeld. Een reeds open paperpositie wordt tijdens iedere poll ook op de actuele bied/laat gecontroleerd, zodat stop-loss en take-profit niet tot de volgende candle-close hoeven te wachten.
 
 ## Lokale controles zonder netwerk
 
