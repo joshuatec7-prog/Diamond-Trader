@@ -150,7 +150,86 @@ class ProfitProtectPaperTrader(PaperTrader):
         if p.bars_held >= self.s.max_hold_bars:
             return self._close(p, candle.close, 'time_exit', closed_at_ms)
 
-        # De gewone Storage-update bewaart bars_held; stop_price is al apart
-        # atomair opgeslagen zodra de live profit-protect hem verhoogt.
+        self.db.update_position(p)
+        return None
+
+
+class RunnerProfitProtectPaperTrader(ProfitProtectPaperTrader):
+    """Profit-protect trader zonder harde take-profit.
+
+    Zodra de trigger is gehaald, bewaakt alleen een oplopende trailing stop de
+    winst. De positie blijft dus open zolang nieuwe hogere biedprijzen worden
+    gezien en de koers niet terugvalt tot de beschermstop. De `take_price` in
+    de bestaande positie-structuur blijft alleen een referentiewaarde en wordt
+    in runner-modus niet als exit gebruikt.
+
+    De normale max-hold blijft gelden zolang de positie nog niet beschermd is.
+    Na activatie van de winstbescherming mag een sterke runner langer doorlopen;
+    dan bepaalt de trailing stop de uiteindelijke exit.
+    """
+
+    def _maybe_raise_stop(self, p: Position, bid: float) -> bool:
+        trigger_price = p.entry_price * (1.0 + self.trigger_pct / 100.0)
+        if bid < trigger_price:
+            return False
+
+        lock_floor = self._lock_reference_price(p)
+        trailing_stop = bid * (1.0 - self.trail_distance_pct / 100.0)
+        candidate = max(p.stop_price, lock_floor, trailing_stop)
+
+        # Runner heeft geen harde TP; de stop mag onbeperkt mee omhoog lopen.
+        ceiling = bid * (1.0 - 1e-9)
+        candidate = min(candidate, ceiling)
+
+        if candidate <= p.stop_price * (1.0 + 1e-10):
+            return False
+
+        self._persist_stop(p, candidate)
+        return True
+
+    def process_book(
+        self,
+        market: str,
+        book: Book,
+        now_ms: int | None = None,
+    ) -> TradeEvent | None:
+        if not book.is_valid:
+            raise ValueError(f'ongeldig orderboek voor {market}')
+        p = self.db.get_position(market)
+        if p is None:
+            return None
+
+        closed_at_ms = int(time.time() * 1000) if now_ms is None else now_ms
+
+        if book.bid <= p.stop_price:
+            reference_price = min(book.bid, p.stop_price)
+            reason = 'runner_trailing_stop' if self._is_protected(p) else 'stop_loss'
+            return self._close(p, reference_price, reason, closed_at_ms)
+
+        self._maybe_raise_stop(p, book.bid)
+        return None
+
+    def process_candle(
+        self,
+        market: str,
+        candle: Candle,
+        now_ms: int | None = None,
+    ) -> TradeEvent | None:
+        if not candle.is_valid:
+            raise ValueError(f'ongeldige candle voor {market}')
+        p = self.db.get_position(market)
+        if p is None or candle.timestamp_ms <= p.entry_candle_ts:
+            return None
+
+        p.bars_held += 1
+        closed_at_ms = int(time.time() * 1000) if now_ms is None else now_ms
+
+        if candle.low <= p.stop_price:
+            reason = 'runner_trailing_stop' if self._is_protected(p) else 'stop_loss'
+            return self._close(p, p.stop_price, reason, closed_at_ms)
+
+        if p.bars_held >= self.s.max_hold_bars and not self._is_protected(p):
+            return self._close(p, candle.close, 'time_exit', closed_at_ms)
+
         self.db.update_position(p)
         return None
