@@ -8,6 +8,7 @@ from pathlib import Path
 from bitvavo_public import INTERVAL_MS
 from config import Settings
 from missed_trade_audit import (
+    STRATEGY_A,
     _connect,
     _connect_source_readonly,
     _import_new_skips,
@@ -19,26 +20,32 @@ from missed_trade_audit import (
     _update_pending,
     audit_db_path,
     estimated_roundtrip_cost_floor_pct,
-    print_audit_report,
-    update_missed_trade_audit,
 )
 
 logger = logging.getLogger('cryptobot_missed_audit_all')
-STRATEGY_C = 'C_CONTINUATION_V1'
+STRATEGY_B = 'B_TREND_V3'
+STRATEGY_C = 'C_CONTINUATION_V2'
+
+
+def trend_db_path(primary_path: str) -> str:
+    p = Path(primary_path)
+    suffix = p.suffix or '.db'
+    stem = p.stem if p.suffix else p.name
+    return str(p.with_name(f'{stem}_trend_v3{suffix}'))
 
 
 def continuation_db_path(primary_path: str) -> str:
     p = Path(primary_path)
     suffix = p.suffix or '.db'
     stem = p.stem if p.suffix else p.name
-    return str(p.with_name(f'{stem}_continuation_v1{suffix}'))
+    return str(p.with_name(f'{stem}_continuation_v2{suffix}'))
 
 
-def update_continuation_audit(settings: Settings) -> dict[str, int | str]:
-    if settings.interval not in INTERVAL_MS:
-        raise ValueError(f'interval niet ondersteund voor audit: {settings.interval}')
-
-    source_path = continuation_db_path(settings.db_path)
+def _update_source(
+    settings: Settings,
+    strategy: str,
+    source_path: str,
+) -> dict[str, int | str]:
     out_path = audit_db_path(settings.db_path)
     if not Path(source_path).exists():
         return {'sources': 0, 'imported': 0, 'updated': 0, 'db_path': out_path}
@@ -52,23 +59,21 @@ def update_continuation_audit(settings: Settings) -> dict[str, int | str]:
     updated = 0
     try:
         decision_sig, max_candle_ts = _source_signature(source, settings.interval)
-        old_decision_sig = _state_get(audit, f'decision_sig:{STRATEGY_C}', '')
-        old_max_candle = int(
-            _state_get(audit, f'max_candle:{STRATEGY_C}', '0') or 0
-        )
+        old_decision_sig = _state_get(audit, f'decision_sig:{strategy}', '')
+        old_max_candle = int(_state_get(audit, f'max_candle:{strategy}', '0') or 0)
 
         if decision_sig != old_decision_sig or max_candle_ts != old_max_candle:
             with audit:
-                imported += _import_new_skips(source, audit, STRATEGY_C)
+                imported += _import_new_skips(source, audit, strategy)
                 updated += _update_pending(
                     source,
                     audit,
-                    STRATEGY_C,
+                    strategy,
                     settings.interval,
                     interval_ms,
                 )
-                _state_set(audit, f'decision_sig:{STRATEGY_C}', decision_sig)
-                _state_set(audit, f'max_candle:{STRATEGY_C}', max_candle_ts)
+                _state_set(audit, f'decision_sig:{strategy}', decision_sig)
+                _state_set(audit, f'max_candle:{strategy}', max_candle_ts)
     finally:
         source.close()
         audit.close()
@@ -82,30 +87,57 @@ def update_continuation_audit(settings: Settings) -> dict[str, int | str]:
 
 
 def update_all_missed_trade_audit(settings: Settings) -> dict[str, int | str]:
-    base = update_missed_trade_audit(settings)
-    continuation = update_continuation_audit(settings)
+    if settings.interval not in INTERVAL_MS:
+        raise ValueError(f'interval niet ondersteund voor audit: {settings.interval}')
+
+    results = [
+        _update_source(settings, STRATEGY_A, settings.db_path),
+        _update_source(settings, STRATEGY_B, trend_db_path(settings.db_path)),
+        _update_source(settings, STRATEGY_C, continuation_db_path(settings.db_path)),
+    ]
+
     return {
-        'sources': int(base['sources']) + int(continuation['sources']),
-        'imported': int(base['imported']) + int(continuation['imported']),
-        'updated': int(base['updated']) + int(continuation['updated']),
-        'db_path': str(base['db_path']),
+        'sources': sum(int(r['sources']) for r in results),
+        'imported': sum(int(r['imported']) for r in results),
+        'updated': sum(int(r['updated']) for r in results),
+        'db_path': audit_db_path(settings.db_path),
     }
 
 
 def print_all_audit_report(settings: Settings) -> None:
-    print_audit_report(settings)
-
     path = audit_db_path(settings.db_path)
+    cost_floor = estimated_roundtrip_cost_floor_pct(settings)
+
+    print('=== MISSED-TRADE AUDIT | READ-ONLY PAPER RESEARCH ===')
+    print(f'AUDIT DB        : {path}')
+    print(f'INTERVAL        : {settings.interval}')
+    print(f'KOSTENVLOER     : {cost_floor:.2f}% + werkelijke spread')
+    print('HORIZONS        : 15m, 1h, 4h, 12h')
+    print('LET OP          : >kosten is marktbeweging, geen bewezen uitvoerbare winst')
+
     if not Path(path).exists():
+        print('STATUS          : nog geen auditdatabase')
         return
 
     conn = _connect(path)
     try:
         _print_strategy_report(
             conn,
+            STRATEGY_A,
+            'STRATEGIE A | MEAN REVERSION SKIPS',
+            cost_floor,
+        )
+        _print_strategy_report(
+            conn,
+            STRATEGY_B,
+            'STRATEGIE B v3 | TREND SKIPS',
+            cost_floor,
+        )
+        _print_strategy_report(
+            conn,
             STRATEGY_C,
-            'STRATEGIE C v1 | CONTINUATION SKIPS',
-            estimated_roundtrip_cost_floor_pct(settings),
+            'STRATEGIE C v2 | CONTINUATION SKIPS',
+            cost_floor,
         )
     finally:
         conn.close()
@@ -113,7 +145,7 @@ def print_all_audit_report(settings: Settings) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description='Clean-Room missed-trade audit voor PAPER strategie A/B/C'
+        description='Clean-Room missed-trade audit voor actuele PAPER strategie A/B/C'
     )
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--report', action='store_true')
@@ -141,7 +173,7 @@ def main() -> int:
         return 0
 
     logger.info(
-        'gestart | READ-ONLY PAPER MISSED-TRADE AUDIT A/B/C | interval=%s',
+        'gestart | READ-ONLY PAPER MISSED-TRADE AUDIT A/Bv3/Cv2 | interval=%s',
         settings.interval,
     )
     while True:
