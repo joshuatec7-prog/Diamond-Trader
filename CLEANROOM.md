@@ -1,33 +1,58 @@
-# Clean-room verklaring
+# CryptoBot Clean-Room
 
-Deze codebasis is opnieuw opgebouwd vanuit uitsluitend drie infrastructuurrandvoorwaarden: Render-hosting, GitHub-broncodebeheer en Bitvavo als exchange.
+Deze branch is een schone PAPER-only herstart. De runtime bevat geen private Bitvavo-authenticatie en geen echte orderfunctie.
 
-Geen eerdere handelsstrategie, eerder symbooluniversum, eerdere indicatorinstellingen, eerdere stake-instellingen, eerdere onderzoeksresultaten of eerdere evaluatieresultaten zijn als input gebruikt.
+## Vaste uitgangspunten
 
-## Onafhankelijke ontwerpkeuzes
+- `RUN_MODE=PAPER` is verplicht.
+- Alleen publieke Bitvavo-marktdata wordt gebruikt.
+- De eerste EUR-marktselectie wordt op actueel 24-uurs quotevolume gemaakt en daarna in SQLite vastgezet.
+- Het huidige vaste universe bestaat uit 20 liquide EUR-markten.
+- Interval is 15 minuten.
+- Nieuwe entries worden alleen op gesloten 15m-candles beoordeeld.
+- Open paperposities worden standaard iedere 120 seconden met actuele bid/ask bewaakt.
+- Paper startkapitaal en bestaande Bitvavo-saldi staan volledig los van elkaar.
+- Fees, slippage en spread worden expliciet meegenomen.
 
-- De runtime accepteert uitsluitend `RUN_MODE=PAPER`.
-- Er is geen private API-authenticatie en geen echte orderfunctie aanwezig.
-- Marktdata is via `MarketDataSource` losgekoppeld van strategie en paper-execution.
-- De eerste marktselectie is niet hard-coded. Publieke EUR-markten worden op actueel 24-uurs quotevolume gerangschikt; de eerste selectie wordt daarna in de eigen SQLite-database vastgezet.
-- De huidige strategie is een statistische lower-band re-entry op 15-minutencandles met alleen een rollend gemiddelde en standaarddeviatie.
-- De statistische lookback blijft circa 20 uur (80 × 15 minuten) en de maximale houdtijd circa 24 uur (96 × 15 minuten).
-- Exitregels zijn vooraf vastgezet: procentuele stop, procentueel winstdoel en maximale houdtijd.
-- Open paperposities worden standaard iedere 120 seconden ook met actuele bied/laat bewaakt; nieuwe entries blijven uitsluitend gekoppeld aan gesloten 15-minutencandles.
-- Paper trading gebruikt een eigen fictief startkapitaal en geen bestaand rekeningbedrag.
-- Evaluatiegrenzen zijn vóór de eerste paper trade vastgezet.
+## Strategy A — Mean Reversion
 
-## Veiligheids- en integriteitscontroles
+De oorspronkelijke statistische lower-band re-entry blijft ongewijzigd en behoudt zijn bestaande prospectieve database `cryptobot_cleanroom.db`.
 
-- inkomende candles en orderboekwaarden worden op eindigheid en prijsstructuur gevalideerd;
-- cash en positie-mutaties gebeuren transactioneel in SQLite;
-- een positie kan niet tweemaal worden gesloten en paper-cash kan daardoor niet dubbel worden gecrediteerd;
-- SQLite `quick_check` en schema-versie zijn onderdeel van readiness/status;
-- paper-tradetijden gebruiken de prospectieve runtime-tijd, zodat historische candle-timestamps de minimale observatieperiode niet kunnen versnellen;
-- intracycle stop-loss gebruikt de actuele biedprijs als uitvoerbare referentie en maakt een neerwaartse gap niet gunstiger dan de waargenomen biedprijs;
-- CI scant de runtime op private trading-capabilities;
-- `offline_check.py` test de volledige paperketen deterministisch zonder netwerk.
+Entry:
+- vorige close onder de lower band;
+- laatste close terug boven de lower band;
+- laatste close nog onder de middle band.
 
-## Marktdata bij storing
+## Strategy B — Trend Momentum
 
-Een publieke API-storing of netwerkblokkade veroorzaakt geen crash/restart-lus. De worker blijft veilig zonder trading actief, registreert de datastatus en voert alleen publieke REST/WebSocket-diagnose uit.
+Strategy B draait parallel in een aparte prospectieve PAPER-database `cryptobot_cleanroom_trend.db`. De regels zijn vooraf vastgezet:
+
+- SMA 12 boven SMA 48;
+- SMA 48 stijgt minimaal 0,15% over 8 bars;
+- 4-bar momentum minimaal +0,30% en maximaal +6,00%;
+- laatste close breekt boven de hoogste close van de vorige 8 bars.
+
+De maximale momentumgrens voorkomt blind najagen van een extreme pump. Execution, stake, fees, slippage, spreadfilter, stop-loss, take-profit en maximale houdtijd zijn gelijk aan Strategy A, zodat het verschil in eerste instantie uit de entrylogica komt.
+
+## Veiligheid en integriteit
+
+- Geen private API-key/secret in runtimecode.
+- Geen `/order`-endpoint of create/cancel-orderfunctie.
+- SQLite quick-check en schema-versie zijn onderdeel van status/readiness.
+- Een positie kan niet dubbel gesloten en gecrediteerd worden.
+- Prospectieve trade-tijden gebruiken wall-clock runtime-tijd.
+- Intracycle stop-loss gebruikt de actuele biedprijs als uitvoerbare referentie.
+- Strategy A en B hebben ieder eigen cash, posities, trades, beslissingen en performance.
+- `supervisor.py` bewaakt beide PAPER-workers; als één worker onverwacht stopt, wordt de andere ook gestopt zodat Render de service kan herstarten.
+
+## Evaluatie
+
+Beide strategieën worden apart beoordeeld op:
+
+- minimaal 40 gesloten trades;
+- minimaal 14 meetdagen als kwaliteitsgrens;
+- netto PnL positief;
+- profit factor minimaal 1,25;
+- maximale drawdown maximaal 10%.
+
+Tussenbeoordelingen kunnen eerder plaatsvinden bij 10 en 20 gesloten trades; de databases worden daarvoor niet gereset.
