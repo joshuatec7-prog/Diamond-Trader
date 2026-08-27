@@ -1,4 +1,3 @@
-import base64
 import json
 import tempfile
 import unittest
@@ -17,18 +16,18 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, current_payload):
-        self.current_payload = current_payload
-        self.put_calls = []
+    def __init__(self, current_body):
+        self.current_body = current_body
+        self.patch_calls = []
         self.get_calls = []
 
-    def get(self, url, *, params, headers, timeout):
-        self.get_calls.append((url, params, headers, timeout))
-        return FakeResponse(200, self.current_payload)
+    def get(self, url, *, headers, timeout):
+        self.get_calls.append((url, headers, timeout))
+        return FakeResponse(200, {'body': self.current_body})
 
-    def put(self, url, *, headers, json, timeout):
-        self.put_calls.append((url, headers, json, timeout))
-        return FakeResponse(200, {'commit': {'sha': 'abc123'}})
+    def patch(self, url, *, headers, json, timeout):
+        self.patch_calls.append((url, headers, json, timeout))
+        return FakeResponse(200, {'number': 3})
 
 
 class ResearchReportPublisherTests(unittest.TestCase):
@@ -42,66 +41,47 @@ class ResearchReportPublisherTests(unittest.TestCase):
 
     def test_without_token_is_disabled_and_never_needs_network(self):
         with tempfile.TemporaryDirectory() as tmp:
-            result = publish_once(self._report(tmp), token='')
+            result = publish_once(self._report(tmp), token='', issue_number=3)
             self.assertEqual(result['status'], 'DISABLED')
             self.assertIn('RESEARCH_GITHUB_TOKEN', result['detail'])
 
-    def test_updates_only_research_data_branch_with_existing_sha(self):
+    def test_updates_only_research_feed_issue(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_path = self._report(tmp)
-            session = FakeSession(
-                {
-                    'sha': 'oldsha',
-                    'content': base64.b64encode(b'{"old":true}').decode('ascii'),
-                }
-            )
+            session = FakeSession('{"old":true}')
             result = publish_once(
                 report_path,
                 token='secret-for-test',
                 repository='joshuatec7-prog/Diamond-Trader',
-                branch='research-data',
-                remote_path='latest.json',
+                issue_number=3,
                 session=session,
             )
 
             self.assertEqual(result['status'], 'OK')
-            self.assertEqual(result['commit'], 'abc123')
-            self.assertEqual(len(session.put_calls), 1)
-            payload = session.put_calls[0][2]
-            self.assertEqual(payload['branch'], 'research-data')
-            self.assertEqual(payload['sha'], 'oldsha')
-            self.assertEqual(
-                payload['message'],
-                'Research data: update latest hourly report',
-            )
-            decoded = json.loads(base64.b64decode(payload['content']).decode('utf-8'))
+            self.assertEqual(result['issue'], 3)
+            self.assertEqual(len(session.patch_calls), 1)
+            url, _headers, payload, _timeout = session.patch_calls[0]
+            self.assertTrue(url.endswith('/issues/3'))
+            decoded = json.loads(payload['body'])
             self.assertEqual(decoded['mode'], 'OBSERVE_ANALYSE_ONLY')
 
-    def test_identical_remote_report_does_not_create_commit(self):
+    def test_identical_issue_body_does_not_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_path = self._report(tmp)
-            body = (
-                json.dumps(
-                    {'generated_at_ms': 123, 'mode': 'OBSERVE_ANALYSE_ONLY'},
-                    indent=2,
-                    sort_keys=True,
-                )
-                + '\n'
-            ).encode('utf-8')
-            session = FakeSession(
-                {
-                    'sha': 'same',
-                    'content': base64.b64encode(body).decode('ascii'),
-                }
+            current = json.dumps(
+                {'generated_at_ms': 123, 'mode': 'OBSERVE_ANALYSE_ONLY'},
+                indent=2,
+                sort_keys=True,
             )
+            session = FakeSession(current)
             result = publish_once(
                 report_path,
                 token='secret-for-test',
-                branch='research-data',
+                issue_number=3,
                 session=session,
             )
             self.assertEqual(result['status'], 'UNCHANGED')
-            self.assertEqual(session.put_calls, [])
+            self.assertEqual(session.patch_calls, [])
 
 
 if __name__ == '__main__':
