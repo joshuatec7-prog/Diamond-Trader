@@ -3,17 +3,26 @@ import unittest
 from pathlib import Path
 
 from config import Settings
-from continuation_v5_main import build_continuation_settings, continuation_db_path
+from continuation_v6_main import (
+    LOCK_PROFIT_EUR as CONTINUATION_LOCK_PROFIT_EUR,
+    build_continuation_settings,
+    continuation_db_path,
+)
 from models import Book, Candle
 from staged_runner_trader import StagedRunnerPaperTrader
 from storage import Storage
-from trend_v6_main import build_trend_settings, trend_db_path
+from trend_v7_main import (
+    LOCK_PROFIT_EUR as TREND_LOCK_PROFIT_EUR,
+    build_trend_settings,
+    trend_db_path,
+)
 
 
 class StagedRunnerTests(unittest.TestCase):
     def _open(self, tmp: str):
         s = Settings(
             db_path=str(Path(tmp) / 'paper.db'),
+            stop_loss_pct=1.0,
             take_profit_pct=3.5,
             max_open_positions=3,
         )
@@ -23,7 +32,7 @@ class StagedRunnerTests(unittest.TestCase):
             db,
             entry_reason='test_entry',
             lock_trigger_pct=1.50,
-            lock_profit_eur=0.50,
+            lock_profit_eur=1.00,
             wide_trigger_pct=3.00,
             wide_trail_pct=1.25,
             tight_trigger_pct=6.00,
@@ -50,7 +59,7 @@ class StagedRunnerTests(unittest.TestCase):
                 lock_stop = first.stop_price
                 self.assertAlmostEqual(lock_stop, trader._lock_reference_price(first), places=10)
 
-                # Ook bij +2,5% blijft alleen de €0,50-winstvloer actief.
+                # Ook bij +2,5% blijft alleen de €1,00-winstvloer actief.
                 bid = p.entry_price * 1.025
                 self.assertIsNone(
                     trader.process_book('AAA-EUR', Book(bid, bid * 1.0005), now_ms=3)
@@ -101,7 +110,7 @@ class StagedRunnerTests(unittest.TestCase):
             finally:
                 db.close()
 
-    def test_lock_exit_is_separate_reason_and_about_half_euro_net(self):
+    def test_lock_exit_is_separate_reason_and_about_one_euro_net(self):
         with tempfile.TemporaryDirectory() as tmp:
             _s, db, trader, p = self._open(tmp)
             try:
@@ -119,7 +128,7 @@ class StagedRunnerTests(unittest.TestCase):
                 self.assertIsNotNone(event)
                 assert event is not None
                 self.assertEqual(event.reason, 'runner_profit_lock')
-                self.assertGreaterEqual(event.pnl_eur or 0.0, 0.499)
+                self.assertGreaterEqual(event.pnl_eur or 0.0, 0.999)
             finally:
                 db.close()
 
@@ -151,17 +160,21 @@ class StagedRunnerTests(unittest.TestCase):
             finally:
                 db.close()
 
-    def test_new_versions_have_clean_database_paths(self):
+    def test_new_versions_have_clean_database_paths_and_new_risk_levels(self):
         base = Settings(db_path='/tmp/cryptobot_cleanroom.db')
         b = build_trend_settings(base)
         c = build_continuation_settings(base)
-        self.assertEqual(trend_db_path(base.db_path), '/tmp/cryptobot_cleanroom_trend_v6.db')
+        self.assertEqual(trend_db_path(base.db_path), '/tmp/cryptobot_cleanroom_trend_v7.db')
         self.assertEqual(
             continuation_db_path(base.db_path),
-            '/tmp/cryptobot_cleanroom_continuation_v5.db',
+            '/tmp/cryptobot_cleanroom_continuation_v6.db',
         )
         self.assertEqual(b.max_open_positions, 3)
         self.assertEqual(c.max_open_positions, 3)
+        self.assertAlmostEqual(b.stop_loss_pct, 1.0)
+        self.assertAlmostEqual(c.stop_loss_pct, 1.0)
+        self.assertAlmostEqual(TREND_LOCK_PROFIT_EUR, 1.0)
+        self.assertAlmostEqual(CONTINUATION_LOCK_PROFIT_EUR, 1.0)
 
 
 if __name__ == '__main__':
