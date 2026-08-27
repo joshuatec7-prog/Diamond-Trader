@@ -11,15 +11,16 @@ from models import Candle, Decision
 class TrendMomentumStrategy:
     """Long-only trend/momentum entry for rising markets.
 
-    De regels staan bewust vast voor de prospectieve PAPER-meting:
+    Vaste prospectieve PAPER-regels:
     - 12-bar gemiddelde boven 48-bar gemiddelde;
     - 48-bar gemiddelde stijgt over de laatste 8 bars;
     - 1-uurs momentum (4 x 15m) tussen +0,30% en +6,00%;
     - laatste close breekt boven de hoogste close van de vorige 8 bars.
 
-    De bovengrens op momentum voorkomt blind instappen in een extreem uitgerekte
-    candle/pump. Execution, kosten, stop, take-profit en stake blijven gelijk aan
-    strategie A zodat het verschil vooral uit de entry komt.
+    Geldige BUY-signalen krijgen daarna een vaste trend-score. Die score is de
+    som van vier percentages: fast/slow-afstand, slow-slope, 1h momentum en de
+    breakout-afstand. Daardoor wordt niet meer simpelweg de eerste munt uit de
+    universe gekozen, maar worden gelijktijdige kandidaten onderling gerangschikt.
     """
 
     FAST_WINDOW = 12
@@ -34,9 +35,29 @@ class TrendMomentumStrategy:
     def __init__(self, settings: Settings) -> None:
         self.s = settings
 
+    @classmethod
+    def required_candles(cls) -> int:
+        return cls.SLOW_WINDOW + cls.SLOPE_LOOKBACK
+
+    @classmethod
+    def rank_score(cls, decision: Decision) -> float:
+        if decision.action != 'BUY':
+            return float('-inf')
+        try:
+            values = [
+                float(decision.metrics['fast_slow_gap_pct']),
+                float(decision.metrics['slow_slope_pct']),
+                float(decision.metrics['momentum_pct']),
+                float(decision.metrics['breakout_pct']),
+            ]
+        except (KeyError, TypeError, ValueError):
+            return float('-inf')
+        if not all(math.isfinite(v) for v in values):
+            return float('-inf')
+        return sum(values)
+
     def evaluate(self, candles: Sequence[Candle]) -> Decision:
-        need = self.SLOW_WINDOW + self.SLOPE_LOOKBACK
-        if len(candles) < need:
+        if len(candles) < self.required_candles():
             return Decision('SKIP', 'onvoldoende_data', {})
 
         closes = [c.close for c in candles]
@@ -51,18 +72,24 @@ class TrendMomentumStrategy:
 
         slow_slope_pct = ((slow / slow_prev) - 1.0) * 100.0 if slow_prev > 0 else float('nan')
         momentum_pct = ((last / momentum_base) - 1.0) * 100.0 if momentum_base > 0 else float('nan')
+        fast_slow_gap_pct = ((fast / slow) - 1.0) * 100.0 if slow > 0 else float('nan')
+        breakout_pct = ((last / breakout_ref) - 1.0) * 100.0 if breakout_ref > 0 else float('nan')
 
         metrics = {
             'close': last,
             'fast_sma': fast,
             'slow_sma': slow,
+            'fast_slow_gap_pct': fast_slow_gap_pct,
             'slow_slope_pct': slow_slope_pct,
             'momentum_pct': momentum_pct,
             'breakout_ref': breakout_ref,
+            'breakout_pct': breakout_pct,
         }
 
-        values = [last, fast, slow, slow_prev, momentum_base, breakout_ref,
-                  slow_slope_pct, momentum_pct]
+        values = [
+            last, fast, slow, slow_prev, momentum_base, breakout_ref,
+            fast_slow_gap_pct, slow_slope_pct, momentum_pct, breakout_pct,
+        ]
         if not all(math.isfinite(v) for v in values) or min(
             last, fast, slow, slow_prev, momentum_base, breakout_ref
         ) <= 0:
