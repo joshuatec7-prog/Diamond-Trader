@@ -61,6 +61,27 @@ class PaperTrader:
         self.db.open_position_atomic(p, entry_notional + entry_fee)
         return TradeEvent('OPEN', market, entry_price, 'lower_band_reentry')
 
+    def process_book(self, market: str, book: Book,
+                     now_ms: int | None = None) -> TradeEvent | None:
+        """Bewaken van een open paperpositie tussen gesloten candles door.
+
+        Voor een long gebruiken we de biedprijs als uitvoerbare marktprijs. Een
+        neerwaartse gap wordt niet mooier gemaakt dan hij is; een take-profit
+        wordt begrensd op het vooraf vastgelegde take-niveau.
+        """
+        if not book.is_valid:
+            raise ValueError(f'ongeldig orderboek voor {market}')
+        p = self.db.get_position(market)
+        if p is None:
+            return None
+        closed_at_ms = int(time.time()*1000) if now_ms is None else now_ms
+        if book.bid <= p.stop_price:
+            reference_price = min(book.bid, p.stop_price)
+            return self._close(p, reference_price, 'stop_loss', closed_at_ms)
+        if book.bid >= p.take_price:
+            return self._close(p, p.take_price, 'take_profit', closed_at_ms)
+        return None
+
     def process_candle(self, market: str, candle: Candle,
                        now_ms: int | None = None) -> TradeEvent | None:
         if not candle.is_valid:
