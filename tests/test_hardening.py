@@ -98,7 +98,7 @@ class HardeningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             s = replace(
                 Settings(), db_path=str(Path(tmp)/'x.db'), band_window=5,
-                slippage_pct=0, taker_fee_pct=0,
+                slippage_pct=0,
             )
             db = Storage(s.db_path, s.paper_start_eur)
             trader = PaperTrader(s, db)
