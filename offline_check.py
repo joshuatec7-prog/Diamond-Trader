@@ -17,16 +17,16 @@ class SyntheticMarketData:
     """Deterministic no-network source used only to verify the paper pipeline."""
 
     def __init__(self) -> None:
-        interval_ms = 3_600_000
-        latest_close_ms = int(time.time()*1000) - 60_000
-        first_ts = latest_close_ms - interval_ms * 22
-        closes = [100.0] * 20 + [90.0, 95.0]
+        interval_ms = 900_000
+        closes = [100.0] * 80 + [90.0, 98.0]
+        latest_open_ms = int(time.time()*1000) - interval_ms - 60_000
+        first_ts = latest_open_ms - interval_ms * (len(closes) - 1)
         self.base = [
             Candle(first_ts + i*interval_ms, v, v+1.0, v-1.0, v, 10.0)
             for i, v in enumerate(closes)
         ]
         next_ts = self.base[-1].timestamp_ms + interval_ms
-        self.exit_candle = Candle(next_ts, 95.0, 100.0, 94.0, 99.0, 10.0)
+        self.exit_candle = Candle(next_ts, 98.0, 103.0, 97.0, 102.0, 10.0)
         self.stage = 0
 
     def top_markets_by_quote_volume(self, quote: str, limit: int) -> list[str]:
@@ -36,13 +36,13 @@ class SyntheticMarketData:
 
     def closed_candles(self, market: str, interval: str, limit: int,
                        now_ms: int | None = None) -> list[Candle]:
-        if market != 'SIM-EUR' or interval != '1h':
+        if market != 'SIM-EUR' or interval != '15m':
             raise RuntimeError('synthetic market mismatch')
         values = self.base if self.stage == 0 else self.base + [self.exit_candle]
         return values[-limit:]
 
     def book(self, market: str) -> Book:
-        return Book(95.00, 95.05)
+        return Book(98.00, 98.05)
 
     def advance(self) -> None:
         self.stage = 1
@@ -54,7 +54,7 @@ def run_offline_check() -> dict[str, object]:
             Settings(),
             db_path=str(Path(tmp)/'offline.db'),
             universe_size=1,
-            candle_limit=60,
+            candle_limit=120,
             max_signal_age_seconds=7200,
             max_open_positions=1,
         )
