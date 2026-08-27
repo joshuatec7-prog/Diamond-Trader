@@ -9,9 +9,11 @@ from storage import Storage
 
 
 class PaperTrader:
-    def __init__(self, settings: Settings, storage: Storage) -> None:
+    def __init__(self, settings: Settings, storage: Storage,
+                 entry_reason: str = 'lower_band_reentry') -> None:
         self.s = settings
         self.db = storage
+        self.entry_reason = entry_reason
 
     @property
     def fee_rate(self) -> float:
@@ -59,7 +61,7 @@ class PaperTrader:
             bars_held=0,
         )
         self.db.open_position_atomic(p, entry_notional + entry_fee)
-        return TradeEvent('OPEN', market, entry_price, 'lower_band_reentry')
+        return TradeEvent('OPEN', market, entry_price, self.entry_reason)
 
     def process_book(self, market: str, book: Book,
                      now_ms: int | None = None) -> TradeEvent | None:
