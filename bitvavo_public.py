@@ -34,7 +34,7 @@ class BitvavoPublic:
         self.timeout_seconds = timeout_seconds
         self.retries = retries
         self.session = session or requests.Session()
-        self.session.headers.update({'Accept': 'application/json', 'User-Agent': 'CryptoBot-CleanRoom/1.0'})
+        self.session.headers.update({'Accept': 'application/json'})
 
     def _get(self, path: str, params: Dict[str, Any] | None = None) -> Any:
         last_error: Exception | None = None
@@ -89,7 +89,6 @@ class BitvavoPublic:
             'Connection: Upgrade\r\n'
             f'Sec-WebSocket-Key: {key}\r\n'
             'Sec-WebSocket-Version: 13\r\n'
-            'User-Agent: CryptoBot-CleanRoom/1.0\r\n'
             '\r\n'
         ).encode('ascii')
         try:
