@@ -8,9 +8,9 @@ class TreeTests(unittest.TestCase):
         allowed_top = {
             '.env.example','.gitignore','.python-version','.github','CLEANROOM.md','README.md',
             'backtest.py','bitvavo_public.py','config.py','main.py','market_data.py','models.py',
-            'offline_check.py','paper_trader.py','readiness.py','report.py','requirements.txt',
-            'start.sh','status.py','storage.py','strategy.py','supervisor.py','trend_main.py',
-            'trend_strategy.py','tests'
+            'missed_trade_audit.py','offline_check.py','paper_trader.py','readiness.py','report.py',
+            'requirements.txt','start.sh','status.py','storage.py','strategy.py','supervisor.py',
+            'trend_main.py','trend_strategy.py','tests'
         }
         actual = {p.name for p in root.iterdir() if p.name not in {'__pycache__', '.git', '.venv'}}
         self.assertEqual(actual, allowed_top)
