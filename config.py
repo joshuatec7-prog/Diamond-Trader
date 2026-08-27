@@ -37,7 +37,7 @@ class Settings:
     quote_currency: str = os.getenv('QUOTE_CURRENCY', 'EUR').upper()
     universe_size: int = _env_int('UNIVERSE_SIZE', 3)
 
-    interval: str = os.getenv('CANDLE_INTERVAL', '1h')
+    interval: str = os.getenv('CANDLE_INTERVAL', '15m')
     candle_limit: int = _env_int('CANDLE_LIMIT', 240)
     poll_seconds: int = _env_int('POLL_SECONDS', 120)
     degraded_retry_seconds: int = _env_int('DEGRADED_RETRY_SECONDS', 300)
@@ -53,11 +53,13 @@ class Settings:
     max_spread_pct: float = _env_float('MAX_SPREAD_PCT', 0.40)
     backtest_assumed_spread_pct: float = _env_float('BACKTEST_ASSUMED_SPREAD_PCT', 0.12)
 
-    band_window: int = _env_int('BAND_WINDOW', 20)
+    # De clean-room strategie behoudt dezelfde tijdshorizon als bij 1h:
+    # 80 x 15m = circa 20 uur lookback; 96 x 15m = circa 24 uur max hold.
+    band_window: int = _env_int('BAND_WINDOW', 80)
     band_stddev: float = _env_float('BAND_STDDEV', 2.0)
     stop_loss_pct: float = _env_float('STOP_LOSS_PCT', 1.5)
     take_profit_pct: float = _env_float('TAKE_PROFIT_PCT', 2.5)
-    max_hold_bars: int = _env_int('MAX_HOLD_BARS', 24)
+    max_hold_bars: int = _env_int('MAX_HOLD_BARS', 96)
 
     eval_min_trades: int = _env_int('EVAL_MIN_TRADES', 40)
     eval_min_span_days: float = _env_float('EVAL_MIN_SPAN_DAYS', 14.0)
