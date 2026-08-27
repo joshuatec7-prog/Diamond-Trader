@@ -93,15 +93,29 @@ def process_market(market: str, api: MarketDataSource, db: Storage,
         new_candles = [candles[-1]]
     else:
         new_candles = [c for c in candles if c.timestamp_ms > last_done]
-    if not new_candles:
-        return True
 
+    # Eerst alle nieuwe gesloten candles verwerken. Hierdoor blijven bar-based
+    # max-hold en dezelfde-candle stop/take deterministisch en herstartveilig.
     for candle in new_candles:
         event = trader.process_candle(market, candle)
         if event:
             logger.info('%s %s @ %.8f | %s | pnl=%s', event.market, event.kind, event.price,
                         event.reason, '-' if event.pnl_eur is None else f'€{event.pnl_eur:+.2f}')
         db.set_last_processed(market, candle.timestamp_ms)
+
+    # Een open paperpositie wordt iedere poll (standaard 120s) ook met de
+    # actuele bied/laat gecontroleerd. Zo hoeft stop/take niet tot de volgende
+    # 15m candle-close te wachten.
+    if db.get_position(market) is not None:
+        live_book = api.book(market)
+        event = trader.process_book(market, live_book)
+        if event:
+            logger.info('%s %s @ %.8f | %s | pnl=%s | intracycle',
+                        event.market, event.kind, event.price, event.reason,
+                        '-' if event.pnl_eur is None else f'€{event.pnl_eur:+.2f}')
+
+    if not new_candles:
+        return True
 
     latest = candles[-1]
     decision = strategy.evaluate(candles)
