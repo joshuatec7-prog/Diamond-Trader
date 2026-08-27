@@ -23,22 +23,22 @@ from missed_trade_audit import (
 )
 
 logger = logging.getLogger('cryptobot_missed_audit_all')
-STRATEGY_B = 'B_TREND_V4'
-STRATEGY_C = 'C_CONTINUATION_V3'
+STRATEGY_B = 'B_TREND_V5_RUNNER'
+STRATEGY_C = 'C_CONTINUATION_V4_RUNNER'
 
 
 def trend_db_path(primary_path: str) -> str:
     p = Path(primary_path)
     suffix = p.suffix or '.db'
     stem = p.stem if p.suffix else p.name
-    return str(p.with_name(f'{stem}_trend_v4{suffix}'))
+    return str(p.with_name(f'{stem}_trend_v5{suffix}'))
 
 
 def continuation_db_path(primary_path: str) -> str:
     p = Path(primary_path)
     suffix = p.suffix or '.db'
     stem = p.stem if p.suffix else p.name
-    return str(p.with_name(f'{stem}_continuation_v3{suffix}'))
+    return str(p.with_name(f'{stem}_continuation_v4{suffix}'))
 
 
 def _update_source(
@@ -130,13 +130,13 @@ def print_all_audit_report(settings: Settings) -> None:
         _print_strategy_report(
             conn,
             STRATEGY_B,
-            'STRATEGIE B v4 | TREND + PROFIT PROTECT SKIPS',
+            'STRATEGIE B v5 | TREND RUNNER SKIPS',
             cost_floor,
         )
         _print_strategy_report(
             conn,
             STRATEGY_C,
-            'STRATEGIE C v3 | CONTINUATION + PROFIT PROTECT SKIPS',
+            'STRATEGIE C v4 | CONTINUATION RUNNER SKIPS',
             cost_floor,
         )
     finally:
@@ -173,7 +173,7 @@ def main() -> int:
         return 0
 
     logger.info(
-        'gestart | READ-ONLY PAPER MISSED-TRADE AUDIT A/Bv4/Cv3 | interval=%s',
+        'gestart | READ-ONLY PAPER MISSED-TRADE AUDIT A/Bv5-runner/Cv4-runner | interval=%s',
         settings.interval,
     )
     while True:
