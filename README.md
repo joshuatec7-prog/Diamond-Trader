@@ -1,57 +1,54 @@
-# CryptoBot Clean-Room v1
+# CryptoBot Clean-Room
 
-Zelfstandige paper-trading bot met een harde scheiding tussen marktdata, strategie, paper-execution en opslag.
+Clean-room crypto trading research project for Bitvavo public EUR market data.
 
-## Veiligheidsgrens
+## Safety
 
-- `RUN_MODE=PAPER` is verplicht; iedere andere mode wordt geweigerd.
-- De runtime bevat geen private Bitvavo-authenticatie en geen echte orderfunctie.
-- Alleen publieke marktdata wordt benaderd.
-- De SQLite-database is zelfstandig en gebruikt op Render standaard `/var/data/cryptobot_cleanroom.db`.
-- De eerste marktselectie is dynamisch op publiek EUR-volume en wordt daarna vastgezet.
+- PAPER ONLY.
+- Geen private API-authenticatie.
+- Geen echte orderfunctie.
+- Geen bestaande Bitvavo-balansen worden gebruikt.
 
-## Strategie
+## Runtime
 
-De huidige vooraf vastgezette paperstrategie is een long-only statistische lower-band re-entry op 15-minutencandles. De strategie gebruikt een rollend gemiddelde en standaarddeviatie. Met 80 candles blijft de statistische lookback circa 20 uur; met maximaal 96 bars blijft de maximale houdtijd circa 24 uur. Stop en winstdoel zijn vooraf vastgezet.
+- Interval: 15 minuten.
+- Universe: 20 liquide EUR-markten, eenmaal geselecteerd op actueel 24-uurs quotevolume en daarna vastgezet.
+- Open paperposities worden tussen candle-closes door bewaakt met actuele bid/ask.
+- Strategy A en Strategy B draaien parallel, ieder met een eigen PAPER-database en fictief kapitaal.
 
-De worker pollt standaard iedere 120 seconden. Nieuwe entries worden alleen op basis van een nieuwe gesloten 15-minutencandle beoordeeld. Een reeds open paperpositie wordt tijdens iedere poll ook op de actuele bied/laat gecontroleerd, zodat stop-loss en take-profit niet tot de volgende candle-close hoeven te wachten.
+## Strategy A — Mean Reversion
 
-## Lokale controles zonder netwerk
+De oorspronkelijke lower-band re-entry strategie blijft ongewijzigd. Zij wacht op een koers die eerst onder de statistische lower band komt en daarna weer boven die band sluit terwijl de koers nog onder de middle band ligt.
+
+Database: `cryptobot_cleanroom.db`.
+
+## Strategy B — Trend Momentum
+
+Strategy B is bedoeld voor stijgende markten en gebruikt vooraf vaste, eenvoudige regels:
+
+- SMA 12 boven SMA 48;
+- SMA 48 stijgt over 8 bars;
+- 4-bar momentum tussen +0,30% en +6,00%;
+- laatste close breekt boven de hoogste close van de vorige 8 bars.
+
+De bovengrens op momentum voorkomt dat een extreme pump blind wordt nagejaagd. Stake, fees, slippage, spreadfilter, stop-loss, take-profit en maximale houdtijd zijn gelijk aan Strategy A, zodat de entries eerlijker vergelijkbaar blijven.
+
+Database: `cryptobot_cleanroom_trend.db`.
+
+## Controle
+
+Strategy A:
 
 ```bash
-python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
-python offline_check.py
-python readiness.py
+python3 main.py --status
+python3 main.py --report
 ```
 
-`offline_check.py` doorloopt deterministisch de volledige keten van synthetische marktdata → signaal → paper entry → paper exit → trade → database, zonder internet.
-
-## Runtime-commando's
+Strategy B:
 
 ```bash
-python main.py --status
-python main.py --readiness
-python main.py --report
-python main.py --once
+python3 trend_main.py --status
+python3 trend_main.py --report
 ```
 
-Voor Render:
-
-```bash
-./start.sh
-```
-
-## Readiness
-
-Readiness maakt bewust onderscheid tussen:
-
-- lokale veiligheid/configuratie/database;
-- bereikbaarheid van marktdata;
-- gereedheid om de prospectieve paper-observatie te starten.
-
-Als marktdata geblokkeerd is, blijft de worker actief zonder te handelen en registreert hij de datastatus in SQLite en de diagnose in de logs.
-
-`READY` wordt alleen gezet als de volledige vastgezette marktset in dezelfde cyclus gezond verwerkt is; gedeeltelijke marktdata blijft `PARTIAL` en kan de paper-observatie niet vrijgeven.
-
-GitHub CI voert dezelfde deterministische tests, compilecontrole, offline paperketen en lokale readiness-check uit zonder externe marktdata nodig te hebben.
+Alle runtime-processen worden gestart en bewaakt door `supervisor.py` via `start.sh`.
