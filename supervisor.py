@@ -73,8 +73,8 @@ def main() -> int:
 
     CHILDREN = [
         Child([sys.executable, '-u', 'main.py'], critical=True),
-        Child([sys.executable, '-u', 'trend_v4_main.py'], critical=True),
-        Child([sys.executable, '-u', 'continuation_v3_main.py'], critical=True),
+        Child([sys.executable, '-u', 'trend_v5_main.py'], critical=True),
+        Child([sys.executable, '-u', 'continuation_v4_main.py'], critical=True),
         Child([sys.executable, '-u', 'audit_all.py'], critical=False),
     ]
 
