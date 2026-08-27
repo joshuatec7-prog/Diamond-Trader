@@ -9,11 +9,11 @@ class TreeTests(unittest.TestCase):
             '.env.example','.gitignore','.python-version','.github','CLEANROOM.md','README.md',
             'audit_all.py','backtest.py','bitvavo_public.py','config.py','continuation_main.py',
             'continuation_strategy.py','continuation_v2_main.py','continuation_v3_main.py',
-            'continuation_v4_main.py','main.py','market_data.py','models.py',
+            'continuation_v4_main.py','continuation_v5_main.py','main.py','market_data.py','models.py',
             'missed_trade_audit.py','offline_check.py','paper_trader.py','profit_protect_trader.py',
-            'readiness.py','report.py','requirements.txt','start.sh','status.py','storage.py',
-            'strategy.py','supervisor.py','trend_main.py','trend_strategy.py','trend_v3_main.py',
-            'trend_v4_main.py','trend_v5_main.py','tests'
+            'readiness.py','report.py','requirements.txt','staged_runner_trader.py','start.sh',
+            'status.py','storage.py','strategy.py','supervisor.py','trend_main.py','trend_strategy.py',
+            'trend_v3_main.py','trend_v4_main.py','trend_v5_main.py','trend_v6_main.py','tests'
         }
         actual = {p.name for p in root.iterdir() if p.name not in {'__pycache__', '.git', '.venv'}}
         self.assertEqual(actual, allowed_top)
