@@ -9,7 +9,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from audit_all import STRATEGY_B, STRATEGY_C, continuation_db_path, trend_db_path
+from audit_all import (
+    STRATEGY_B,
+    STRATEGY_C,
+    STRATEGY_D,
+    adaptive_db_path,
+    continuation_db_path,
+    trend_db_path,
+)
 from bitvavo_public import INTERVAL_MS
 from config import Settings
 from missed_trade_audit import STRATEGY_A, audit_db_path
@@ -22,6 +29,7 @@ MIN_CLOSED_FOR_REVIEW = 10
 MIN_1H_REBOUNDS_FOR_REVIEW = 8
 REBOUND_TRIGGER_PCT = 1.50
 MODE = 'OBSERVE_ANALYSE_ONLY'
+HEALTHY_DATA_STATUSES = {'READY', 'PARTIAL', 'UNIVERSE_READY'}
 
 
 def research_db_path(primary_path: str) -> str:
@@ -140,9 +148,8 @@ def _snapshot_source(source: sqlite3.Connection) -> dict[str, Any]:
     pf_infinite = gross_profit > 0 and gross_loss <= 1e-12
     profit_factor = None if pf_infinite else (gross_profit / gross_loss if gross_loss > 0 else 0.0)
 
-    cash_raw = _state_value(source, 'cash_eur', '')
     try:
-        cash = float(cash_raw)
+        cash = float(_state_value(source, 'cash_eur', ''))
     except (TypeError, ValueError):
         cash = None
 
@@ -192,22 +199,11 @@ def _save_snapshot(
                data_status=excluded.data_status,
                recorded_at_ms=excluded.recorded_at_ms''',
         (
-            bucket_ms,
-            strategy,
-            source_db,
-            snapshot['cash_eur'],
-            snapshot['open_positions'],
-            snapshot['closed_trades'],
-            snapshot['wins'],
-            snapshot['losses'],
-            snapshot['breakeven'],
-            snapshot['net_pnl'],
-            snapshot['gross_profit'],
-            snapshot['gross_loss'],
-            snapshot['profit_factor'],
-            1 if snapshot['profit_factor_infinite'] else 0,
-            snapshot['data_status'],
-            now_ms,
+            bucket_ms, strategy, source_db, snapshot['cash_eur'], snapshot['open_positions'],
+            snapshot['closed_trades'], snapshot['wins'], snapshot['losses'], snapshot['breakeven'],
+            snapshot['net_pnl'], snapshot['gross_profit'], snapshot['gross_loss'],
+            snapshot['profit_factor'], 1 if snapshot['profit_factor_infinite'] else 0,
+            snapshot['data_status'], now_ms,
         ),
     )
 
@@ -222,11 +218,10 @@ def _evaluate_stop_rebounds(
     if interval not in INTERVAL_MS:
         raise ValueError(f'interval niet ondersteund: {interval}')
     interval_ms = INTERVAL_MS[interval]
-
     trades = source.execute(
         '''SELECT id,market,closed_at_ms,exit_price
            FROM trades
-           WHERE exit_reason='stop_loss'
+           WHERE exit_reason IN ('stop_loss','adaptive_stop_loss')
            ORDER BY id'''
     ).fetchall()
     inserted = 0
@@ -238,97 +233,63 @@ def _evaluate_stop_rebounds(
         exit_price = float(trade['exit_price'])
         if not math.isfinite(exit_price) or exit_price <= 0:
             continue
-
         latest = source.execute(
-            '''SELECT MAX(timestamp_ms) mx
-               FROM candles
-               WHERE market=? AND interval=?''',
+            'SELECT MAX(timestamp_ms) mx FROM candles WHERE market=? AND interval=?',
             (market, interval),
         ).fetchone()
         latest_ts = 0 if latest is None or latest['mx'] is None else int(latest['mx'])
 
         for horizon_min in HORIZONS_MINUTES:
-            exists = research.execute(
-                '''SELECT 1 FROM stop_rebounds
-                   WHERE strategy=? AND trade_id=? AND horizon_min=?''',
+            if research.execute(
+                'SELECT 1 FROM stop_rebounds WHERE strategy=? AND trade_id=? AND horizon_min=?',
                 (strategy, trade_id, horizon_min),
-            ).fetchone()
-            if exists is not None:
+            ).fetchone() is not None:
                 continue
-
             target_ms = closed_at_ms + horizon_min * 60_000
             if latest_ts + interval_ms < target_ms:
                 continue
-
             rows = source.execute(
-                '''SELECT timestamp_ms,high,low,close
-                   FROM candles
+                '''SELECT timestamp_ms,high,low,close FROM candles
                    WHERE market=? AND interval=?
-                     AND timestamp_ms + ? > ?
-                     AND timestamp_ms < ?
+                     AND timestamp_ms + ? > ? AND timestamp_ms < ?
                    ORDER BY timestamp_ms''',
                 (market, interval, interval_ms, closed_at_ms, target_ms),
             ).fetchall()
             if not rows:
                 continue
-
             highs = [float(r['high']) for r in rows]
             lows = [float(r['low']) for r in rows]
             end_close = float(rows[-1]['close'])
             if not all(math.isfinite(x) and x > 0 for x in highs + lows + [end_close]):
                 continue
-
             end_return = (end_close / exit_price - 1.0) * 100.0
             max_up = (max(highs) / exit_price - 1.0) * 100.0
             max_down = (min(lows) / exit_price - 1.0) * 100.0
-
             research.execute(
                 '''INSERT OR IGNORE INTO stop_rebounds(
                        strategy,trade_id,market,closed_at_ms,horizon_min,exit_price,
                        end_return_pct,max_up_pct,max_down_pct,evaluated_at_ms
                    ) VALUES(?,?,?,?,?,?,?,?,?,?)''',
-                (
-                    strategy,
-                    trade_id,
-                    market,
-                    closed_at_ms,
-                    horizon_min,
-                    exit_price,
-                    end_return,
-                    max_up,
-                    max_down,
-                    now_ms,
-                ),
+                (strategy, trade_id, market, closed_at_ms, horizon_min, exit_price,
+                 end_return, max_up, max_down, now_ms),
             )
             inserted += 1
-
     return inserted
 
 
-def _missed_summary(
-    audit_path: str,
-    strategy: str,
-) -> dict[int, dict[str, float | int | None]]:
-    columns = {
-        15: 'r15m_pct',
-        60: 'r1h_pct',
-        240: 'r4h_pct',
-    }
+def _missed_summary(audit_path: str, strategy: str) -> dict[int, dict[str, float | int | None]]:
+    columns = {15: 'r15m_pct', 60: 'r1h_pct', 240: 'r4h_pct'}
     result: dict[int, dict[str, float | int | None]] = {}
     if not Path(audit_path).exists():
-        for horizon in columns:
-            result[horizon] = {'n': 0, 'avg_return_pct': None, 'positive_pct': None}
-        return result
+        return {h: {'n': 0, 'avg_return_pct': None, 'positive_pct': None} for h in columns}
 
     audit = _connect_readonly(audit_path)
     try:
         for horizon, column in columns.items():
             row = audit.execute(
-                f'''SELECT COUNT({column}) n,
-                           AVG({column}) avg_return,
+                f'''SELECT COUNT({column}) n, AVG({column}) avg_return,
                            AVG(CASE WHEN {column} > 0 THEN 1.0 ELSE 0.0 END) positive_ratio
-                    FROM skip_audit
-                    WHERE strategy=? AND {column} IS NOT NULL''',
+                    FROM skip_audit WHERE strategy=? AND {column} IS NOT NULL''',
                 (strategy,),
             ).fetchone()
             n = int(row['n'] or 0)
@@ -359,15 +320,8 @@ def _save_missed_snapshot(
                    avg_return_pct=excluded.avg_return_pct,
                    positive_pct=excluded.positive_pct,
                    recorded_at_ms=excluded.recorded_at_ms''',
-            (
-                bucket_ms,
-                strategy,
-                horizon,
-                int(values['n'] or 0),
-                values['avg_return_pct'],
-                values['positive_pct'],
-                now_ms,
-            ),
+            (bucket_ms, strategy, horizon, int(values['n'] or 0),
+             values['avg_return_pct'], values['positive_pct'], now_ms),
         )
 
 
@@ -377,24 +331,16 @@ def _rebound_summary(
     horizon_min: int,
 ) -> dict[str, float | int | None]:
     row = research.execute(
-        '''SELECT COUNT(*) n,
-                  AVG(end_return_pct) avg_end,
-                  AVG(max_up_pct) avg_max_up,
+        '''SELECT COUNT(*) n, AVG(end_return_pct) avg_end, AVG(max_up_pct) avg_max_up,
                   AVG(max_down_pct) avg_max_down,
                   AVG(CASE WHEN max_up_pct >= ? THEN 1.0 ELSE 0.0 END) trigger_ratio
-           FROM stop_rebounds
-           WHERE strategy=? AND horizon_min=?''',
+           FROM stop_rebounds WHERE strategy=? AND horizon_min=?''',
         (REBOUND_TRIGGER_PCT, strategy, horizon_min),
     ).fetchone()
     n = int(row['n'] or 0)
     if n == 0:
-        return {
-            'n': 0,
-            'avg_end_return_pct': None,
-            'avg_max_up_pct': None,
-            'avg_max_down_pct': None,
-            'recovered_1_5pct_pct': None,
-        }
+        return {'n': 0, 'avg_end_return_pct': None, 'avg_max_up_pct': None,
+                'avg_max_down_pct': None, 'recovered_1_5pct_pct': None}
     return {
         'n': n,
         'avg_end_return_pct': float(row['avg_end']),
@@ -411,7 +357,7 @@ def _recommendation(
 ) -> str:
     if snapshot.get('missing'):
         return 'WACHT | bronbestand ontbreekt'
-    if snapshot['data_status'] not in {'READY', 'PARTIAL'}:
+    if snapshot['data_status'] not in HEALTHY_DATA_STATUSES:
         return f"WACHT | data-status {snapshot['data_status']}"
 
     closed = int(snapshot['closed_trades'])
@@ -423,29 +369,29 @@ def _recommendation(
     if closed < MIN_CLOSED_FOR_REVIEW:
         return f'VERZAMELEN | gesloten trades {closed}/{MIN_CLOSED_FOR_REVIEW}'
 
-    rebound_n = int(rebound_1h['n'] or 0)
+    pf = snapshot['profit_factor']
+    if closed >= 20 and not snapshot['profit_factor_infinite'] and pf is not None and float(pf) < 0.80:
+        return 'REVIEW | prestaties zwak; onderzoek nodig, geen automatische wijziging'
+
+    rebound_n = int(rebound_1h.get('n') or 0)
     if rebound_n < MIN_1H_REBOUNDS_FOR_REVIEW:
-        return (
-            'VERZAMELEN | 1h stop-rebounds '
-            f'{rebound_n}/{MIN_1H_REBOUNDS_FOR_REVIEW}'
-        )
+        return f'VERZAMELEN | 1h stop-rebounds {rebound_n}/{MIN_1H_REBOUNDS_FOR_REVIEW}'
 
-    recovered = float(rebound_1h['recovered_1_5pct_pct'] or 0.0)
-    avg_end = float(rebound_1h['avg_end_return_pct'] or 0.0)
-    avg_max_up = float(rebound_1h['avg_max_up_pct'] or 0.0)
-
+    recovered = float(rebound_1h.get('recovered_1_5pct_pct') or 0.0)
+    avg_end = float(rebound_1h.get('avg_end_return_pct') or 0.0)
+    avg_max_up = float(rebound_1h.get('avg_max_up_pct') or 0.0)
     if recovered >= 60.0 and avg_max_up >= REBOUND_TRIGGER_PCT:
+        if strategy == STRATEGY_D:
+            return (
+                'REVIEW | adaptive stop/entrytiming onderzoeken; '
+                f'{recovered:.1f}% herstelt binnen 1h minstens +{REBOUND_TRIGGER_PCT:.1f}%'
+            )
         return (
             'REVIEW | 1.0% stop mogelijk te krap; '
             f'{recovered:.1f}% herstelt binnen 1h minstens +{REBOUND_TRIGGER_PCT:.1f}%'
         )
     if recovered <= 25.0 and avg_end <= 0.0:
-        return 'HOLD | 1.0% stop lijkt doorgaans verdere zwakte te vermijden'
-
-    pf = snapshot['profit_factor']
-    if closed >= 20 and not snapshot['profit_factor_infinite'] and pf is not None and float(pf) < 0.80:
-        return 'REVIEW | prestaties zwak; onderzoek nodig, geen automatische wijziging'
-
+        return 'HOLD | stop lijkt doorgaans verdere zwakte te vermijden'
     return 'HOLD | gemengd bewijs; geen overtuigende reden voor wijziging'
 
 
@@ -455,6 +401,15 @@ def _write_report(path: str, report: dict[str, Any]) -> None:
     tmp = p.with_name(p.name + '.tmp')
     tmp.write_text(json.dumps(report, indent=2, sort_keys=True), encoding='utf-8')
     tmp.replace(p)
+
+
+def _default_sources(settings: Settings) -> dict[str, str]:
+    return {
+        STRATEGY_A: settings.db_path,
+        STRATEGY_B: trend_db_path(settings.db_path),
+        STRATEGY_C: continuation_db_path(settings.db_path),
+        STRATEGY_D: adaptive_db_path(settings.db_path),
+    }
 
 
 def run_once(
@@ -472,11 +427,8 @@ def run_once(
     controller_path = controller_path or research_db_path(settings.db_path)
     report_path = report_path or research_report_path(settings.db_path)
     missed_path = missed_path or audit_db_path(settings.db_path)
-    source_paths = source_paths or {
-        STRATEGY_A: settings.db_path,
-        STRATEGY_B: trend_db_path(settings.db_path),
-        STRATEGY_C: continuation_db_path(settings.db_path),
-    }
+    sources = dict(source_paths) if source_paths is not None else _default_sources(settings)
+    active_strategies = tuple(sources.keys())
 
     research = _connect_research(controller_path)
     snapshots: dict[str, dict[str, Any]] = {}
@@ -484,24 +436,15 @@ def run_once(
     inserted_rebounds = 0
 
     try:
-        for strategy in (STRATEGY_A, STRATEGY_B, STRATEGY_C):
-            source_path = source_paths[strategy]
+        for strategy in active_strategies:
+            source_path = sources[strategy]
             if not Path(source_path).exists():
                 snapshot = {
-                    'missing': True,
-                    'source_db': source_path,
-                    'cash_eur': None,
-                    'open_positions': 0,
-                    'closed_trades': 0,
-                    'wins': 0,
-                    'losses': 0,
-                    'breakeven': 0,
-                    'net_pnl': 0.0,
-                    'gross_profit': 0.0,
-                    'gross_loss': 0.0,
-                    'profit_factor': 0.0,
-                    'profit_factor_infinite': False,
-                    'data_status': 'MISSING',
+                    'missing': True, 'source_db': source_path, 'cash_eur': None,
+                    'open_positions': 0, 'closed_trades': 0, 'wins': 0, 'losses': 0,
+                    'breakeven': 0, 'net_pnl': 0.0, 'gross_profit': 0.0,
+                    'gross_loss': 0.0, 'profit_factor': 0.0,
+                    'profit_factor_infinite': False, 'data_status': 'MISSING',
                 }
             else:
                 source = _connect_readonly(source_path)
@@ -509,51 +452,34 @@ def run_once(
                     snapshot = _snapshot_source(source)
                     snapshot['missing'] = False
                     snapshot['source_db'] = source_path
-                    if strategy in {STRATEGY_B, STRATEGY_C}:
+                    if strategy != STRATEGY_A:
                         inserted_rebounds += _evaluate_stop_rebounds(
-                            source,
-                            research,
-                            strategy,
-                            settings.interval,
-                            now,
+                            source, research, strategy, settings.interval, now
                         )
                 finally:
                     source.close()
 
             snapshots[strategy] = snapshot
             _save_snapshot(research, bucket_ms, strategy, source_path, snapshot, now)
-
             missed_values = _missed_summary(missed_path, strategy)
             missed[strategy] = missed_values
             _save_missed_snapshot(research, bucket_ms, strategy, missed_values, now)
 
         rebound = {
-            STRATEGY_B: {
-                horizon: _rebound_summary(research, STRATEGY_B, horizon)
+            strategy: {
+                horizon: _rebound_summary(research, strategy, horizon)
                 for horizon in HORIZONS_MINUTES
-            },
-            STRATEGY_C: {
-                horizon: _rebound_summary(research, STRATEGY_C, horizon)
-                for horizon in HORIZONS_MINUTES
-            },
+            }
+            for strategy in active_strategies
+            if strategy != STRATEGY_A
         }
-
         recommendations = {
-            STRATEGY_A: _recommendation(
-                STRATEGY_A,
-                snapshots[STRATEGY_A],
-                {'n': 0},
-            ),
-            STRATEGY_B: _recommendation(
-                STRATEGY_B,
-                snapshots[STRATEGY_B],
-                rebound[STRATEGY_B][60],
-            ),
-            STRATEGY_C: _recommendation(
-                STRATEGY_C,
-                snapshots[STRATEGY_C],
-                rebound[STRATEGY_C][60],
-            ),
+            strategy: _recommendation(
+                strategy,
+                snapshots[strategy],
+                {'n': 0} if strategy == STRATEGY_A else rebound[strategy][60],
+            )
+            for strategy in active_strategies
         }
 
         report = {
@@ -564,14 +490,13 @@ def run_once(
             'generated_at_ms': now,
             'bucket_ms': bucket_ms,
             'controller_db': controller_path,
-            'source_databases': source_paths,
+            'source_databases': sources,
             'inserted_rebound_measurements': inserted_rebounds,
             'strategies': snapshots,
             'missed_trade_summary': missed,
             'stop_rebound_summary': rebound,
             'recommendations': recommendations,
         }
-
         research.execute(
             '''INSERT INTO state(key,value) VALUES('last_run_ms',?)
                ON CONFLICT(key) DO UPDATE SET value=excluded.value''',
@@ -606,29 +531,23 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"LAATSTE RUN     : {report['generated_at_ms']}")
 
     labels = {
-        STRATEGY_A: 'A',
-        STRATEGY_B: 'B v7',
-        STRATEGY_C: 'C v6',
+        STRATEGY_A: 'A', STRATEGY_B: 'B v7', STRATEGY_C: 'C v6', STRATEGY_D: 'D v1',
     }
-    for strategy in (STRATEGY_A, STRATEGY_B, STRATEGY_C):
-        s = report['strategies'][strategy]
-        print(f"\n--- {labels[strategy]} ---")
+    for strategy, s in report['strategies'].items():
+        print(f"\n--- {labels.get(strategy, strategy)} ---")
         print(
             f"STATUS {s['data_status']} | closed {s['closed_trades']} | "
             f"W/L {s['wins']}/{s['losses']} | PnL €{s['net_pnl']:+.2f} | PF {_pf_text(s)}"
         )
         print(f"ADVIES          : {report['recommendations'][strategy]}")
-
-        miss = report['missed_trade_summary'][strategy]
         for horizon in (15, 60, 240):
-            m = miss[horizon]
+            m = report['missed_trade_summary'][strategy][horizon]
             if int(m['n'] or 0) > 0:
                 print(
                     f"MISSED {horizon:3}m    : n={m['n']} | "
                     f"gem {float(m['avg_return_pct']):+.2f}% | >0 {float(m['positive_pct']):.1f}%"
                 )
-
-        if strategy in {STRATEGY_B, STRATEGY_C}:
+        if strategy != STRATEGY_A and strategy in report['stop_rebound_summary']:
             for horizon in HORIZONS_MINUTES:
                 r = report['stop_rebound_summary'][strategy][horizon]
                 if int(r['n'] or 0) > 0:
@@ -645,7 +564,7 @@ def _restore_horizon_keys(report: dict[str, Any]) -> dict[str, Any]:
         section = report.get(section_name, {})
         if not isinstance(section, dict):
             continue
-        for _strategy, values in section.items():
+        for values in section.values():
             if not isinstance(values, dict):
                 continue
             for key in list(values.keys()):
@@ -665,9 +584,7 @@ def load_report(path: str) -> dict[str, Any] | None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description='Uurlijkse read-only PAPER research controller'
-    )
+    parser = argparse.ArgumentParser(description='Uurlijkse read-only PAPER research controller')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--report', action='store_true')
     args = parser.parse_args()
@@ -679,7 +596,6 @@ def main() -> int:
         format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
     )
-
     report_path = research_report_path(settings.db_path)
     if args.report:
         report = load_report(report_path)
@@ -688,29 +604,21 @@ def main() -> int:
             return 0
         print_report(report)
         return 0
-
     if args.once:
         print_report(run_once(settings))
         return 0
 
-    logger.info(
-        'gestart | %s | interval=%ss | auto_modify=NEE | auto_deploy=NEE',
-        MODE,
-        RUN_INTERVAL_SECONDS,
-    )
+    logger.info('gestart | %s | interval=%ss | auto_modify=NEE | auto_deploy=NEE', MODE, RUN_INTERVAL_SECONDS)
     while True:
         started = time.monotonic()
         try:
             report = run_once(settings)
-            logger.info(
-                'uurmeting gereed | B=%s | C=%s | nieuwe_rebounds=%s',
-                report['recommendations'][STRATEGY_B],
-                report['recommendations'][STRATEGY_C],
-                report['inserted_rebound_measurements'],
+            summary = ' | '.join(
+                f'{key}={value}' for key, value in report['recommendations'].items()
             )
+            logger.info('uurmeting gereed | %s | nieuwe_rebounds=%s', summary, report['inserted_rebound_measurements'])
         except Exception:
             logger.exception('uurmeting mislukt; bronstrategieën blijven onaangeroerd')
-
         elapsed = time.monotonic() - started
         time.sleep(max(60.0, RUN_INTERVAL_SECONDS - elapsed))
 

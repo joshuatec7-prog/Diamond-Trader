@@ -34,10 +34,7 @@ def _start_child(child: Child) -> None:
     child.proc = subprocess.Popen(child.cmd)
     child.restart_at = 0.0
     kind = 'critical' if child.critical else 'research'
-    print(
-        f'[SUPERVISOR] gestart pid={child.proc.pid} | {_label(child)} | {kind}',
-        flush=True,
-    )
+    print(f'[SUPERVISOR] gestart pid={child.proc.pid} | {_label(child)} | {kind}', flush=True)
 
 
 def _terminate_children() -> None:
@@ -45,7 +42,6 @@ def _terminate_children() -> None:
         proc = child.proc
         if proc is not None and proc.poll() is None:
             proc.terminate()
-
     deadline = time.time() + 10.0
     for child in CHILDREN:
         proc = child.proc
@@ -55,7 +51,6 @@ def _terminate_children() -> None:
             time.sleep(0.1)
         if proc.poll() is None:
             proc.kill()
-
     for child in CHILDREN:
         proc = child.proc
         if proc is None:
@@ -75,6 +70,7 @@ def main() -> int:
         Child([sys.executable, '-u', 'main.py'], critical=True),
         Child([sys.executable, '-u', 'trend_v7_main.py'], critical=True),
         Child([sys.executable, '-u', 'continuation_v6_main.py'], critical=True),
+        Child([sys.executable, '-u', 'adaptive_trend_main.py'], critical=True),
         Child([sys.executable, '-u', 'audit_all.py'], critical=False),
         Child([sys.executable, '-u', 'auto_research_controller.py'], critical=False),
         Child([sys.executable, '-u', 'research_report_publisher.py'], critical=False),
@@ -89,38 +85,28 @@ def main() -> int:
             now = time.time()
             for child in CHILDREN:
                 proc = child.proc
-
                 if proc is None:
                     if not child.critical and now >= child.restart_at:
                         _start_child(child)
                     continue
-
                 rc = proc.poll()
                 if rc is None:
                     continue
-
                 if child.critical:
-                    print(
-                        f'[SUPERVISOR] critical child {_label(child)} gestopt rc={rc}',
-                        flush=True,
-                    )
+                    print(f'[SUPERVISOR] critical child {_label(child)} gestopt rc={rc}', flush=True)
                     exit_code = rc if rc != 0 else 1
                     STOP = True
                     break
-
                 print(
-                    f'[SUPERVISOR] research child {_label(child)} gestopt rc={rc}; '
-                    'herstart over 5s',
+                    f'[SUPERVISOR] research child {_label(child)} gestopt rc={rc}; herstart over 5s',
                     flush=True,
                 )
                 child.proc = None
                 child.restart_at = now + 5.0
-
             if not STOP:
                 time.sleep(0.5)
     finally:
         _terminate_children()
-
     return exit_code
 
 
