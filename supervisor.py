@@ -71,8 +71,9 @@ def main() -> int:
         Child([sys.executable, '-u', 'trend_v7_main.py'], critical=True),
         Child([sys.executable, '-u', 'continuation_v6_main.py'], critical=True),
         Child([sys.executable, '-u', 'adaptive_trend_main.py'], critical=True),
+        Child([sys.executable, '-u', 'adaptive_ls_main.py'], critical=True),
         Child([sys.executable, '-u', 'audit_all.py'], critical=False),
-        Child([sys.executable, '-u', 'auto_research_controller.py'], critical=False),
+        Child([sys.executable, '-u', 'auto_research_controller_d2.py'], critical=False),
         Child([sys.executable, '-u', 'research_report_publisher.py'], critical=False),
     ]
 
