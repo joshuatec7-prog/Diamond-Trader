@@ -1,11 +1,19 @@
 import unittest
 
-from funding_basis_monitor import TOTAL_ROUNDTRIP_BUFFER_PCT, _score_candidate
+from funding_basis_monitor import (
+    TOTAL_ROUNDTRIP_BUFFER_PCT,
+    _relative_funding_pct,
+    _score_candidate,
+)
 
 
 class FundingBasisMonitorTests(unittest.TestCase):
     def test_roundtrip_buffer_includes_both_legs(self):
         self.assertAlmostEqual(TOTAL_ROUNDTRIP_BUFFER_PCT, 0.35)
+
+    def test_absolute_kraken_rate_is_normalized_by_index(self):
+        # $0.25 funding per BTC contract on $50k index = 0.0005% per hour.
+        self.assertAlmostEqual(_relative_funding_pct(0.25, 50_000.0), 0.0005)
 
     def test_monitor_collects_before_watch_label(self):
         score, action, net = _score_candidate(
@@ -16,6 +24,7 @@ class FundingBasisMonitorTests(unittest.TestCase):
             basis_pct=0.10,
             history={
                 'samples_24h': 10.0,
+                'span_hours_24h': 2.0,
                 'positive_share_24h': 1.0,
                 'avg_funding_hour_pct_24h': 0.010,
             },
@@ -32,7 +41,8 @@ class FundingBasisMonitorTests(unittest.TestCase):
             volume_quote=50_000_000,
             basis_pct=0.10,
             history={
-                'samples_24h': 96.0,
+                'samples_24h': 72.0,
+                'span_hours_24h': 18.0,
                 'positive_share_24h': 0.85,
                 'avg_funding_hour_pct_24h': 0.008,
             },
@@ -48,7 +58,8 @@ class FundingBasisMonitorTests(unittest.TestCase):
             volume_quote=100_000_000,
             basis_pct=0.20,
             history={
-                'samples_24h': 96.0,
+                'samples_24h': 72.0,
+                'span_hours_24h': 18.0,
                 'positive_share_24h': 0.10,
                 'avg_funding_hour_pct_24h': -0.008,
             },
