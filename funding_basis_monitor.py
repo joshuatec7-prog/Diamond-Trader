@@ -14,19 +14,26 @@ from typing import Any
 
 import requests
 
-logger = logging.getLogger('cryptobot_funding_basis_v2')
+logger = logging.getLogger('cryptobot_funding_basis_v3')
 STOP = False
 
 KRAKEN_FUTURES_URL = 'https://futures.kraken.com/derivatives/api/v3'
+KRAKEN_SPOT_URL = 'https://api.kraken.com/0/public'
 BITVAVO_URL = 'https://api.bitvavo.com/v2'
+
 FUTURES_TAKER_FEE_PCT = 0.05
 BITVAVO_USDC_TAKER_FEE_PCT = 0.05
-EXECUTION_BUFFER_PCT = 0.15
+CROSS_EXCHANGE_EXECUTION_BUFFER_PCT = 0.15
 TOTAL_ROUNDTRIP_BUFFER_PCT = (
     2.0 * FUTURES_TAKER_FEE_PCT
     + 2.0 * BITVAVO_USDC_TAKER_FEE_PCT
-    + EXECUTION_BUFFER_PCT
+    + CROSS_EXCHANGE_EXECUTION_BUFFER_PCT
 )
+
+# Bestaand BTC/ETH-bezit op Kraken hoeft voor een hedge niet opnieuw spot gekocht/verkocht te worden.
+# Daarom rekenen we hier alleen futures heen+terug plus een extra uitvoeringsbuffer.
+NATIVE_EXISTING_HOLDING_BUFFER_PCT = 2.0 * FUTURES_TAKER_FEE_PCT + 0.10
+
 MIN_VOLUME_QUOTE_USD = 1_000_000.0
 MAX_FUTURES_SPREAD_PCT = 0.12
 MIN_HISTORY_SAMPLES = 48
@@ -34,6 +41,8 @@ MIN_HISTORY_SPAN_HOURS = 10.0
 MIN_POSITIVE_SHARE = 0.75
 MAX_ABS_FUNDING_HOUR_PCT = 0.50
 BASE_ALIASES = {'XBT': 'BTC', 'XDG': 'DOGE'}
+KRAKEN_NATIVE_SPOT_PAIRS = {'BTC': 'XBTUSD', 'ETH': 'ETHUSD'}
+DEFAULT_NATIVE_HOLDINGS = ('BTC', 'ETH')
 
 
 def _data_path(filename: str) -> Path:
@@ -45,12 +54,22 @@ def _data_path(filename: str) -> Path:
 
 def _report_path() -> Path:
     raw = os.getenv('FUNDING_MONITOR_REPORT_PATH')
-    return Path(raw) if raw else _data_path('cryptobot_funding_basis_v2.json')
+    return Path(raw) if raw else _data_path('cryptobot_funding_basis_v3.json')
 
 
 def _db_path() -> Path:
     raw = os.getenv('FUNDING_MONITOR_DB_PATH')
-    return Path(raw) if raw else _data_path('cryptobot_funding_basis_v2.db')
+    return Path(raw) if raw else _data_path('cryptobot_funding_basis_v3.db')
+
+
+def _native_holdings() -> tuple[str, ...]:
+    raw = os.getenv('KRAKEN_NATIVE_HOLDINGS', ','.join(DEFAULT_NATIVE_HOLDINGS))
+    values = []
+    for part in raw.split(','):
+        base = part.strip().upper()
+        if base in KRAKEN_NATIVE_SPOT_PAIRS and base not in values:
+            values.append(base)
+    return tuple(values)
 
 
 def _stop(signum: int, frame: object) -> None:
@@ -105,7 +124,7 @@ def _fetch_bitvavo_usdc_markets(timeout: int = 10) -> dict[str, str]:
     return result
 
 
-def _fetch_tickers(timeout: int = 10) -> list[dict[str, Any]]:
+def _fetch_futures_tickers(timeout: int = 10) -> list[dict[str, Any]]:
     response = requests.get(f'{KRAKEN_FUTURES_URL}/tickers', timeout=timeout, headers={'Accept': 'application/json'})
     response.raise_for_status()
     payload = response.json()
@@ -117,6 +136,33 @@ def _fetch_tickers(timeout: int = 10) -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)]
 
 
+def _fetch_kraken_spot_ticker(pair: str, timeout: int = 10) -> dict[str, float]:
+    response = requests.get(
+        f'{KRAKEN_SPOT_URL}/Ticker', params={'pair': pair}, timeout=timeout, headers={'Accept': 'application/json'}
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get('error'):
+        raise RuntimeError(f'ongeldig Kraken spot ticker-antwoord voor {pair}')
+    result = payload.get('result')
+    if not isinstance(result, dict) or not result:
+        raise RuntimeError(f'Kraken spot ticker ontbreekt voor {pair}')
+    row = next(iter(result.values()))
+    if not isinstance(row, dict):
+        raise RuntimeError(f'ongeldig Kraken spot ticker-record voor {pair}')
+    try:
+        ask = float(row['a'][0])
+        bid = float(row['b'][0])
+        last = float(row['c'][0])
+    except (KeyError, IndexError, TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(f'ongeldige Kraken spot prijzen voor {pair}') from exc
+    if min(ask, bid, last) <= 0 or ask < bid:
+        raise RuntimeError(f'ongeldige Kraken spot bid/ask voor {pair}')
+    mid = (bid + ask) / 2.0
+    spread_pct = (ask - bid) / mid * 100.0 if mid > 0 else 999.0
+    return {'bid': bid, 'ask': ask, 'last': last, 'mid': mid, 'spread_pct': spread_pct}
+
+
 def _db_connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,28 +171,31 @@ def _db_connect() -> sqlite3.Connection:
     conn.execute(
         '''CREATE TABLE IF NOT EXISTS snapshots (
             generated_ms INTEGER NOT NULL,
+            route_id TEXT NOT NULL,
             symbol TEXT NOT NULL,
+            route_type TEXT NOT NULL,
             spot_market TEXT NOT NULL,
+            roundtrip_buffer_pct REAL NOT NULL,
             funding_hour_pct REAL NOT NULL,
             predicted_funding_hour_pct REAL NOT NULL,
             basis_pct REAL NOT NULL,
-            spread_pct REAL NOT NULL,
+            futures_spread_pct REAL NOT NULL,
             volume_quote REAL NOT NULL,
             open_interest REAL NOT NULL,
-            PRIMARY KEY (generated_ms, symbol)
+            PRIMARY KEY (generated_ms, route_id)
         )'''
     )
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_funding_v2_symbol_time ON snapshots(symbol, generated_ms)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_funding_v3_route_time ON snapshots(route_id, generated_ms)')
     conn.commit()
     return conn
 
 
-def _history_summary(conn: sqlite3.Connection, symbol: str, now_ms: int) -> dict[str, float]:
+def _history_summary(conn: sqlite3.Connection, route_id: str, now_ms: int) -> dict[str, float]:
     cutoff = now_ms - 24 * 60 * 60 * 1000
     rows = conn.execute(
         '''SELECT generated_ms, funding_hour_pct
-           FROM snapshots WHERE symbol=? AND generated_ms>=? ORDER BY generated_ms''',
-        (symbol, cutoff),
+           FROM snapshots WHERE route_id=? AND generated_ms>=? ORDER BY generated_ms''',
+        (route_id, cutoff),
     ).fetchall()
     if not rows:
         return {
@@ -173,9 +222,10 @@ def _score_candidate(
     volume_quote: float,
     basis_pct: float,
     history: dict[str, float],
+    roundtrip_buffer_pct: float = TOTAL_ROUNDTRIP_BUFFER_PCT,
 ) -> tuple[float, str, float]:
     gross_7d_pct = max(0.0, funding_hour_pct) * 24.0 * 7.0
-    net_7d_snapshot_pct = gross_7d_pct - TOTAL_ROUNDTRIP_BUFFER_PCT
+    net_7d_snapshot_pct = gross_7d_pct - roundtrip_buffer_pct
     samples = int(history.get('samples_24h', 0.0))
     span_hours = float(history.get('span_hours_24h', 0.0))
     positive_share = float(history.get('positive_share_24h', 0.0))
@@ -213,97 +263,168 @@ def _score_candidate(
     return score, action, net_7d_snapshot_pct
 
 
+def _future_record(ticker: dict[str, Any]) -> dict[str, Any] | None:
+    symbol = str(ticker.get('symbol', '')).upper()
+    tag = str(ticker.get('tag', '')).lower()
+    if not symbol.startswith('PF_') or tag != 'perpetual' or bool(ticker.get('suspended', False)):
+        return None
+    pair = str(ticker.get('pair', symbol)).upper()
+    base = _kraken_base(pair, symbol)
+    mark = _finite(ticker.get('markPrice'))
+    index = _finite(ticker.get('indexPrice'))
+    bid = _finite(ticker.get('bid'))
+    ask = _finite(ticker.get('ask'))
+    if min(mark, index, bid, ask) <= 0 or ask < bid:
+        return None
+    funding_hour_pct = _relative_funding_pct(_finite(ticker.get('fundingRate')), index)
+    predicted_hour_pct = _relative_funding_pct(_finite(ticker.get('fundingRatePrediction')), index)
+    if abs(funding_hour_pct) > MAX_ABS_FUNDING_HOUR_PCT or abs(predicted_hour_pct) > MAX_ABS_FUNDING_HOUR_PCT:
+        return None
+    mid = (bid + ask) / 2.0
+    spread_pct = (ask - bid) / mid * 100.0 if mid > 0 else 999.0
+    return {
+        'symbol': symbol,
+        'pair': pair,
+        'base': base,
+        'mark': mark,
+        'index': index,
+        'funding_hour_pct': funding_hour_pct,
+        'predicted_hour_pct': predicted_hour_pct,
+        'futures_spread_pct': spread_pct,
+        'volume_quote': _finite(ticker.get('volumeQuote')),
+        'open_interest': _finite(ticker.get('openInterest')),
+    }
+
+
+def _build_row(
+    *,
+    future: dict[str, Any],
+    route_id: str,
+    route_type: str,
+    spot_market: str,
+    spot_reference: float,
+    spot_spread_pct: float,
+    roundtrip_buffer_pct: float,
+    conn: sqlite3.Connection,
+    now_ms: int,
+) -> dict[str, Any]:
+    basis_pct = _pct_change(float(future['mark']), spot_reference)
+    history = _history_summary(conn, route_id, now_ms)
+    score, action, net_7d = _score_candidate(
+        funding_hour_pct=float(future['funding_hour_pct']),
+        predicted_hour_pct=float(future['predicted_hour_pct']),
+        spread_pct=float(future['futures_spread_pct']),
+        volume_quote=float(future['volume_quote']),
+        basis_pct=basis_pct,
+        history=history,
+        roundtrip_buffer_pct=roundtrip_buffer_pct,
+    )
+    return {
+        'route_id': route_id,
+        'route_type': route_type,
+        'symbol': future['symbol'],
+        'pair': future['pair'],
+        'base': future['base'],
+        'spot_market': spot_market,
+        'spot_reference': round(spot_reference, 8),
+        'spot_spread_pct': round(spot_spread_pct, 5),
+        'mark_price': round(float(future['mark']), 8),
+        'index_price': round(float(future['index']), 8),
+        'basis_pct': round(basis_pct, 5),
+        'funding_hour_pct': round(float(future['funding_hour_pct']), 7),
+        'predicted_funding_hour_pct': round(float(future['predicted_hour_pct']), 7),
+        'gross_funding_7d_snapshot_pct': round(max(0.0, float(future['funding_hour_pct'])) * 168.0, 4),
+        'net_7d_snapshot_pct': round(net_7d, 4),
+        'futures_spread_pct': round(float(future['futures_spread_pct']), 5),
+        'volume_quote': round(float(future['volume_quote']), 2),
+        'open_interest': round(float(future['open_interest']), 4),
+        'roundtrip_buffer_pct': round(roundtrip_buffer_pct, 4),
+        'score': score,
+        'action': action,
+    }
+
+
 def scan_once() -> dict[str, object]:
     now_ms = int(time.time() * 1000)
     usdc_markets = _fetch_bitvavo_usdc_markets()
-    tickers = _fetch_tickers()
+    tickers = _fetch_futures_tickers()
+    futures_by_base: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for ticker in tickers:
+        record = _future_record(ticker)
+        if record is None:
+            continue
+        futures_by_base[str(record['base'])] = record
+
     conn = _db_connect()
     rows: list[dict[str, Any]] = []
-    errors: list[str] = []
     try:
-        for ticker in tickers:
-            symbol = str(ticker.get('symbol', '')).upper()
-            tag = str(ticker.get('tag', '')).lower()
-            if not symbol.startswith('PF_') or tag != 'perpetual' or bool(ticker.get('suspended', False)):
+        # Route A: Bitvavo USDC spot + Kraken perpetual.
+        for base, spot_market in sorted(usdc_markets.items()):
+            future = futures_by_base.get(base)
+            if future is None:
                 continue
+            rows.append(_build_row(
+                future=future,
+                route_id=f'BITVAVO_USDC_{base}',
+                route_type='BITVAVO_USDC_KRAKEN_PERP',
+                spot_market=spot_market,
+                spot_reference=float(future['index']),
+                spot_spread_pct=0.0,
+                roundtrip_buffer_pct=TOTAL_ROUNDTRIP_BUFFER_PCT,
+                conn=conn,
+                now_ms=now_ms,
+            ))
 
-            pair = str(ticker.get('pair', symbol)).upper()
-            base = _kraken_base(pair, symbol)
-            spot_market = usdc_markets.get(base)
-            if not spot_market:
+        # Route B: bestaand Kraken BTC/ETH-bezit + Kraken perpetual. Spot wordt niet opnieuw verhandeld.
+        for base in _native_holdings():
+            future = futures_by_base.get(base)
+            if future is None:
+                errors.append(f'Kraken native {base}: geen bruikbare perpetual')
                 continue
-
-            mark = _finite(ticker.get('markPrice'))
-            index = _finite(ticker.get('indexPrice'))
-            bid = _finite(ticker.get('bid'))
-            ask = _finite(ticker.get('ask'))
-            volume_quote = _finite(ticker.get('volumeQuote'))
-            open_interest = _finite(ticker.get('openInterest'))
-            if min(mark, index, bid, ask) <= 0 or ask < bid:
+            pair = KRAKEN_NATIVE_SPOT_PAIRS[base]
+            try:
+                spot = _fetch_kraken_spot_ticker(pair)
+            except Exception as exc:
+                errors.append(f'Kraken native {base}: {type(exc).__name__}: {exc}')
                 continue
+            rows.append(_build_row(
+                future=future,
+                route_id=f'KRAKEN_EXISTING_{base}',
+                route_type='KRAKEN_EXISTING_HOLDING',
+                spot_market=f'KRAKEN:{pair}',
+                spot_reference=float(spot['mid']),
+                spot_spread_pct=float(spot['spread_pct']),
+                roundtrip_buffer_pct=NATIVE_EXISTING_HOLDING_BUFFER_PCT,
+                conn=conn,
+                now_ms=now_ms,
+            ))
 
-            funding_hour_pct = _relative_funding_pct(_finite(ticker.get('fundingRate')), index)
-            predicted_hour_pct = _relative_funding_pct(_finite(ticker.get('fundingRatePrediction')), index)
-            if abs(funding_hour_pct) > MAX_ABS_FUNDING_HOUR_PCT or abs(predicted_hour_pct) > MAX_ABS_FUNDING_HOUR_PCT:
-                errors.append(f'{symbol}: funding buiten sanity-range')
-                continue
-
-            mid = (bid + ask) / 2.0
-            spread_pct = (ask - bid) / mid * 100.0 if mid > 0 else 999.0
-            basis_pct = _pct_change(mark, index)
-            history = _history_summary(conn, symbol, now_ms)
-            score, action, net_7d = _score_candidate(
-                funding_hour_pct=funding_hour_pct,
-                predicted_hour_pct=predicted_hour_pct,
-                spread_pct=spread_pct,
-                volume_quote=volume_quote,
-                basis_pct=basis_pct,
-                history=history,
-            )
-            rows.append({
-                'symbol': symbol,
-                'pair': pair,
-                'base': base,
-                'spot_market': spot_market,
-                'mark_price': mark,
-                'index_price': index,
-                'basis_pct': round(basis_pct, 5),
-                'funding_hour_pct': round(funding_hour_pct, 7),
-                'predicted_funding_hour_pct': round(predicted_hour_pct, 7),
-                'gross_funding_7d_snapshot_pct': round(max(0.0, funding_hour_pct) * 168.0, 4),
-                'net_7d_snapshot_pct': round(net_7d, 4),
-                'spread_pct': round(spread_pct, 5),
-                'volume_quote': round(volume_quote, 2),
-                'open_interest': round(open_interest, 4),
-                'score': score,
-                'action': action,
-            })
-
-        rows.sort(key=lambda row: (float(row['volume_quote']), float(row['open_interest'])), reverse=True)
-        rows = rows[:30]
         for row in rows:
             conn.execute(
                 '''INSERT OR REPLACE INTO snapshots
-                   (generated_ms,symbol,spot_market,funding_hour_pct,predicted_funding_hour_pct,
-                    basis_pct,spread_pct,volume_quote,open_interest)
-                   VALUES (?,?,?,?,?,?,?,?,?)''',
+                   (generated_ms,route_id,symbol,route_type,spot_market,roundtrip_buffer_pct,
+                    funding_hour_pct,predicted_funding_hour_pct,basis_pct,futures_spread_pct,
+                    volume_quote,open_interest)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (
-                    now_ms, row['symbol'], row['spot_market'], row['funding_hour_pct'],
-                    row['predicted_funding_hour_pct'], row['basis_pct'], row['spread_pct'],
-                    row['volume_quote'], row['open_interest'],
+                    now_ms, row['route_id'], row['symbol'], row['route_type'], row['spot_market'],
+                    row['roundtrip_buffer_pct'], row['funding_hour_pct'], row['predicted_funding_hour_pct'],
+                    row['basis_pct'], row['futures_spread_pct'], row['volume_quote'], row['open_interest'],
                 ),
             )
         conn.commit()
 
         for row in rows:
-            history = _history_summary(conn, str(row['symbol']), now_ms)
+            history = _history_summary(conn, str(row['route_id']), now_ms)
             score, action, net_7d = _score_candidate(
                 funding_hour_pct=float(row['funding_hour_pct']),
                 predicted_hour_pct=float(row['predicted_funding_hour_pct']),
-                spread_pct=float(row['spread_pct']),
+                spread_pct=float(row['futures_spread_pct']),
                 volume_quote=float(row['volume_quote']),
                 basis_pct=float(row['basis_pct']),
                 history=history,
+                roundtrip_buffer_pct=float(row['roundtrip_buffer_pct']),
             )
             row['samples_24h'] = int(history['samples_24h'])
             row['span_hours_24h'] = round(history['span_hours_24h'], 2)
@@ -312,32 +433,33 @@ def scan_once() -> dict[str, object]:
             row['score'] = score
             row['action'] = action
             row['net_7d_snapshot_pct'] = round(net_7d, 4)
-
-        rows.sort(
-            key=lambda row: (
-                2 if row['action'] == 'STERKE CARRY WATCH' else 1 if row['action'] == 'CARRY WATCH' else 0,
-                float(row['score']), float(row['net_7d_snapshot_pct']), float(row['volume_quote']),
-            ),
-            reverse=True,
-        )
     finally:
         conn.close()
 
+    def sort_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
+        action_rank = 2 if row['action'] == 'STERKE CARRY WATCH' else 1 if row['action'] == 'CARRY WATCH' else 0
+        return (action_rank, float(row['score']), float(row['net_7d_snapshot_pct']), float(row['volume_quote']))
+
+    rows.sort(key=sort_key, reverse=True)
+    cross_rows = [row for row in rows if row['route_type'] == 'BITVAVO_USDC_KRAKEN_PERP']
+    native_rows = [row for row in rows if row['route_type'] == 'KRAKEN_EXISTING_HOLDING']
     generated = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).isoformat()
     return {
-        'version': '2.0',
+        'version': '3.0',
         'mode': 'READ_ONLY_PUBLIC_DATA',
         'generated_at_ms': now_ms,
         'generated_at_utc': generated,
-        'source': 'Kraken Futures + Bitvavo public markets',
-        'roundtrip_buffer_pct': TOTAL_ROUNDTRIP_BUFFER_PCT,
+        'source': 'Kraken Futures + Kraken Spot + Bitvavo public markets',
         'bitvavo_usdc_markets': len(usdc_markets),
-        'eligible_perpetuals': len(rows),
+        'cross_exchange_routes': len(cross_rows),
+        'native_existing_routes': len(native_rows),
+        'native_holdings_configured': list(_native_holdings()),
         'watch_count': sum(1 for row in rows if 'CARRY WATCH' in str(row['action'])),
         'top5': rows[:5],
-        'candidates': rows,
+        'cross_exchange': cross_rows,
+        'kraken_existing_holdings': native_rows,
         'errors': errors,
-        'note': 'Alleen Kraken perpetuals met een echte Bitvavo-USDC spothedge; geen orders.',
+        'note': 'Native Kraken-route veronderstelt bestaand BTC/ETH-bezit: spot wordt niet opnieuw verhandeld; geen orders.',
     }
 
 
@@ -360,50 +482,68 @@ def _load_report() -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
+def _print_row(index: int, row: dict[str, Any]) -> None:
+    route = 'KRAKEN BESTAAND' if row.get('route_type') == 'KRAKEN_EXISTING_HOLDING' else 'BITVAVO↔KRAKEN'
+    print(
+        f"{index}. {str(row.get('base','?')):5s} | {route:15s} | {str(row.get('action','VERZAMELEN')):18s}"
+        f" | score {float(row.get('score',0.0)):5.1f}/100"
+    )
+    print(
+        f"   funding {float(row.get('funding_hour_pct',0.0)):+.6f}%/u"
+        f" | voorspeld {float(row.get('predicted_funding_hour_pct',0.0)):+.6f}%/u"
+        f" | basis {float(row.get('basis_pct',0.0)):+.3f}%"
+        f" | fut.spread {float(row.get('futures_spread_pct',0.0)):.3f}%"
+    )
+    print(
+        f"   buffer {float(row.get('roundtrip_buffer_pct',0.0)):.2f}%"
+        f" | 7d snapshot netto {float(row.get('net_7d_snapshot_pct',0.0)):+.2f}%"
+        f" | positief24h {float(row.get('positive_share_24h_pct',0.0)):.1f}%"
+        f" | samples {int(row.get('samples_24h',0))} | span {float(row.get('span_hours_24h',0.0)):.1f}u"
+    )
+
+
 def print_report(report: dict[str, object]) -> None:
-    print('=== FUNDING / BASIS MONITOR v2 | READ ONLY ===')
-    print(f"UTC             : {report.get('generated_at_utc', 'n/a')}")
-    print(f"USDC SPOTMARKTEN: {report.get('bitvavo_usdc_markets', 0)}")
-    print(f"HEDGE-PAIRS     : {report.get('eligible_perpetuals', 0)}")
-    print(f"CARRY WATCH     : {report.get('watch_count', 0)}")
-    print(f"KOSTENBUFFER    : {float(report.get('roundtrip_buffer_pct', 0.0)):.2f}% roundtrip")
-    print('ORDERS          : ONMOGELIJK | alleen publieke marktdata')
+    print('=== FUNDING / BASIS MONITOR v3 | READ ONLY ===')
+    print(f"UTC                 : {report.get('generated_at_utc', 'n/a')}")
+    print(f"BITVAVO USDC ROUTES : {report.get('cross_exchange_routes', 0)}")
+    print(f"KRAKEN BESTAAND     : {report.get('native_existing_routes', 0)}")
+    print(f"NATIVE WATCHLIST    : {', '.join(str(x) for x in report.get('native_holdings_configured', []))}")
+    print(f"CARRY WATCH         : {report.get('watch_count', 0)}")
+    print('ORDERS              : ONMOGELIJK | alleen publieke marktdata')
+
+    native = report.get('kraken_existing_holdings', [])
     print()
-    print('=== TOP 5 ===')
-    top5 = report.get('top5', [])
-    if not isinstance(top5, list) or not top5:
-        print('geen hedge-paren')
+    print('=== KRAKEN BESTAAND BTC/ETH ===')
+    if not isinstance(native, list) or not native:
+        print('geen native routes')
     else:
-        for index, row in enumerate(top5, 1):
-            if not isinstance(row, dict):
-                continue
-            print(
-                f"{index}. {str(row.get('symbol','?')):12s} + {str(row.get('spot_market','?')):12s}"
-                f" | {str(row.get('action','VERZAMELEN')):18s} | score {float(row.get('score',0.0)):5.1f}/100"
-            )
-            print(
-                f"   funding {float(row.get('funding_hour_pct',0.0)):+.6f}%/u"
-                f" | voorspeld {float(row.get('predicted_funding_hour_pct',0.0)):+.6f}%/u"
-                f" | basis {float(row.get('basis_pct',0.0)):+.3f}% | spread {float(row.get('spread_pct',0.0)):.3f}%"
-            )
-            print(
-                f"   7d snapshot netto {float(row.get('net_7d_snapshot_pct',0.0)):+.2f}%"
-                f" | positief24h {float(row.get('positive_share_24h_pct',0.0)):.1f}%"
-                f" | samples {int(row.get('samples_24h',0))} | span {float(row.get('span_hours_24h',0.0)):.1f}u"
-            )
+        for index, row in enumerate(native, 1):
+            if isinstance(row, dict):
+                _print_row(index, row)
+
+    cross = report.get('cross_exchange', [])
+    print()
+    print('=== BESTE BITVAVO USDC ↔ KRAKEN ===')
+    if not isinstance(cross, list) or not cross:
+        print('geen cross-exchange routes')
+    else:
+        for index, row in enumerate(cross[:5], 1):
+            if isinstance(row, dict):
+                _print_row(index, row)
+
     errors = report.get('errors', [])
     if isinstance(errors, list) and errors:
         print()
-        print(f'WAARSCHUWINGEN   : {len(errors)}')
+        print(f'WAARSCHUWINGEN       : {len(errors)}')
         for text in errors[:5]:
             print(f'  - {text}')
     print()
-    print('LET OP: funding is relatief %/uur (absolute Kraken-rate gedeeld door indexprijs).')
+    print('LET OP: native route rekent alleen futures hedge-kosten omdat BTC/ETH al bestaan op Kraken.')
     print('CARRY WATCH vereist historie; snapshotrendement is geen garantie.')
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Funding/Basis Monitor v2 - read only')
+    parser = argparse.ArgumentParser(description='Funding/Basis Monitor v3 - read only')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--status', action='store_true')
     args = parser.parse_args()
@@ -412,7 +552,7 @@ def main() -> int:
     if args.status:
         report = _load_report()
         if report is None:
-            print('=== FUNDING / BASIS MONITOR v2 | READ ONLY ===')
+            print('=== FUNDING / BASIS MONITOR v3 | READ ONLY ===')
             print('STATUS          : nog geen rapport')
             print(f'RAPPORT         : {_report_path()}')
             return 1
