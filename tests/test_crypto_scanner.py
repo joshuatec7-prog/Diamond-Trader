@@ -1,6 +1,8 @@
 import unittest
+from types import SimpleNamespace
 
 from crypto_scanner import _direction_score, _sideways_score
+from crypto_scanner_v2 import _grade_action, _roundtrip_cost_pct, _taker_fee_pct
 
 
 class CryptoScannerTests(unittest.TestCase):
@@ -34,6 +36,23 @@ class CryptoScannerTests(unittest.TestCase):
         }
         score = _sideways_score(band_metrics, 3.0, 0.78, 0.05, 0.40)
         self.assertLessEqual(score, 70.0)
+        self.assertEqual(_grade_action('SIDEWAYS', 'LONG', 99.0, 9.0, 0.01), 'GEEN TRADE')
+
+    def test_usdc_fee_is_materially_lower_than_eur(self):
+        settings = SimpleNamespace(slippage_pct=0.08)
+        eur = _roundtrip_cost_pct(settings, 0.12, 'EUR')
+        usdc = _roundtrip_cost_pct(settings, 0.12, 'USDC')
+        self.assertEqual(_taker_fee_pct('EUR'), 0.25)
+        self.assertEqual(_taker_fee_pct('USDC'), 0.05)
+        self.assertAlmostEqual(eur, 0.78)
+        self.assertAlmostEqual(usdc, 0.38)
+        self.assertLess(usdc, eur)
+
+    def test_trade_grade_requires_three_times_cost_room(self):
+        self.assertEqual(_grade_action('BULL', 'LONG', 85.0, 3.2, 0.10), 'LONG TRADE-GRADE')
+        self.assertEqual(_grade_action('BEAR', 'SHORT', 85.0, 3.2, 0.10), 'SHORT TRADE-GRADE')
+        self.assertEqual(_grade_action('BULL', 'LONG', 85.0, 2.9, 0.10), 'LONG WATCH')
+        self.assertNotIn('TRADE-GRADE', _grade_action('BULL', 'SKIP', 95.0, 5.0, 0.01))
 
 
 if __name__ == '__main__':
