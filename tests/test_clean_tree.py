@@ -13,7 +13,7 @@ class TreeTests(unittest.TestCase):
             'audit_all.py','auto_research_controller.py','auto_research_controller_d2.py','backtest.py','bitvavo_public.py','config.py',
             'continuation_main.py','continuation_strategy.py','continuation_v2_main.py',
             'continuation_v3_main.py','continuation_v4_main.py','continuation_v5_main.py',
-            'continuation_v6_main.py','crypto_scanner.py','exit_capture_lab.py','exit_capture_1m_lab.py','low_frequency_lab.py','main.py','market_data.py','models.py','missed_trade_audit.py',
+            'continuation_v6_main.py','crypto_scanner.py','crypto_scanner_v2.py','exit_capture_lab.py','exit_capture_1m_lab.py','funding_basis_monitor.py','low_frequency_lab.py','main.py','market_data.py','models.py','missed_trade_audit.py',
             'offline_check.py','paper_trader.py','profit_protect_trader.py','readiness.py',
             'regime_strategy_lab.py','report.py','requirements.txt','research_report_publisher.py','signal_excursion_lab.py','staged_runner_trader.py',
             'start.sh','status.py','storage.py','strategy.py','supervisor.py','trend_main.py',
