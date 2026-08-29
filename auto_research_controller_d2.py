@@ -6,35 +6,39 @@ import time
 
 import auto_research_controller as base
 from adaptive_ls_main import adaptive_v2_db_path
+from adaptive_ls_strict_main import strict_db_path
 from config import Settings
 
 logger = logging.getLogger('cryptobot_auto_research_controller_d2')
 STRATEGY_D2 = 'D_ADAPTIVE_LONG_SHORT_V2'
+STRATEGY_D2S = 'D_ADAPTIVE_LONG_SHORT_STRICT'
 _BASE_RECOMMENDATION = base._recommendation
 
 
 def _sources(settings: Settings) -> dict[str, str]:
     result = base._default_sources(settings)
     result[STRATEGY_D2] = adaptive_v2_db_path(settings.db_path)
+    result[STRATEGY_D2S] = strict_db_path(settings.db_path)
     return result
 
 
 def _recommendation(strategy: str, snapshot: dict, rebound_1h: dict) -> str:
-    if strategy != STRATEGY_D2:
+    if strategy not in {STRATEGY_D2, STRATEGY_D2S}:
         return _BASE_RECOMMENDATION(strategy, snapshot, rebound_1h)
     if snapshot.get('missing'):
         return 'WACHT | bronbestand ontbreekt'
     if snapshot['data_status'] not in base.HEALTHY_DATA_STATUSES:
         return f"WACHT | data-status {snapshot['data_status']}"
     closed = int(snapshot['closed_trades'])
+    label = 'D v2S strict' if strategy == STRATEGY_D2S else 'D v2'
     if closed < 10:
-        return f'VERZAMELEN | gesloten trades {closed}/10'
+        return f'VERZAMELEN | {label} gesloten trades {closed}/10'
     if closed < 20:
-        return f'VERZAMELEN | gesloten trades {closed}/20 voor LONG/SHORT beoordeling'
+        return f'VERZAMELEN | {label} gesloten trades {closed}/20 voor vergelijking'
     pf = snapshot['profit_factor']
     if not snapshot['profit_factor_infinite'] and pf is not None and float(pf) < 0.80:
-        return 'REVIEW | D v2 prestaties zwak; geen automatische wijziging'
-    return 'HOLD | D v2 heeft 20+ trades; LONG/SHORT resultaat handmatig vergelijken'
+        return f'REVIEW | {label} prestaties zwak; geen automatische wijziging'
+    return f'HOLD | {label} heeft 20+ trades; handmatig vergelijken'
 
 
 def run_once(settings: Settings) -> dict:
@@ -46,7 +50,7 @@ def run_once(settings: Settings) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Research controller A/B/C/Dv1/Dv2 PAPER')
+    parser = argparse.ArgumentParser(description='Research controller A/B/C/Dv1/Dv2/Dv2S PAPER')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--report', action='store_true')
     args = parser.parse_args()
@@ -69,7 +73,7 @@ def main() -> int:
         base.print_report(run_once(settings))
         return 0
 
-    logger.info('gestart | %s | A/B/C/Dv1/Dv2 | auto_modify=NEE | auto_deploy=NEE', base.MODE)
+    logger.info('gestart | %s | A/B/C/Dv1/Dv2/Dv2S | auto_modify=NEE | auto_deploy=NEE', base.MODE)
     while True:
         started = time.monotonic()
         try:
