@@ -15,7 +15,7 @@ class TreeTests(unittest.TestCase):
             'continuation_v3_main.py','continuation_v4_main.py','continuation_v5_main.py',
             'continuation_v6_main.py','main.py','market_data.py','models.py','missed_trade_audit.py',
             'offline_check.py','paper_trader.py','profit_protect_trader.py','readiness.py',
-            'report.py','requirements.txt','research_report_publisher.py','staged_runner_trader.py',
+            'regime_strategy_lab.py','report.py','requirements.txt','research_report_publisher.py','staged_runner_trader.py',
             'start.sh','status.py','storage.py','strategy.py','supervisor.py','trend_main.py',
             'trend_strategy.py','trend_v3_main.py','trend_v4_main.py','trend_v5_main.py',
             'trend_v6_main.py','trend_v7_main.py','tests'
