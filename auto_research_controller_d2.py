@@ -10,6 +10,7 @@ from config import Settings
 
 logger = logging.getLogger('cryptobot_auto_research_controller_d2')
 STRATEGY_D2 = 'D_ADAPTIVE_LONG_SHORT_V2'
+_BASE_RECOMMENDATION = base._recommendation
 
 
 def _sources(settings: Settings) -> dict[str, str]:
@@ -20,7 +21,7 @@ def _sources(settings: Settings) -> dict[str, str]:
 
 def _recommendation(strategy: str, snapshot: dict, rebound_1h: dict) -> str:
     if strategy != STRATEGY_D2:
-        return base._recommendation(strategy, snapshot, rebound_1h)
+        return _BASE_RECOMMENDATION(strategy, snapshot, rebound_1h)
     if snapshot.get('missing'):
         return 'WACHT | bronbestand ontbreekt'
     if snapshot['data_status'] not in base.HEALTHY_DATA_STATUSES:
@@ -37,12 +38,11 @@ def _recommendation(strategy: str, snapshot: dict, rebound_1h: dict) -> str:
 
 
 def run_once(settings: Settings) -> dict:
-    original = base._recommendation
     base._recommendation = _recommendation
     try:
         return base.run_once(settings, source_paths=_sources(settings))
     finally:
-        base._recommendation = original
+        base._recommendation = _BASE_RECOMMENDATION
 
 
 def main() -> int:
