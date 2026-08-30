@@ -9,6 +9,33 @@ Clean-room crypto trading research project for Bitvavo public EUR market data.
 - Geen echte orderfunctie.
 - Geen bestaande Bitvavo-balansen worden gebruikt.
 
+## Nieuwe read-only onderzoekslaag
+
+`crypto_scanner_v2.py` blijft de strenge scanner voor zeldzame handmatige kansen. Daarnaast draait nu
+`crypto_research_v4.py`: een trage, prospectieve schaduwtest die uitsluitend BTC-USDC en ETH-USDC volgt.
+
+V4 bevriest iedere zondag om 00:00 UTC één beslissing voor de hele week:
+
+- alleen een long-schaduwpositie wanneer de laatste volledige dagslotkoers boven SMA65 ligt;
+- anders blijft dat deel in USDC-cash;
+- actieve munten krijgen een gelijk basisgewicht;
+- bij een gemiddelde 20-daagse gerealiseerde volatiliteit boven 80% wordt de totale blootstelling verlaagd;
+- geen short, leverage, tussentijdse herweging of echte orderfunctie.
+
+De database vergelijkt v4 vanaf de start met USDC-cash, 50/50 BTC/ETH buy-and-hold en wekelijkse DCA.
+Ook worden 2x- en 3x-kostenstresstests bijgehouden. Een eerste oordeel volgt pas na minimaal 26 volledige weken.
+
+Controle:
+
+```bash
+python3 crypto_research_v4.py --status
+```
+
+`funding_basis_monitor.py` blijft versie 3, maar vereist nu minimaal 72 uur stabiele historie voor een
+`CARRY WATCH`. Het rapport toont daarnaast 30- en 90-daagse gemiddelden, tekenwisselingen, fundingverval,
+2x transactiekosten, een ongunstige basisschok van 1% en een expliciete waarschuwing dat marge- en
+beursrisico altijd handmatig moeten worden beoordeeld.
+
 ## Runtime
 
 - Interval: 15 minuten.
@@ -52,3 +79,4 @@ python3 trend_main.py --report
 ```
 
 Alle runtime-processen worden gestart en bewaakt door `supervisor.py` via `start.sh`.
+

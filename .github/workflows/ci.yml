@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - clean-room-20260826
+      - main
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -20,3 +22,4 @@ jobs:
       - run: python -c "from config import Settings; Settings().validate(); print('config OK')"
       - run: python offline_check.py
       - run: DB_PATH=/tmp/cleanroom-ci.db python readiness.py
+
