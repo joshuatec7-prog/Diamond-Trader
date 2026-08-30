@@ -186,6 +186,15 @@ def _pair_snapshot(
     }
 
 
+def _display_action(action: object) -> str:
+    text = str(action or 'GEEN TRADE')
+    if text == 'LONG TRADE-GRADE':
+        return 'ZELDZAME KANS LONG'
+    if text == 'SHORT TRADE-GRADE':
+        return 'ZELDZAME KANS SHORT'
+    return text
+
+
 def _rank_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
     action = str(row.get('action', ''))
     grade = 2.0 if 'TRADE-GRADE' in action else 1.0 if 'WATCH' in action else 0.0
@@ -300,6 +309,8 @@ def scan_once(settings: Settings) -> dict[str, object]:
         'usdc_available_for_reference_assets': usdc_available,
         'trade_grade_count': len(trade_grade),
         'trade_grade': trade_grade,
+        'rare_opportunity_count': len(trade_grade),
+        'rare_opportunities': trade_grade,
         'top3': chosen[:3],
         'candidates': chosen,
         'all_pair_snapshots': all_pairs,
@@ -311,7 +322,7 @@ def scan_once(settings: Settings) -> dict[str, object]:
             'eur_taker_fee_pct': EUR_TAKER_FEE_PCT,
             'usdc_taker_fee_pct': USDC_TAKER_FEE_PCT,
         },
-        'note': 'Technische scanner; TRADE-GRADE is researchlabel, geen bewezen winstverwachting en opent geen orders.',
+        'note': 'Zeldzame kansen zijn een strenge beslisfilter, geen koop- of verkoopadvies. De scanner opent nooit orders.',
     }
 
 
@@ -342,10 +353,32 @@ def print_report(report: dict[str, object]) -> None:
     print(f"BEAR BREADTH    : {float(report.get('bear_breadth_pct', 0.0)):.1f}%")
     print(f"MARKTEN GELDIG  : {report.get('valid_reference_markets', 0)}/{len(report.get('reference_universe', []))}")
     print(f"USDC BESCHIKBAAR: {report.get('usdc_available_for_reference_assets', 0)}/{len(report.get('reference_universe', []))}")
-    print(f"TRADE-GRADE     : {report.get('trade_grade_count', 0)}")
-    print('ORDERS          : ONMOGELIJK | scanner heeft geen private trading-capability')
+    print(f"ZELDZAME KANSEN : {report.get('rare_opportunity_count', report.get('trade_grade_count', 0))}")
+    print('BESLISSING       : ALTIJD ZELF | dit is geen koop- of verkoopadvies')
+    print('ORDERS           : ONMOGELIJK | scanner heeft geen private trading-capability')
     print()
-    print('=== TOP 3 ===')
+    print('=== ZELDZAME KANSEN — ZELF BESLISSEN ===')
+    rare = report.get('rare_opportunities', report.get('trade_grade', []))
+    if not isinstance(rare, list) or not rare:
+        print('geen uitzonderlijke kans; niets doen is nu de standaard')
+    else:
+        for index, row in enumerate(rare, 1):
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"{index}. {str(row.get('market','?')):12s} | {_display_action(row.get('action'))}"
+                f" | score {float(row.get('score',0.0)):.1f}/100"
+                f" | xkosten {float(row.get('cost_multiple',0.0)):.2f}"
+                f" | spread {float(row.get('spread_pct',0.0)):.3f}%"
+            )
+            print(
+                f"   besliszone {_fmt_price(row.get('entry_zone_low'))} - {_fmt_price(row.get('entry_zone_high'))}"
+                f" | ongeldig onder/boven {_fmt_price(row.get('stop_hint'))}"
+                f" | technisch doel {_fmt_price(row.get('target_hint'))}"
+            )
+            print('   controleer zelf: actueel nieuws, orderboek, positieomvang en of de koers nog in de besliszone ligt')
+    print()
+    print('=== TOP 3 OBSERVATIES ===')
     top3 = report.get('top3', [])
     if not isinstance(top3, list) or not top3:
         print('geen kandidaten')
@@ -354,7 +387,7 @@ def print_report(report: dict[str, object]) -> None:
             if not isinstance(row, dict):
                 continue
             print(
-                f"{index}. {str(row.get('market','?')):12s} | {str(row.get('action','GEEN TRADE')):18s}"
+                f"{index}. {str(row.get('market','?')):12s} | {_display_action(row.get('action')):20s}"
                 f" | score {float(row.get('score',0.0)):5.1f}/100"
                 f" | kosten {float(row.get('roundtrip_cost_pct',0.0)):.2f}%"
                 f" | beweging {float(row.get('movement_proxy_pct',0.0)):.2f}%"
@@ -375,7 +408,7 @@ def print_report(report: dict[str, object]) -> None:
         for text in errors[:5]:
             print(f'  - {text}')
     print()
-    print('LET OP: TRADE-GRADE = strenge researchselectie, geen bewezen winstverwachting.')
+    print('LET OP: een ZELDZAME KANS is een strenge beslisfilter, geen bewezen winstverwachting.')
 
 
 def main() -> int:
