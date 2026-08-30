@@ -36,9 +36,10 @@ NATIVE_EXISTING_HOLDING_BUFFER_PCT = 2.0 * FUTURES_TAKER_FEE_PCT + 0.10
 
 MIN_VOLUME_QUOTE_USD = 1_000_000.0
 MAX_FUTURES_SPREAD_PCT = 0.12
-MIN_HISTORY_SAMPLES = 48
-MIN_HISTORY_SPAN_HOURS = 10.0
 MIN_POSITIVE_SHARE = 0.75
+MIN_WATCH_SAMPLES_72H = 144
+MIN_WATCH_SPAN_HOURS = 71.5
+HISTORY_RETENTION_DAYS = 100
 MAX_ABS_FUNDING_HOUR_PCT = 0.50
 BASE_ALIASES = {'XBT': 'BTC', 'XDG': 'DOGE'}
 KRAKEN_NATIVE_SPOT_PAIRS = {'BTC': 'XBTUSD', 'ETH': 'ETHUSD'}
@@ -47,7 +48,7 @@ DEFAULT_NATIVE_HOLDINGS = ('BTC', 'ETH')
 
 def _data_path(filename: str) -> Path:
     data = Path('/var/data')
-    if data.exists() and os.access(data, os.W_OK):
+    if os.name != 'nt' and data.exists() and os.access(data, os.W_OK):
         return data / filename
     return Path('data') / filename
 
@@ -190,10 +191,40 @@ def _db_connect() -> sqlite3.Connection:
     return conn
 
 
+def _window_history(rows: list[tuple[Any, ...]], cutoff_ms: int, suffix: str) -> dict[str, float]:
+    selected = [row for row in rows if int(row[0]) >= cutoff_ms]
+    if not selected:
+        return {
+            f'samples_{suffix}': 0.0,
+            f'span_hours_{suffix}': 0.0,
+            f'positive_share_{suffix}': 0.0,
+            f'avg_funding_hour_pct_{suffix}': 0.0,
+            f'sign_flips_{suffix}': 0.0,
+            f'avg_basis_pct_{suffix}': 0.0,
+            f'min_basis_pct_{suffix}': 0.0,
+            f'max_basis_pct_{suffix}': 0.0,
+        }
+    funding = [float(row[1]) for row in selected]
+    basis = [float(row[2]) for row in selected]
+    nonzero_signs = [1 if value > 0.0 else -1 for value in funding if value != 0.0]
+    sign_flips = sum(1 for left, right in zip(nonzero_signs, nonzero_signs[1:]) if left != right)
+    span_hours = (int(selected[-1][0]) - int(selected[0][0])) / 3_600_000.0 if len(selected) > 1 else 0.0
+    return {
+        f'samples_{suffix}': float(len(selected)),
+        f'span_hours_{suffix}': span_hours,
+        f'positive_share_{suffix}': sum(1 for value in funding if value > 0.0) / len(funding),
+        f'avg_funding_hour_pct_{suffix}': sum(funding) / len(funding),
+        f'sign_flips_{suffix}': float(sign_flips),
+        f'avg_basis_pct_{suffix}': sum(basis) / len(basis),
+        f'min_basis_pct_{suffix}': min(basis),
+        f'max_basis_pct_{suffix}': max(basis),
+    }
+
+
 def _history_summary(conn: sqlite3.Connection, route_id: str, now_ms: int) -> dict[str, float]:
-    cutoff = now_ms - 24 * 60 * 60 * 1000
+    cutoff = now_ms - 90 * 24 * 60 * 60 * 1000
     rows = conn.execute(
-        '''SELECT generated_ms, funding_hour_pct
+        '''SELECT generated_ms, funding_hour_pct, basis_pct
            FROM snapshots WHERE route_id=? AND generated_ms>=? ORDER BY generated_ms''',
         (route_id, cutoff),
     ).fetchall()
@@ -203,15 +234,62 @@ def _history_summary(conn: sqlite3.Connection, route_id: str, now_ms: int) -> di
             'span_hours_24h': 0.0,
             'positive_share_24h': 0.0,
             'avg_funding_hour_pct_24h': 0.0,
+            'samples_72h': 0.0,
+            'span_hours_72h': 0.0,
+            'positive_share_72h': 0.0,
+            'avg_funding_hour_pct_72h': 0.0,
+            'funding_decay_ratio_24h_vs_72h': 0.0,
         }
-    funding = [float(row[1]) for row in rows]
-    span_hours = (int(rows[-1][0]) - int(rows[0][0])) / 3_600_000.0 if len(rows) > 1 else 0.0
-    return {
-        'samples_24h': float(len(rows)),
-        'span_hours_24h': span_hours,
-        'positive_share_24h': sum(1 for value in funding if value > 0.0) / len(funding),
-        'avg_funding_hour_pct_24h': sum(funding) / len(funding),
+    result: dict[str, float] = {}
+    windows = {
+        '24h': 24 * 60 * 60 * 1000,
+        '72h': 72 * 60 * 60 * 1000,
+        '30d': 30 * 24 * 60 * 60 * 1000,
+        '90d': 90 * 24 * 60 * 60 * 1000,
     }
+    for suffix, duration_ms in windows.items():
+        result.update(_window_history(rows, now_ms - duration_ms, suffix))
+    avg_24h = result['avg_funding_hour_pct_24h']
+    avg_72h = result['avg_funding_hour_pct_72h']
+    result['funding_decay_ratio_24h_vs_72h'] = avg_24h / avg_72h if avg_72h > 0.0 else 0.0
+    result['history_age_hours'] = (now_ms - int(rows[0][0])) / 3_600_000.0
+    return result
+
+
+def _stress_metrics(
+    *,
+    average_funding_hour_pct: float,
+    roundtrip_buffer_pct: float,
+) -> dict[str, float]:
+    gross = max(0.0, average_funding_hour_pct) * 24.0 * 7.0
+    return {
+        'gross_7d_historical_pct': gross,
+        'net_7d_historical_pct': gross - roundtrip_buffer_pct,
+        'net_7d_cost_stress_2x_pct': gross - 2.0 * roundtrip_buffer_pct,
+        'net_7d_basis_shock_1pct_pct': gross - roundtrip_buffer_pct - 1.0,
+    }
+
+
+def _attach_history(row: dict[str, Any], history: dict[str, float]) -> None:
+    for suffix in ('24h', '72h', '30d', '90d'):
+        row[f'samples_{suffix}'] = int(history.get(f'samples_{suffix}', 0.0))
+        row[f'span_hours_{suffix}'] = round(history.get(f'span_hours_{suffix}', 0.0), 2)
+        row[f'positive_share_{suffix}_pct'] = round(history.get(f'positive_share_{suffix}', 0.0) * 100.0, 1)
+        row[f'avg_funding_hour_pct_{suffix}'] = round(history.get(f'avg_funding_hour_pct_{suffix}', 0.0), 7)
+        row[f'sign_flips_{suffix}'] = int(history.get(f'sign_flips_{suffix}', 0.0))
+        row[f'avg_basis_pct_{suffix}'] = round(history.get(f'avg_basis_pct_{suffix}', 0.0), 5)
+        row[f'min_basis_pct_{suffix}'] = round(history.get(f'min_basis_pct_{suffix}', 0.0), 5)
+        row[f'max_basis_pct_{suffix}'] = round(history.get(f'max_basis_pct_{suffix}', 0.0), 5)
+    row['history_age_hours'] = round(history.get('history_age_hours', 0.0), 2)
+    row['funding_decay_ratio_24h_vs_72h'] = round(
+        history.get('funding_decay_ratio_24h_vs_72h', 0.0), 3
+    )
+    stress = _stress_metrics(
+        average_funding_hour_pct=float(history.get('avg_funding_hour_pct_72h', 0.0)),
+        roundtrip_buffer_pct=float(row.get('roundtrip_buffer_pct', TOTAL_ROUNDTRIP_BUFFER_PCT)),
+    )
+    for name, value in stress.items():
+        row[name] = round(value, 4)
 
 
 def _score_candidate(
@@ -226,10 +304,15 @@ def _score_candidate(
 ) -> tuple[float, str, float]:
     gross_7d_pct = max(0.0, funding_hour_pct) * 24.0 * 7.0
     net_7d_snapshot_pct = gross_7d_pct - roundtrip_buffer_pct
-    samples = int(history.get('samples_24h', 0.0))
-    span_hours = float(history.get('span_hours_24h', 0.0))
-    positive_share = float(history.get('positive_share_24h', 0.0))
-    avg_24h = float(history.get('avg_funding_hour_pct_24h', 0.0))
+    samples = int(history.get('samples_72h', 0.0))
+    span_hours = float(history.get('span_hours_72h', 0.0))
+    positive_share = float(history.get('positive_share_72h', 0.0))
+    avg_72h = float(history.get('avg_funding_hour_pct_72h', 0.0))
+    decay_ratio = float(history.get('funding_decay_ratio_24h_vs_72h', 0.0))
+    stress = _stress_metrics(
+        average_funding_hour_pct=avg_72h,
+        roundtrip_buffer_pct=roundtrip_buffer_pct,
+    )
 
     score = 0.0
     if funding_hour_pct > 0.0:
@@ -241,24 +324,26 @@ def _score_candidate(
     score += 10.0 if spread_pct <= 0.05 else 5.0 if spread_pct <= MAX_FUTURES_SPREAD_PCT else 0.0
     if basis_pct > 0.0:
         score += min(5.0, basis_pct / 0.5 * 5.0)
-    if samples >= MIN_HISTORY_SAMPLES and span_hours >= MIN_HISTORY_SPAN_HOURS:
+    if samples >= MIN_WATCH_SAMPLES_72H and span_hours >= MIN_WATCH_SPAN_HOURS:
         score += min(10.0, positive_share * 10.0)
     score = round(max(0.0, min(100.0, score)), 1)
 
-    stable_history = samples >= MIN_HISTORY_SAMPLES and span_hours >= MIN_HISTORY_SPAN_HOURS
+    stable_history = samples >= MIN_WATCH_SAMPLES_72H and span_hours >= MIN_WATCH_SPAN_HOURS
     action = 'VERZAMELEN'
     if (
         stable_history
         and funding_hour_pct > 0.0
         and predicted_hour_pct > 0.0
-        and avg_24h > 0.0
+        and avg_72h > 0.0
         and positive_share >= MIN_POSITIVE_SHARE
-        and net_7d_snapshot_pct > 0.50
+        and stress['net_7d_historical_pct'] > 0.50
+        and stress['net_7d_cost_stress_2x_pct'] > 0.0
+        and decay_ratio >= 0.50
         and volume_quote >= MIN_VOLUME_QUOTE_USD
         and spread_pct <= MAX_FUTURES_SPREAD_PCT
     ):
         action = 'CARRY WATCH'
-    if action == 'CARRY WATCH' and net_7d_snapshot_pct >= 1.00 and positive_share >= 0.80:
+    if action == 'CARRY WATCH' and stress['net_7d_historical_pct'] >= 1.00 and positive_share >= 0.80:
         action = 'STERKE CARRY WATCH'
     return score, action, net_7d_snapshot_pct
 
@@ -282,7 +367,7 @@ def _future_record(ticker: dict[str, Any]) -> dict[str, Any] | None:
         return None
     mid = (bid + ask) / 2.0
     spread_pct = (ask - bid) / mid * 100.0 if mid > 0 else 999.0
-    return {
+    row = {
         'symbol': symbol,
         'pair': pair,
         'base': base,
@@ -294,6 +379,7 @@ def _future_record(ticker: dict[str, Any]) -> dict[str, Any] | None:
         'volume_quote': _finite(ticker.get('volumeQuote')),
         'open_interest': _finite(ticker.get('openInterest')),
     }
+    return row
 
 
 def _build_row(
@@ -319,7 +405,7 @@ def _build_row(
         history=history,
         roundtrip_buffer_pct=roundtrip_buffer_pct,
     )
-    return {
+    row = {
         'route_id': route_id,
         'route_type': route_type,
         'symbol': future['symbol'],
@@ -342,6 +428,8 @@ def _build_row(
         'score': score,
         'action': action,
     }
+    _attach_history(row, history)
+    return row
 
 
 def scan_once() -> dict[str, object]:
@@ -414,6 +502,9 @@ def scan_once() -> dict[str, object]:
                 ),
             )
         conn.commit()
+        retention_cutoff = now_ms - HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000
+        conn.execute('DELETE FROM snapshots WHERE generated_ms<?', (retention_cutoff,))
+        conn.commit()
 
         for row in rows:
             history = _history_summary(conn, str(row['route_id']), now_ms)
@@ -426,10 +517,7 @@ def scan_once() -> dict[str, object]:
                 history=history,
                 roundtrip_buffer_pct=float(row['roundtrip_buffer_pct']),
             )
-            row['samples_24h'] = int(history['samples_24h'])
-            row['span_hours_24h'] = round(history['span_hours_24h'], 2)
-            row['positive_share_24h_pct'] = round(history['positive_share_24h'] * 100.0, 1)
-            row['avg_funding_hour_pct_24h'] = round(history['avg_funding_hour_pct_24h'], 7)
+            _attach_history(row, history)
             row['score'] = score
             row['action'] = action
             row['net_7d_snapshot_pct'] = round(net_7d, 4)
@@ -445,7 +533,7 @@ def scan_once() -> dict[str, object]:
     native_rows = [row for row in rows if row['route_type'] == 'KRAKEN_EXISTING_HOLDING']
     generated = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).isoformat()
     return {
-        'version': '3.0',
+        'version': '3.1',
         'mode': 'READ_ONLY_PUBLIC_DATA',
         'generated_at_ms': now_ms,
         'generated_at_utc': generated,
@@ -459,7 +547,8 @@ def scan_once() -> dict[str, object]:
         'cross_exchange': cross_rows,
         'kraken_existing_holdings': native_rows,
         'errors': errors,
-        'note': 'Native Kraken-route veronderstelt bestaand BTC/ETH-bezit: spot wordt niet opnieuw verhandeld; geen orders.',
+        'risk_check': 'MARGE EN BEURSRISICO NIET BEOORDEELD | altijd handmatig controleren',
+        'note': 'CARRY WATCH vereist minimaal 72 uur stabiele historie en blijft een handmatige onderzoekskans; geen orders.',
     }
 
 
@@ -500,6 +589,25 @@ def _print_row(index: int, row: dict[str, Any]) -> None:
         f" | positief24h {float(row.get('positive_share_24h_pct',0.0)):.1f}%"
         f" | samples {int(row.get('samples_24h',0))} | span {float(row.get('span_hours_24h',0.0)):.1f}u"
     )
+    print(
+        f"   gem.72u {float(row.get('avg_funding_hour_pct_72h',0.0)):+.6f}%/u"
+        f" | positief72u {float(row.get('positive_share_72h_pct',0.0)):.1f}%"
+        f" | span {float(row.get('span_hours_72h',0.0)):.1f}u"
+        f" | omslagen {int(row.get('sign_flips_72h',0))}"
+        f" | verval {float(row.get('funding_decay_ratio_24h_vs_72h',0.0)):.2f}x"
+    )
+    print(
+        f"   30d gem {float(row.get('avg_funding_hour_pct_30d',0.0)):+.6f}%/u"
+        f" ({float(row.get('span_hours_30d',0.0))/24.0:.1f}d)"
+        f" | 90d gem {float(row.get('avg_funding_hour_pct_90d',0.0)):+.6f}%/u"
+        f" ({float(row.get('span_hours_90d',0.0))/24.0:.1f}d)"
+    )
+    print(
+        f"   7d op gem.72u {float(row.get('net_7d_historical_pct',0.0)):+.2f}%"
+        f" | bij 2x kosten {float(row.get('net_7d_cost_stress_2x_pct',0.0)):+.2f}%"
+        f" | bij -1% basis {float(row.get('net_7d_basis_shock_1pct_pct',0.0)):+.2f}%"
+        f" | basis72u {float(row.get('min_basis_pct_72h',0.0)):+.2f}%..{float(row.get('max_basis_pct_72h',0.0)):+.2f}%"
+    )
 
 
 def print_report(report: dict[str, object]) -> None:
@@ -509,6 +617,8 @@ def print_report(report: dict[str, object]) -> None:
     print(f"KRAKEN BESTAAND     : {report.get('native_existing_routes', 0)}")
     print(f"NATIVE WATCHLIST    : {', '.join(str(x) for x in report.get('native_holdings_configured', []))}")
     print(f"CARRY WATCH         : {report.get('watch_count', 0)}")
+    print('HISTORIE-EIS        : minimaal 72 uur stabiel vóór een kanslabel')
+    print(f"MARGE / BEURSRISICO : {report.get('risk_check', 'NIET BEOORDEELD')}")
     print('ORDERS              : ONMOGELIJK | alleen publieke marktdata')
 
     native = report.get('kraken_existing_holdings', [])
@@ -539,7 +649,7 @@ def print_report(report: dict[str, object]) -> None:
             print(f'  - {text}')
     print()
     print('LET OP: native route rekent alleen futures hedge-kosten omdat BTC/ETH al bestaan op Kraken.')
-    print('CARRY WATCH vereist historie; snapshotrendement is geen garantie.')
+    print('CARRY WATCH vereist 72 uur historie, positieve 2x-kostenstress en handmatige risico-controle.')
 
 
 def main() -> int:
@@ -582,3 +692,4 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
