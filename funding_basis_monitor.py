@@ -14,16 +14,27 @@ from typing import Any
 
 import requests
 
-logger = logging.getLogger('cryptobot_funding_basis_v3')
+logger = logging.getLogger('cryptobot_funding_basis_v4')
 STOP = False
 
 KRAKEN_FUTURES_URL = 'https://futures.kraken.com/derivatives/api/v3'
 KRAKEN_SPOT_URL = 'https://api.kraken.com/0/public'
 BITVAVO_URL = 'https://api.bitvavo.com/v2'
+KRAKEN_FUTURES_BOOK_RESOURCE = 'orderbook'
 
 FUTURES_TAKER_FEE_PCT = 0.05
 BITVAVO_USDC_TAKER_FEE_PCT = 0.05
 CROSS_EXCHANGE_EXECUTION_BUFFER_PCT = 0.15
+# V4 meet altijd een concrete schaduworder tegen de publieke orderboeken. De cross-exchange
+# route blijft fail-closed: hij verzamelt wel geldige metingen, maar kan geen kanslabel geven.
+MEASUREMENT_GENERATION = 4
+CROSS_EXCHANGE_WATCH_ENABLED = False
+DEFAULT_SHADOW_NOTIONAL_USD = 200.0
+MIN_SHADOW_NOTIONAL_USD = 25.0
+MAX_SHADOW_NOTIONAL_USD = 10_000.0
+ORDER_BOOK_DEPTH = 100
+MAX_MEASUREMENT_SKEW_MS = 30_000
+KRAKEN_STABLECOIN_PAIR = 'USDCUSD'
 TOTAL_ROUNDTRIP_BUFFER_PCT = (
     2.0 * FUTURES_TAKER_FEE_PCT
     + 2.0 * BITVAVO_USDC_TAKER_FEE_PCT
@@ -71,6 +82,17 @@ def _native_holdings() -> tuple[str, ...]:
         if base in KRAKEN_NATIVE_SPOT_PAIRS and base not in values:
             values.append(base)
     return tuple(values)
+
+
+def _shadow_notional_usd() -> float:
+    raw = os.getenv('FUNDING_SHADOW_NOTIONAL_USD', str(DEFAULT_SHADOW_NOTIONAL_USD))
+    value = _finite(raw, -1.0)
+    if not MIN_SHADOW_NOTIONAL_USD <= value <= MAX_SHADOW_NOTIONAL_USD:
+        raise RuntimeError(
+            'FUNDING_SHADOW_NOTIONAL_USD moet tussen '
+            f'{MIN_SHADOW_NOTIONAL_USD:.0f} en {MAX_SHADOW_NOTIONAL_USD:.0f} liggen'
+        )
+    return value
 
 
 def _stop(signum: int, frame: object) -> None:
@@ -125,6 +147,96 @@ def _fetch_bitvavo_usdc_markets(timeout: int = 10) -> dict[str, str]:
     return result
 
 
+def _parse_book_levels(levels: Any, *, side: str, size_multiplier: float = 1.0) -> list[tuple[float, float]]:
+    if not isinstance(levels, list):
+        raise RuntimeError(f'orderboek {side} ontbreekt')
+    parsed: list[tuple[float, float]] = []
+    for level in levels:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            continue
+        price = _finite(level[0], -1.0)
+        size = _finite(level[1], -1.0) * size_multiplier
+        if price > 0.0 and size > 0.0:
+            parsed.append((price, size))
+    if not parsed:
+        raise RuntimeError(f'orderboek {side} bevat geen geldige niveaus')
+    parsed.sort(key=lambda value: value[0], reverse=side == 'bids')
+    return parsed
+
+
+def _vwap_for_quote(levels: list[tuple[float, float]], notional_quote: float) -> tuple[float, float]:
+    remaining = notional_quote
+    total_quote = 0.0
+    total_base = 0.0
+    for price, available_base in levels:
+        quote_at_level = price * available_base
+        used_quote = min(remaining, quote_at_level)
+        total_quote += used_quote
+        total_base += used_quote / price
+        remaining -= used_quote
+        if remaining <= max(1e-9, notional_quote * 1e-9):
+            break
+    if remaining > max(1e-9, notional_quote * 1e-9) or total_base <= 0.0:
+        available = sum(price * size for price, size in levels)
+        raise RuntimeError(
+            f'onvoldoende orderboekdiepte: {available:.2f} beschikbaar voor {notional_quote:.2f}'
+        )
+    return total_quote / total_base, sum(price * size for price, size in levels)
+
+
+def _order_book_metrics(
+    bids: Any,
+    asks: Any,
+    *,
+    notional_quote: float,
+    size_multiplier: float = 1.0,
+) -> dict[str, float]:
+    if notional_quote <= 0.0 or not math.isfinite(notional_quote):
+        raise RuntimeError('orderboeknotional moet positief en eindig zijn')
+    parsed_bids = _parse_book_levels(bids, side='bids', size_multiplier=size_multiplier)
+    parsed_asks = _parse_book_levels(asks, side='asks', size_multiplier=size_multiplier)
+    bid = parsed_bids[0][0]
+    ask = parsed_asks[0][0]
+    if ask < bid:
+        raise RuntimeError('gekruist orderboek: ask ligt onder bid')
+    sell_vwap, bid_depth_quote = _vwap_for_quote(parsed_bids, notional_quote)
+    buy_vwap, ask_depth_quote = _vwap_for_quote(parsed_asks, notional_quote)
+    mid = (bid + ask) / 2.0
+    spread_pct = _pct_change(ask, bid)
+    execution_spread_pct = _pct_change(buy_vwap, sell_vwap)
+    return {
+        'bid': bid,
+        'ask': ask,
+        'mid': mid,
+        'spread_pct': spread_pct,
+        'sell_vwap': sell_vwap,
+        'buy_vwap': buy_vwap,
+        'execution_spread_pct': execution_spread_pct,
+        'bid_depth_quote': bid_depth_quote,
+        'ask_depth_quote': ask_depth_quote,
+        'notional_quote': notional_quote,
+    }
+
+
+def _fetch_bitvavo_book(market: str, notional_quote: float, timeout: int = 10) -> dict[str, float]:
+    response = requests.get(
+        f'{BITVAVO_URL}/{market}/book',
+        params={'depth': ORDER_BOOK_DEPTH},
+        timeout=timeout,
+        headers={'Accept': 'application/json'},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f'ongeldig Bitvavo orderboek voor {market}')
+    returned_market = str(payload.get('market', market)).upper()
+    if returned_market != market.upper():
+        raise RuntimeError(f'Bitvavo orderboek hoort bij {returned_market}, niet {market}')
+    metrics = _order_book_metrics(payload.get('bids'), payload.get('asks'), notional_quote=notional_quote)
+    metrics['captured_at_ms'] = float(int(time.time() * 1000))
+    return metrics
+
+
 def _fetch_futures_tickers(timeout: int = 10) -> list[dict[str, Any]]:
     response = requests.get(f'{KRAKEN_FUTURES_URL}/tickers', timeout=timeout, headers={'Accept': 'application/json'})
     response.raise_for_status()
@@ -137,31 +249,66 @@ def _fetch_futures_tickers(timeout: int = 10) -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)]
 
 
-def _fetch_kraken_spot_ticker(pair: str, timeout: int = 10) -> dict[str, float]:
+def _fetch_futures_instruments(timeout: int = 10) -> dict[str, dict[str, Any]]:
     response = requests.get(
-        f'{KRAKEN_SPOT_URL}/Ticker', params={'pair': pair}, timeout=timeout, headers={'Accept': 'application/json'}
+        f'{KRAKEN_FUTURES_URL}/instruments', timeout=timeout, headers={'Accept': 'application/json'}
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get('result') not in {None, 'success'}:
+        raise RuntimeError('ongeldig Kraken Futures instruments-antwoord')
+    rows = payload.get('instruments', [])
+    if not isinstance(rows, list):
+        raise RuntimeError('Kraken Futures instruments ontbreken')
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get('symbol', '')).upper()
+        if symbol:
+            result[symbol] = row
+    return result
+
+
+def _fetch_kraken_futures_book(symbol: str, notional_quote: float, timeout: int = 10) -> dict[str, float]:
+    response = requests.get(
+        f'{KRAKEN_FUTURES_URL}/{KRAKEN_FUTURES_BOOK_RESOURCE}',
+        params={'symbol': symbol},
+        timeout=timeout,
+        headers={'Accept': 'application/json'},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get('result') not in {None, 'success'}:
+        raise RuntimeError(f'ongeldig Kraken Futures orderboek voor {symbol}')
+    book = payload.get('orderBook')
+    if not isinstance(book, dict):
+        raise RuntimeError(f'Kraken Futures orderboek ontbreekt voor {symbol}')
+    metrics = _order_book_metrics(book.get('bids'), book.get('asks'), notional_quote=notional_quote)
+    metrics['captured_at_ms'] = float(int(time.time() * 1000))
+    return metrics
+
+
+def _fetch_kraken_spot_book(pair: str, notional_quote: float, timeout: int = 10) -> dict[str, float]:
+    response = requests.get(
+        f'{KRAKEN_SPOT_URL}/Depth',
+        params={'pair': pair, 'count': ORDER_BOOK_DEPTH},
+        timeout=timeout,
+        headers={'Accept': 'application/json'},
     )
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict) or payload.get('error'):
-        raise RuntimeError(f'ongeldig Kraken spot ticker-antwoord voor {pair}')
+        raise RuntimeError(f'ongeldig Kraken spot orderboek voor {pair}')
     result = payload.get('result')
     if not isinstance(result, dict) or not result:
-        raise RuntimeError(f'Kraken spot ticker ontbreekt voor {pair}')
-    row = next(iter(result.values()))
-    if not isinstance(row, dict):
-        raise RuntimeError(f'ongeldig Kraken spot ticker-record voor {pair}')
-    try:
-        ask = float(row['a'][0])
-        bid = float(row['b'][0])
-        last = float(row['c'][0])
-    except (KeyError, IndexError, TypeError, ValueError, OverflowError) as exc:
-        raise RuntimeError(f'ongeldige Kraken spot prijzen voor {pair}') from exc
-    if min(ask, bid, last) <= 0 or ask < bid:
-        raise RuntimeError(f'ongeldige Kraken spot bid/ask voor {pair}')
-    mid = (bid + ask) / 2.0
-    spread_pct = (ask - bid) / mid * 100.0 if mid > 0 else 999.0
-    return {'bid': bid, 'ask': ask, 'last': last, 'mid': mid, 'spread_pct': spread_pct}
+        raise RuntimeError(f'Kraken spot orderboek ontbreekt voor {pair}')
+    book = next(iter(result.values()))
+    if not isinstance(book, dict):
+        raise RuntimeError(f'ongeldig Kraken spot orderboekrecord voor {pair}')
+    metrics = _order_book_metrics(book.get('bids'), book.get('asks'), notional_quote=notional_quote)
+    metrics['captured_at_ms'] = float(int(time.time() * 1000))
+    return metrics
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -176,16 +323,66 @@ def _db_connect() -> sqlite3.Connection:
             symbol TEXT NOT NULL,
             route_type TEXT NOT NULL,
             spot_market TEXT NOT NULL,
+            measurement_generation INTEGER NOT NULL DEFAULT 4,
+            research_notional_usd REAL,
+            measurement_started_at_ms INTEGER,
+            measurement_completed_at_ms INTEGER,
+            measurement_skew_ms INTEGER,
             roundtrip_buffer_pct REAL NOT NULL,
             funding_hour_pct REAL NOT NULL,
             predicted_funding_hour_pct REAL NOT NULL,
             basis_pct REAL NOT NULL,
+            exit_basis_pct REAL,
             futures_spread_pct REAL NOT NULL,
+            spot_bid REAL,
+            spot_ask REAL,
+            spot_buy_vwap REAL,
+            spot_sell_vwap REAL,
+            spot_bid_depth_quote REAL,
+            spot_ask_depth_quote REAL,
+            futures_bid REAL,
+            futures_ask REAL,
+            futures_buy_vwap REAL,
+            futures_sell_vwap REAL,
+            futures_bid_depth_quote REAL,
+            futures_ask_depth_quote REAL,
+            stablecoin_buy_usd REAL,
+            stablecoin_sell_usd REAL,
+            measurement_valid INTEGER NOT NULL DEFAULT 1,
+            watch_eligible INTEGER NOT NULL DEFAULT 0,
             volume_quote REAL NOT NULL,
             open_interest REAL NOT NULL,
             PRIMARY KEY (generated_ms, route_id)
         )'''
     )
+    existing_columns = {str(row[1]) for row in conn.execute('PRAGMA table_info(snapshots)').fetchall()}
+    migrations = {
+        'measurement_generation': 'INTEGER NOT NULL DEFAULT 3',
+        'research_notional_usd': 'REAL',
+        'measurement_started_at_ms': 'INTEGER',
+        'measurement_completed_at_ms': 'INTEGER',
+        'measurement_skew_ms': 'INTEGER',
+        'exit_basis_pct': 'REAL',
+        'spot_bid': 'REAL',
+        'spot_ask': 'REAL',
+        'spot_buy_vwap': 'REAL',
+        'spot_sell_vwap': 'REAL',
+        'spot_bid_depth_quote': 'REAL',
+        'spot_ask_depth_quote': 'REAL',
+        'futures_bid': 'REAL',
+        'futures_ask': 'REAL',
+        'futures_buy_vwap': 'REAL',
+        'futures_sell_vwap': 'REAL',
+        'futures_bid_depth_quote': 'REAL',
+        'futures_ask_depth_quote': 'REAL',
+        'stablecoin_buy_usd': 'REAL',
+        'stablecoin_sell_usd': 'REAL',
+        'measurement_valid': 'INTEGER NOT NULL DEFAULT 1',
+        'watch_eligible': 'INTEGER NOT NULL DEFAULT 0',
+    }
+    for name, definition in migrations.items():
+        if name not in existing_columns:
+            conn.execute(f'ALTER TABLE snapshots ADD COLUMN {name} {definition}')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_funding_v3_route_time ON snapshots(route_id, generated_ms)')
     conn.commit()
     return conn
@@ -301,6 +498,7 @@ def _score_candidate(
     basis_pct: float,
     history: dict[str, float],
     roundtrip_buffer_pct: float = TOTAL_ROUNDTRIP_BUFFER_PCT,
+    watch_enabled: bool = True,
 ) -> tuple[float, str, float]:
     gross_7d_pct = max(0.0, funding_hour_pct) * 24.0 * 7.0
     net_7d_snapshot_pct = gross_7d_pct - roundtrip_buffer_pct
@@ -329,8 +527,10 @@ def _score_candidate(
     score = round(max(0.0, min(100.0, score)), 1)
 
     stable_history = samples >= MIN_WATCH_SAMPLES_72H and span_hours >= MIN_WATCH_SPAN_HOURS
-    action = 'VERZAMELEN'
+    action = 'VERZAMELEN' if watch_enabled else 'CROSS GEBLOKKEERD'
     if (
+        watch_enabled
+        and
         stable_history
         and funding_hour_pct > 0.0
         and predicted_hour_pct > 0.0
@@ -348,11 +548,24 @@ def _score_candidate(
     return score, action, net_7d_snapshot_pct
 
 
-def _future_record(ticker: dict[str, Any]) -> dict[str, Any] | None:
+def _future_record(
+    ticker: dict[str, Any], instrument: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
     symbol = str(ticker.get('symbol', '')).upper()
     tag = str(ticker.get('tag', '')).lower()
     if not symbol.startswith('PF_') or tag != 'perpetual' or bool(ticker.get('suspended', False)):
         return None
+    if instrument is not None:
+        if str(instrument.get('symbol', '')).upper() != symbol:
+            return None
+        if str(instrument.get('type', '')).lower() != 'flexible_futures':
+            return None
+        if not bool(instrument.get('tradeable', False)) or bool(instrument.get('isExpired', False)):
+            return None
+        # PF-orderboeken gebruiken non-contract units. Een afwijkende contractSize wordt
+        # niet stilzwijgend omgerekend: dan stoppen we de meting veilig.
+        if not math.isclose(_finite(instrument.get('contractSize'), -1.0), 1.0):
+            return None
     pair = str(ticker.get('pair', symbol)).upper()
     base = _kraken_base(pair, symbol)
     mark = _finite(ticker.get('markPrice'))
@@ -388,35 +601,97 @@ def _build_row(
     route_id: str,
     route_type: str,
     spot_market: str,
-    spot_reference: float,
-    spot_spread_pct: float,
-    roundtrip_buffer_pct: float,
+    spot_book: dict[str, float],
+    futures_book: dict[str, float],
+    fixed_roundtrip_buffer_pct: float,
+    watch_enabled: bool,
     conn: sqlite3.Connection,
     now_ms: int,
+    stablecoin_book: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    basis_pct = _pct_change(float(future['mark']), spot_reference)
+    books = [spot_book, futures_book]
+    if stablecoin_book is not None:
+        books.append(stablecoin_book)
+    capture_times = [int(_finite(book.get('captured_at_ms'), float(now_ms))) for book in books]
+    measurement_started_at_ms = min(capture_times)
+    measurement_completed_at_ms = max(capture_times)
+    measurement_skew_ms = measurement_completed_at_ms - measurement_started_at_ms
+    if measurement_skew_ms > MAX_MEASUREMENT_SKEW_MS:
+        raise RuntimeError(
+            f'orderboeken liggen {measurement_skew_ms} ms uiteen; maximum is {MAX_MEASUREMENT_SKEW_MS} ms'
+        )
+    if stablecoin_book is None:
+        stablecoin_buy_usd = 1.0
+        stablecoin_sell_usd = 1.0
+        stablecoin_execution_spread_pct = 0.0
+        spot_entry_reference = float(spot_book['mid'])
+        spot_exit_reference = float(spot_book['mid'])
+    else:
+        stablecoin_buy_usd = float(stablecoin_book['buy_vwap'])
+        stablecoin_sell_usd = float(stablecoin_book['sell_vwap'])
+        stablecoin_execution_spread_pct = float(stablecoin_book['execution_spread_pct'])
+        spot_entry_reference = float(spot_book['buy_vwap']) * stablecoin_buy_usd
+        spot_exit_reference = float(spot_book['sell_vwap']) * stablecoin_sell_usd
+
+    futures_entry_reference = float(futures_book['sell_vwap'])
+    futures_exit_reference = float(futures_book['buy_vwap'])
+    basis_pct = _pct_change(futures_entry_reference, spot_entry_reference)
+    exit_basis_pct = _pct_change(futures_exit_reference, spot_exit_reference)
+    dynamic_execution_pct = float(futures_book['execution_spread_pct'])
+    if stablecoin_book is not None:
+        dynamic_execution_pct += float(spot_book['execution_spread_pct'])
+        dynamic_execution_pct += stablecoin_execution_spread_pct
+    roundtrip_buffer_pct = fixed_roundtrip_buffer_pct + dynamic_execution_pct
     history = _history_summary(conn, route_id, now_ms)
     score, action, net_7d = _score_candidate(
         funding_hour_pct=float(future['funding_hour_pct']),
         predicted_hour_pct=float(future['predicted_hour_pct']),
-        spread_pct=float(future['futures_spread_pct']),
+        spread_pct=float(futures_book['execution_spread_pct']),
         volume_quote=float(future['volume_quote']),
         basis_pct=basis_pct,
         history=history,
         roundtrip_buffer_pct=roundtrip_buffer_pct,
+        watch_enabled=watch_enabled,
     )
     row = {
+        'measurement_generation': MEASUREMENT_GENERATION,
+        'measurement_valid': True,
+        'watch_eligible': watch_enabled,
         'route_id': route_id,
         'route_type': route_type,
         'symbol': future['symbol'],
         'pair': future['pair'],
         'base': future['base'],
         'spot_market': spot_market,
-        'spot_reference': round(spot_reference, 8),
-        'spot_spread_pct': round(spot_spread_pct, 5),
+        'research_notional_usd': round(float(futures_book['notional_quote']), 2),
+        'measurement_started_at_ms': measurement_started_at_ms,
+        'measurement_completed_at_ms': measurement_completed_at_ms,
+        'measurement_skew_ms': measurement_skew_ms,
+        'spot_reference': round(spot_entry_reference, 8),
+        'spot_bid': round(float(spot_book['bid']), 8),
+        'spot_ask': round(float(spot_book['ask']), 8),
+        'spot_buy_vwap': round(float(spot_book['buy_vwap']), 8),
+        'spot_sell_vwap': round(float(spot_book['sell_vwap']), 8),
+        'spot_spread_pct': round(float(spot_book['spread_pct']), 5),
+        'spot_execution_spread_pct': round(float(spot_book['execution_spread_pct']), 5),
+        'spot_bid_depth_quote': round(float(spot_book['bid_depth_quote']), 2),
+        'spot_ask_depth_quote': round(float(spot_book['ask_depth_quote']), 2),
         'mark_price': round(float(future['mark']), 8),
         'index_price': round(float(future['index']), 8),
+        'futures_bid': round(float(futures_book['bid']), 8),
+        'futures_ask': round(float(futures_book['ask']), 8),
+        'futures_sell_vwap': round(futures_entry_reference, 8),
+        'futures_buy_vwap': round(futures_exit_reference, 8),
+        'futures_bid_depth_quote': round(float(futures_book['bid_depth_quote']), 2),
+        'futures_ask_depth_quote': round(float(futures_book['ask_depth_quote']), 2),
+        'futures_execution_spread_pct': round(float(futures_book['execution_spread_pct']), 5),
+        'stablecoin_pair': KRAKEN_STABLECOIN_PAIR if stablecoin_book is not None else None,
+        'stablecoin_buy_usd': round(stablecoin_buy_usd, 8),
+        'stablecoin_sell_usd': round(stablecoin_sell_usd, 8),
+        'stablecoin_execution_spread_pct': round(stablecoin_execution_spread_pct, 5),
         'basis_pct': round(basis_pct, 5),
+        'entry_basis_pct': round(basis_pct, 5),
+        'exit_basis_pct': round(exit_basis_pct, 5),
         'funding_hour_pct': round(float(future['funding_hour_pct']), 7),
         'predicted_funding_hour_pct': round(float(future['predicted_hour_pct']), 7),
         'gross_funding_7d_snapshot_pct': round(max(0.0, float(future['funding_hour_pct'])) * 168.0, 4),
@@ -424,6 +699,8 @@ def _build_row(
         'futures_spread_pct': round(float(future['futures_spread_pct']), 5),
         'volume_quote': round(float(future['volume_quote']), 2),
         'open_interest': round(float(future['open_interest']), 4),
+        'fixed_roundtrip_buffer_pct': round(fixed_roundtrip_buffer_pct, 4),
+        'dynamic_execution_buffer_pct': round(dynamic_execution_pct, 4),
         'roundtrip_buffer_pct': round(roundtrip_buffer_pct, 4),
         'score': score,
         'action': action,
@@ -432,75 +709,125 @@ def _build_row(
     return row
 
 
+def _insert_snapshot(conn: sqlite3.Connection, now_ms: int, row: dict[str, Any]) -> None:
+    columns = (
+        'generated_ms', 'route_id', 'symbol', 'route_type', 'spot_market',
+        'measurement_generation', 'research_notional_usd', 'measurement_started_at_ms',
+        'measurement_completed_at_ms', 'measurement_skew_ms', 'roundtrip_buffer_pct',
+        'funding_hour_pct', 'predicted_funding_hour_pct', 'basis_pct', 'exit_basis_pct',
+        'futures_spread_pct', 'spot_bid', 'spot_ask', 'spot_buy_vwap', 'spot_sell_vwap',
+        'spot_bid_depth_quote', 'spot_ask_depth_quote', 'futures_bid', 'futures_ask',
+        'futures_buy_vwap', 'futures_sell_vwap', 'futures_bid_depth_quote',
+        'futures_ask_depth_quote', 'stablecoin_buy_usd', 'stablecoin_sell_usd',
+        'measurement_valid', 'watch_eligible', 'volume_quote', 'open_interest',
+    )
+    values = (
+        now_ms, row['route_id'], row['symbol'], row['route_type'], row['spot_market'],
+        row['measurement_generation'], row['research_notional_usd'], row['measurement_started_at_ms'],
+        row['measurement_completed_at_ms'], row['measurement_skew_ms'], row['roundtrip_buffer_pct'],
+        row['funding_hour_pct'], row['predicted_funding_hour_pct'], row['basis_pct'],
+        row['exit_basis_pct'], row['futures_spread_pct'], row['spot_bid'], row['spot_ask'],
+        row['spot_buy_vwap'], row['spot_sell_vwap'], row['spot_bid_depth_quote'],
+        row['spot_ask_depth_quote'], row['futures_bid'], row['futures_ask'],
+        row['futures_buy_vwap'], row['futures_sell_vwap'], row['futures_bid_depth_quote'],
+        row['futures_ask_depth_quote'], row['stablecoin_buy_usd'], row['stablecoin_sell_usd'],
+        int(bool(row['measurement_valid'])), int(bool(row['watch_eligible'])),
+        row['volume_quote'], row['open_interest'],
+    )
+    placeholders = ','.join('?' for _ in columns)
+    conn.execute(
+        f"INSERT OR REPLACE INTO snapshots ({','.join(columns)}) VALUES ({placeholders})",
+        values,
+    )
+
+
 def scan_once() -> dict[str, object]:
-    now_ms = int(time.time() * 1000)
+    scan_started_ms = int(time.time() * 1000)
+    now_ms = scan_started_ms
+    notional_usd = _shadow_notional_usd()
     usdc_markets = _fetch_bitvavo_usdc_markets()
     tickers = _fetch_futures_tickers()
+    instruments = _fetch_futures_instruments()
     futures_by_base: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
+    error_keys: set[str] = set()
+
+    def add_error(message: str) -> None:
+        if message not in error_keys:
+            error_keys.add(message)
+            errors.append(message)
+
     for ticker in tickers:
-        record = _future_record(ticker)
+        symbol = str(ticker.get('symbol', '')).upper()
+        instrument = instruments.get(symbol)
+        if instrument is None:
+            continue
+        record = _future_record(ticker, instrument)
         if record is None:
             continue
         futures_by_base[str(record['base'])] = record
 
     conn = _db_connect()
     rows: list[dict[str, Any]] = []
+    cross_expected = sum(1 for base in usdc_markets if base in futures_by_base)
     try:
-        # Route A: Bitvavo USDC spot + Kraken perpetual.
+        # Route A: echte Bitvavo USDC-uitvoeringsprijzen + Kraken perpetual-orderboek + USDC/USD.
+        # Deze route meet opnieuw vanaf nul en blijft geblokkeerd voor kanslabels.
         for base, spot_market in sorted(usdc_markets.items()):
             future = futures_by_base.get(base)
             if future is None:
                 continue
-            rows.append(_build_row(
-                future=future,
-                route_id=f'BITVAVO_USDC_{base}',
-                route_type='BITVAVO_USDC_KRAKEN_PERP',
-                spot_market=spot_market,
-                spot_reference=float(future['index']),
-                spot_spread_pct=0.0,
-                roundtrip_buffer_pct=TOTAL_ROUNDTRIP_BUFFER_PCT,
-                conn=conn,
-                now_ms=now_ms,
-            ))
+            try:
+                spot_depth = _fetch_bitvavo_book(spot_market, notional_usd)
+                future_depth = _fetch_kraken_futures_book(str(future['symbol']), notional_usd)
+                stablecoin_depth = _fetch_kraken_spot_book(KRAKEN_STABLECOIN_PAIR, notional_usd)
+                row = _build_row(
+                    future=future,
+                    route_id=f'BITVAVO_USDC_EXEC_V4_{base}',
+                    route_type='BITVAVO_USDC_KRAKEN_PERP',
+                    spot_market=spot_market,
+                    spot_book=spot_depth,
+                    futures_book=future_depth,
+                    stablecoin_book=stablecoin_depth,
+                    fixed_roundtrip_buffer_pct=TOTAL_ROUNDTRIP_BUFFER_PCT,
+                    watch_enabled=CROSS_EXCHANGE_WATCH_ENABLED,
+                    conn=conn,
+                    now_ms=now_ms,
+                )
+            except Exception as exc:
+                add_error(f'Cross {spot_market}: {type(exc).__name__}: {exc}')
+                continue
+            rows.append(row)
 
-        # Route B: bestaand Kraken BTC/ETH-bezit + Kraken perpetual. Spot wordt niet opnieuw verhandeld.
+        # Route B: bestaand Kraken BTC/ETH-bezit. Alleen de futureshedge wordt als trade gemeten.
         for base in _native_holdings():
             future = futures_by_base.get(base)
             if future is None:
-                errors.append(f'Kraken native {base}: geen bruikbare perpetual')
+                add_error(f'Kraken native {base}: geen gevalideerde flexible perpetual')
                 continue
             pair = KRAKEN_NATIVE_SPOT_PAIRS[base]
             try:
-                spot = _fetch_kraken_spot_ticker(pair)
+                future_depth = _fetch_kraken_futures_book(str(future['symbol']), notional_usd)
+                spot_depth = _fetch_kraken_spot_book(pair, notional_usd)
+                row = _build_row(
+                    future=future,
+                    route_id=f'KRAKEN_EXISTING_EXEC_V4_{base}',
+                    route_type='KRAKEN_EXISTING_HOLDING',
+                    spot_market=f'KRAKEN:{pair}',
+                    spot_book=spot_depth,
+                    futures_book=future_depth,
+                    fixed_roundtrip_buffer_pct=NATIVE_EXISTING_HOLDING_BUFFER_PCT,
+                    watch_enabled=True,
+                    conn=conn,
+                    now_ms=now_ms,
+                )
             except Exception as exc:
-                errors.append(f'Kraken native {base}: {type(exc).__name__}: {exc}')
+                add_error(f'Kraken native {base}: {type(exc).__name__}: {exc}')
                 continue
-            rows.append(_build_row(
-                future=future,
-                route_id=f'KRAKEN_EXISTING_{base}',
-                route_type='KRAKEN_EXISTING_HOLDING',
-                spot_market=f'KRAKEN:{pair}',
-                spot_reference=float(spot['mid']),
-                spot_spread_pct=float(spot['spread_pct']),
-                roundtrip_buffer_pct=NATIVE_EXISTING_HOLDING_BUFFER_PCT,
-                conn=conn,
-                now_ms=now_ms,
-            ))
+            rows.append(row)
 
         for row in rows:
-            conn.execute(
-                '''INSERT OR REPLACE INTO snapshots
-                   (generated_ms,route_id,symbol,route_type,spot_market,roundtrip_buffer_pct,
-                    funding_hour_pct,predicted_funding_hour_pct,basis_pct,futures_spread_pct,
-                    volume_quote,open_interest)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
-                (
-                    now_ms, row['route_id'], row['symbol'], row['route_type'], row['spot_market'],
-                    row['roundtrip_buffer_pct'], row['funding_hour_pct'], row['predicted_funding_hour_pct'],
-                    row['basis_pct'], row['futures_spread_pct'], row['volume_quote'], row['open_interest'],
-                ),
-            )
+            _insert_snapshot(conn, now_ms, row)
         conn.commit()
         retention_cutoff = now_ms - HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000
         conn.execute('DELETE FROM snapshots WHERE generated_ms<?', (retention_cutoff,))
@@ -511,11 +838,12 @@ def scan_once() -> dict[str, object]:
             score, action, net_7d = _score_candidate(
                 funding_hour_pct=float(row['funding_hour_pct']),
                 predicted_hour_pct=float(row['predicted_funding_hour_pct']),
-                spread_pct=float(row['futures_spread_pct']),
+                spread_pct=float(row['futures_execution_spread_pct']),
                 volume_quote=float(row['volume_quote']),
                 basis_pct=float(row['basis_pct']),
                 history=history,
                 roundtrip_buffer_pct=float(row['roundtrip_buffer_pct']),
+                watch_enabled=bool(row['watch_eligible']),
             )
             _attach_history(row, history)
             row['score'] = score
@@ -532,14 +860,23 @@ def scan_once() -> dict[str, object]:
     cross_rows = [row for row in rows if row['route_type'] == 'BITVAVO_USDC_KRAKEN_PERP']
     native_rows = [row for row in rows if row['route_type'] == 'KRAKEN_EXISTING_HOLDING']
     generated = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).isoformat()
+    scan_duration_ms = max(0, int(time.time() * 1000) - scan_started_ms)
     return {
-        'version': '3.1',
+        'version': '4.0',
+        'measurement_generation': MEASUREMENT_GENERATION,
         'mode': 'READ_ONLY_PUBLIC_DATA',
         'generated_at_ms': now_ms,
         'generated_at_utc': generated,
-        'source': 'Kraken Futures + Kraken Spot + Bitvavo public markets',
+        'scan_duration_ms': scan_duration_ms,
+        'source': 'Kraken Futures/Spot L2-orderboeken + Bitvavo L2-orderboeken',
+        'research_notional_usd': notional_usd,
+        'max_measurement_skew_ms': MAX_MEASUREMENT_SKEW_MS,
         'bitvavo_usdc_markets': len(usdc_markets),
+        'cross_exchange_routes_expected': cross_expected,
         'cross_exchange_routes': len(cross_rows),
+        'cross_exchange_routes_skipped': max(0, cross_expected - len(cross_rows)),
+        'cross_exchange_watch_enabled': CROSS_EXCHANGE_WATCH_ENABLED,
+        'cross_exchange_status': 'MEETLAAG ALLEEN | kanslabels fail-closed geblokkeerd',
         'native_existing_routes': len(native_rows),
         'native_holdings_configured': list(_native_holdings()),
         'watch_count': sum(1 for row in rows if 'CARRY WATCH' in str(row['action'])),
@@ -548,7 +885,8 @@ def scan_once() -> dict[str, object]:
         'kraken_existing_holdings': native_rows,
         'errors': errors,
         'risk_check': 'MARGE EN BEURSRISICO NIET BEOORDEELD | altijd handmatig controleren',
-        'note': 'CARRY WATCH vereist minimaal 72 uur stabiele historie en blijft een handmatige onderzoekskans; geen orders.',
+        'history_reset': 'V4 route-id: oude v3 indexreferenties tellen niet mee; 72-uursmeting begint opnieuw.',
+        'note': 'Alleen native CARRY WATCH kan na 72 uur ontstaan; cross-exchange blijft geblokkeerd; geen orders.',
     }
 
 
@@ -574,18 +912,25 @@ def _load_report() -> dict[str, object] | None:
 def _print_row(index: int, row: dict[str, Any]) -> None:
     route = 'KRAKEN BESTAAND' if row.get('route_type') == 'KRAKEN_EXISTING_HOLDING' else 'BITVAVO↔KRAKEN'
     print(
-        f"{index}. {str(row.get('base','?')):5s} | {route:15s} | {str(row.get('action','VERZAMELEN')):18s}"
+        f"{index}. {str(row.get('base','?')):5s} | {route:15s} | {str(row.get('action','VERZAMELEN')):20s}"
         f" | score {float(row.get('score',0.0)):5.1f}/100"
     )
     print(
         f"   funding {float(row.get('funding_hour_pct',0.0)):+.6f}%/u"
         f" | voorspeld {float(row.get('predicted_funding_hour_pct',0.0)):+.6f}%/u"
-        f" | basis {float(row.get('basis_pct',0.0)):+.3f}%"
-        f" | fut.spread {float(row.get('futures_spread_pct',0.0)):.3f}%"
+        f" | entrybasis {float(row.get('entry_basis_pct',row.get('basis_pct',0.0))):+.3f}%"
+        f" | exitbasis {float(row.get('exit_basis_pct',0.0)):+.3f}%"
     )
     print(
         f"   buffer {float(row.get('roundtrip_buffer_pct',0.0)):.2f}%"
+        f" (vast {float(row.get('fixed_roundtrip_buffer_pct',0.0)):.2f}%"
+        f" + L2 {float(row.get('dynamic_execution_buffer_pct',0.0)):.2f}%)"
         f" | 7d snapshot netto {float(row.get('net_7d_snapshot_pct',0.0)):+.2f}%"
+    )
+    print(
+        f"   schaduw ${float(row.get('research_notional_usd',0.0)):.0f}"
+        f" | spot L2 {float(row.get('spot_execution_spread_pct',0.0)):.3f}%"
+        f" | futures L2 {float(row.get('futures_execution_spread_pct',0.0)):.3f}%"
         f" | positief24h {float(row.get('positive_share_24h_pct',0.0)):.1f}%"
         f" | samples {int(row.get('samples_24h',0))} | span {float(row.get('span_hours_24h',0.0)):.1f}u"
     )
@@ -611,12 +956,14 @@ def _print_row(index: int, row: dict[str, Any]) -> None:
 
 
 def print_report(report: dict[str, object]) -> None:
-    print('=== FUNDING / BASIS MONITOR v3 | READ ONLY ===')
+    print('=== FUNDING / BASIS MONITOR v4 | EXECUTABLE L2 | READ ONLY ===')
     print(f"UTC                 : {report.get('generated_at_utc', 'n/a')}")
     print(f"BITVAVO USDC ROUTES : {report.get('cross_exchange_routes', 0)}")
     print(f"KRAKEN BESTAAND     : {report.get('native_existing_routes', 0)}")
     print(f"NATIVE WATCHLIST    : {', '.join(str(x) for x in report.get('native_holdings_configured', []))}")
     print(f"CARRY WATCH         : {report.get('watch_count', 0)}")
+    print(f"SCHADUWOMVANG       : ${float(report.get('research_notional_usd', 0.0)):.0f} per leg")
+    print(f"CROSS LABELS        : {'AAN' if report.get('cross_exchange_watch_enabled') else 'GEBLOKKEERD'}")
     print('HISTORIE-EIS        : minimaal 72 uur stabiel vóór een kanslabel')
     print(f"MARGE / BEURSRISICO : {report.get('risk_check', 'NIET BEOORDEELD')}")
     print('ORDERS              : ONMOGELIJK | alleen publieke marktdata')
@@ -648,12 +995,13 @@ def print_report(report: dict[str, object]) -> None:
         for text in errors[:5]:
             print(f'  - {text}')
     print()
-    print('LET OP: native route rekent alleen futures hedge-kosten omdat BTC/ETH al bestaan op Kraken.')
-    print('CARRY WATCH vereist 72 uur historie, positieve 2x-kostenstress en handmatige risico-controle.')
+    print('LET OP: v4 gebruikt uitvoerbare L2-VWAP, echte Bitvavo-prijzen en een aparte USDC/USD-meting.')
+    print('Native rekent alleen de futureshedge; cross-labels blijven fail-closed geblokkeerd.')
+    print('Een native CARRY WATCH vereist 72 uur v4-historie, 2x-kostenstress en handmatige risico-controle.')
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Funding/Basis Monitor v3 - read only')
+    parser = argparse.ArgumentParser(description='Funding/Basis Monitor v4 - executable L2, read only')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--status', action='store_true')
     args = parser.parse_args()
@@ -662,7 +1010,7 @@ def main() -> int:
     if args.status:
         report = _load_report()
         if report is None:
-            print('=== FUNDING / BASIS MONITOR v3 | READ ONLY ===')
+            print('=== FUNDING / BASIS MONITOR v4 | EXECUTABLE L2 | READ ONLY ===')
             print('STATUS          : nog geen rapport')
             print(f'RAPPORT         : {_report_path()}')
             return 1

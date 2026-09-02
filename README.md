@@ -31,10 +31,16 @@ Controle:
 python3 crypto_research_v4.py --status
 ```
 
-`funding_basis_monitor.py` blijft versie 3, maar vereist nu minimaal 72 uur stabiele historie voor een
-`CARRY WATCH`. Het rapport toont daarnaast 30- en 90-daagse gemiddelden, tekenwisselingen, fundingverval,
-2x transactiekosten, een ongunstige basisschok van 1% en een expliciete waarschuwing dat marge- en
-beursrisico altijd handmatig moeten worden beoordeeld.
+`funding_basis_monitor.py` is nu versie 4. De meetlaag gebruikt voor iedere schaduwleg echte publieke
+L2-orderboeken en berekent uitvoerbare VWAP-prijzen voor standaard $200. Bitvavo USDC-spot, Kraken
+perpetuals en de USDC/USD-conversie worden afzonderlijk gemeten; ontbrekende of te dunne orderboeken
+leveren geen snapshot op. Orderboeken die meer dan 30 seconden uiteenliggen worden eveneens verworpen.
+De oude v3-indexreferenties tellen door nieuwe route-ID's niet mee.
+
+De Bitvavo↔Kraken-route blijft fail-closed geblokkeerd voor `CARRY WATCH` en verzamelt alleen onderzoekdata.
+Alleen bestaand BTC/ETH-bezit op Kraken kan na minimaal 72 uur nieuwe v4-historie een handmatig kanslabel
+krijgen. Het rapport houdt 30- en 90-daagse gemiddelden, fundingverval, 2x-kostenstress, basisschok,
+uitvoeringsspreads en diepte bij. Orders blijven onmogelijk.
 
 ## Runtime
 
