@@ -10,6 +10,7 @@ from funding_basis_monitor import (
     _build_row,
     _order_book_metrics,
     _relative_funding_pct,
+    _report_is_stale,
     scan_once,
     _score_candidate,
     _stress_metrics,
@@ -19,6 +20,10 @@ from funding_basis_monitor import (
 
 
 class FundingBasisMonitorTests(unittest.TestCase):
+    def test_old_report_is_explicitly_stale(self):
+        self.assertTrue(_report_is_stale({'generated_at_ms': 1_000}, now_ms=4_000_000))
+        self.assertFalse(_report_is_stale({'generated_at_ms': 1_000}, now_ms=2_000))
+
     def test_roundtrip_buffer_includes_both_legs(self):
         self.assertAlmostEqual(TOTAL_ROUNDTRIP_BUFFER_PCT, 0.35)
 
@@ -92,7 +97,8 @@ class FundingBasisMonitorTests(unittest.TestCase):
         conn = sqlite3.connect(':memory:')
         conn.execute(
             '''CREATE TABLE snapshots (
-                generated_ms INTEGER, route_id TEXT, funding_hour_pct REAL, basis_pct REAL
+                generated_ms INTEGER, route_id TEXT, funding_hour_pct REAL, basis_pct REAL,
+                roundtrip_buffer_pct REAL
             )'''
         )
         spot_book = _order_book_metrics([[99, 10]], [[101, 10]], notional_quote=200)
@@ -177,6 +183,9 @@ class FundingBasisMonitorTests(unittest.TestCase):
                 'positive_share_72h': 0.85,
                 'avg_funding_hour_pct_72h': 0.009,
                 'funding_decay_ratio_24h_vs_72h': 0.90,
+                'max_gap_minutes_72h': 15.0,
+                'avg_roundtrip_buffer_pct_72h': 0.35,
+                'max_roundtrip_buffer_pct_72h': 0.35,
             },
         )
         self.assertGreaterEqual(net, 1.0)
@@ -195,6 +204,9 @@ class FundingBasisMonitorTests(unittest.TestCase):
                 'positive_share_72h': 0.90,
                 'avg_funding_hour_pct_72h': 0.010,
                 'funding_decay_ratio_24h_vs_72h': 1.0,
+                'max_gap_minutes_72h': 15.0,
+                'avg_roundtrip_buffer_pct_72h': 0.35,
+                'max_roundtrip_buffer_pct_72h': 0.35,
             },
             watch_enabled=False,
         )
@@ -204,7 +216,8 @@ class FundingBasisMonitorTests(unittest.TestCase):
         conn = sqlite3.connect(':memory:')
         conn.execute(
             '''CREATE TABLE snapshots (
-                generated_ms INTEGER, route_id TEXT, funding_hour_pct REAL, basis_pct REAL
+                generated_ms INTEGER, route_id TEXT, funding_hour_pct REAL, basis_pct REAL,
+                roundtrip_buffer_pct REAL
             )'''
         )
         future = {
@@ -297,7 +310,7 @@ class FundingBasisMonitorTests(unittest.TestCase):
                 patched['_fetch_kraken_spot_book'].side_effect = kraken_spot_book
                 report = scan_once()
 
-            self.assertEqual(report['version'], '4.0')
+            self.assertEqual(report['version'], '4.1')
             self.assertFalse(report['cross_exchange_watch_enabled'])
             self.assertEqual(report['cross_exchange'][0]['action'], 'CROSS GEBLOKKEERD')
             self.assertTrue(report['cross_exchange'][0]['route_id'].startswith('BITVAVO_USDC_EXEC_V4_'))
@@ -350,11 +363,61 @@ class FundingBasisMonitorTests(unittest.TestCase):
         self.assertAlmostEqual(stress['net_7d_cost_stress_2x_pct'], 0.14)
         self.assertAlmostEqual(stress['net_7d_basis_shock_1pct_pct'], -0.51)
 
+    def test_watch_is_blocked_when_basis_shock_is_negative(self):
+        _, action, _ = _score_candidate(
+            funding_hour_pct=0.006,
+            predicted_hour_pct=0.006,
+            spread_pct=0.02,
+            volume_quote=100_000_000,
+            basis_pct=0.10,
+            history={
+                'samples_72h': 288.0,
+                'span_hours_72h': 71.75,
+                'positive_share_72h': 0.90,
+                'avg_funding_hour_pct_72h': 0.006,
+                'funding_decay_ratio_24h_vs_72h': 1.0,
+                'max_gap_minutes_72h': 15.0,
+                'avg_roundtrip_buffer_pct_72h': 0.35,
+                'max_roundtrip_buffer_pct_72h': 0.35,
+            },
+        )
+        self.assertEqual(action, 'VERZAMELEN')
+
+    def test_watch_is_blocked_by_large_measurement_gap(self):
+        _, action, _ = _score_candidate(
+            funding_hour_pct=0.010,
+            predicted_hour_pct=0.009,
+            spread_pct=0.02,
+            volume_quote=100_000_000,
+            basis_pct=0.10,
+            history={
+                'samples_72h': 288.0,
+                'span_hours_72h': 71.75,
+                'positive_share_72h': 0.90,
+                'avg_funding_hour_pct_72h': 0.010,
+                'funding_decay_ratio_24h_vs_72h': 1.0,
+                'max_gap_minutes_72h': 45.0,
+                'avg_roundtrip_buffer_pct_72h': 0.35,
+                'max_roundtrip_buffer_pct_72h': 0.35,
+            },
+        )
+        self.assertEqual(action, 'VERZAMELEN')
+
+    def test_worst_historical_cost_is_used_for_stress(self):
+        stress = _stress_metrics(
+            average_funding_hour_pct=0.010,
+            roundtrip_buffer_pct=0.35,
+            stress_buffer_pct=0.80,
+        )
+        self.assertAlmostEqual(stress['net_7d_historical_pct'], 1.33)
+        self.assertAlmostEqual(stress['net_7d_cost_stress_2x_pct'], 0.08)
+        self.assertAlmostEqual(stress['net_7d_basis_shock_1pct_pct'], -0.12)
+
     def test_history_window_counts_sign_flips_and_basis_range(self):
         rows = [
-            (0, 0.001, -0.10),
-            (1_000, -0.001, 0.20),
-            (2_000, 0.002, 0.05),
+            (0, 0.001, -0.10, 0.30),
+            (1_000, -0.001, 0.20, 0.50),
+            (2_000, 0.002, 0.05, 0.40),
         ]
         summary = _window_history(rows, 0, 'test')
         self.assertEqual(summary['samples_test'], 3.0)
@@ -362,6 +425,8 @@ class FundingBasisMonitorTests(unittest.TestCase):
         self.assertAlmostEqual(summary['positive_share_test'], 2 / 3)
         self.assertEqual(summary['min_basis_pct_test'], -0.10)
         self.assertEqual(summary['max_basis_pct_test'], 0.20)
+        self.assertAlmostEqual(summary['avg_roundtrip_buffer_pct_test'], 0.40)
+        self.assertAlmostEqual(summary['max_roundtrip_buffer_pct_test'], 0.50)
 
 
 if __name__ == '__main__':

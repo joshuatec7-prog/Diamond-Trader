@@ -43,7 +43,8 @@ De maximale momentumgrens voorkomt blind najagen van een extreme pump. Execution
 - Prospectieve trade-tijden gebruiken wall-clock runtime-tijd.
 - Intracycle stop-loss gebruikt de actuele biedprijs als uitvoerbare referentie.
 - Strategy A en B hebben ieder eigen cash, posities, trades, beslissingen en performance.
-- `supervisor.py` bewaakt beide PAPER-workers; als één worker onverwacht stopt, wordt de andere ook gestopt zodat Render de service kan herstarten.
+- De lean runtime start alleen scanner v3 en fundingmonitor v4.1; beide zijn read-only.
+- `supervisor.py` bewaakt proces én rapportleeftijd en herstart alleen de ongezonde monitor.
 
 ## Evaluatie
 

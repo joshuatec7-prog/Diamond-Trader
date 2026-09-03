@@ -48,8 +48,10 @@ NATIVE_EXISTING_HOLDING_BUFFER_PCT = 2.0 * FUTURES_TAKER_FEE_PCT + 0.10
 MIN_VOLUME_QUOTE_USD = 1_000_000.0
 MAX_FUTURES_SPREAD_PCT = 0.12
 MIN_POSITIVE_SHARE = 0.75
-MIN_WATCH_SAMPLES_72H = 144
+MIN_WATCH_SAMPLES_72H = 260
 MIN_WATCH_SPAN_HOURS = 71.5
+MAX_WATCH_GAP_MINUTES = 30.5
+REPORT_STALE_SECONDS = 35 * 60
 HISTORY_RETENTION_DAYS = 100
 MAX_ABS_FUNDING_HOUR_PCT = 0.50
 BASE_ALIASES = {'XBT': 'BTC', 'XDG': 'DOGE'}
@@ -400,12 +402,20 @@ def _window_history(rows: list[tuple[Any, ...]], cutoff_ms: int, suffix: str) ->
             f'avg_basis_pct_{suffix}': 0.0,
             f'min_basis_pct_{suffix}': 0.0,
             f'max_basis_pct_{suffix}': 0.0,
+            f'avg_roundtrip_buffer_pct_{suffix}': 0.0,
+            f'max_roundtrip_buffer_pct_{suffix}': 0.0,
+            f'max_gap_minutes_{suffix}': 0.0,
         }
     funding = [float(row[1]) for row in selected]
     basis = [float(row[2]) for row in selected]
+    buffers = [float(row[3]) for row in selected if len(row) > 3 and row[3] is not None]
     nonzero_signs = [1 if value > 0.0 else -1 for value in funding if value != 0.0]
     sign_flips = sum(1 for left, right in zip(nonzero_signs, nonzero_signs[1:]) if left != right)
     span_hours = (int(selected[-1][0]) - int(selected[0][0])) / 3_600_000.0 if len(selected) > 1 else 0.0
+    gaps = [
+        (int(right[0]) - int(left[0])) / 60_000.0
+        for left, right in zip(selected, selected[1:])
+    ]
     return {
         f'samples_{suffix}': float(len(selected)),
         f'span_hours_{suffix}': span_hours,
@@ -415,13 +425,16 @@ def _window_history(rows: list[tuple[Any, ...]], cutoff_ms: int, suffix: str) ->
         f'avg_basis_pct_{suffix}': sum(basis) / len(basis),
         f'min_basis_pct_{suffix}': min(basis),
         f'max_basis_pct_{suffix}': max(basis),
+        f'avg_roundtrip_buffer_pct_{suffix}': sum(buffers) / len(buffers) if buffers else 0.0,
+        f'max_roundtrip_buffer_pct_{suffix}': max(buffers) if buffers else 0.0,
+        f'max_gap_minutes_{suffix}': max(gaps) if gaps else 0.0,
     }
 
 
 def _history_summary(conn: sqlite3.Connection, route_id: str, now_ms: int) -> dict[str, float]:
     cutoff = now_ms - 90 * 24 * 60 * 60 * 1000
     rows = conn.execute(
-        '''SELECT generated_ms, funding_hour_pct, basis_pct
+        '''SELECT generated_ms, funding_hour_pct, basis_pct, roundtrip_buffer_pct
            FROM snapshots WHERE route_id=? AND generated_ms>=? ORDER BY generated_ms''',
         (route_id, cutoff),
     ).fetchall()
@@ -457,13 +470,18 @@ def _stress_metrics(
     *,
     average_funding_hour_pct: float,
     roundtrip_buffer_pct: float,
+    stress_buffer_pct: float | None = None,
 ) -> dict[str, float]:
     gross = max(0.0, average_funding_hour_pct) * 24.0 * 7.0
+    stressed_buffer = max(
+        roundtrip_buffer_pct,
+        roundtrip_buffer_pct if stress_buffer_pct is None else stress_buffer_pct,
+    )
     return {
         'gross_7d_historical_pct': gross,
         'net_7d_historical_pct': gross - roundtrip_buffer_pct,
-        'net_7d_cost_stress_2x_pct': gross - 2.0 * roundtrip_buffer_pct,
-        'net_7d_basis_shock_1pct_pct': gross - roundtrip_buffer_pct - 1.0,
+        'net_7d_cost_stress_2x_pct': gross - 2.0 * stressed_buffer,
+        'net_7d_basis_shock_1pct_pct': gross - stressed_buffer - 1.0,
     }
 
 
@@ -477,13 +495,30 @@ def _attach_history(row: dict[str, Any], history: dict[str, float]) -> None:
         row[f'avg_basis_pct_{suffix}'] = round(history.get(f'avg_basis_pct_{suffix}', 0.0), 5)
         row[f'min_basis_pct_{suffix}'] = round(history.get(f'min_basis_pct_{suffix}', 0.0), 5)
         row[f'max_basis_pct_{suffix}'] = round(history.get(f'max_basis_pct_{suffix}', 0.0), 5)
+        row[f'avg_roundtrip_buffer_pct_{suffix}'] = round(
+            history.get(f'avg_roundtrip_buffer_pct_{suffix}', 0.0), 5
+        )
+        row[f'max_roundtrip_buffer_pct_{suffix}'] = round(
+            history.get(f'max_roundtrip_buffer_pct_{suffix}', 0.0), 5
+        )
+        row[f'max_gap_minutes_{suffix}'] = round(history.get(f'max_gap_minutes_{suffix}', 0.0), 2)
     row['history_age_hours'] = round(history.get('history_age_hours', 0.0), 2)
     row['funding_decay_ratio_24h_vs_72h'] = round(
         history.get('funding_decay_ratio_24h_vs_72h', 0.0), 3
     )
+    current_buffer = float(row.get('roundtrip_buffer_pct', TOTAL_ROUNDTRIP_BUFFER_PCT))
+    average_buffer = float(history.get('avg_roundtrip_buffer_pct_72h', 0.0)) or current_buffer
+    stress_buffer = max(
+        current_buffer,
+        float(history.get('max_roundtrip_buffer_pct_72h', 0.0)),
+        average_buffer,
+    )
+    row['historical_average_buffer_pct_72h'] = round(average_buffer, 5)
+    row['historical_stress_buffer_pct_72h'] = round(stress_buffer, 5)
     stress = _stress_metrics(
         average_funding_hour_pct=float(history.get('avg_funding_hour_pct_72h', 0.0)),
-        roundtrip_buffer_pct=float(row.get('roundtrip_buffer_pct', TOTAL_ROUNDTRIP_BUFFER_PCT)),
+        roundtrip_buffer_pct=average_buffer,
+        stress_buffer_pct=stress_buffer,
     )
     for name, value in stress.items():
         row[name] = round(value, 4)
@@ -507,9 +542,17 @@ def _score_candidate(
     positive_share = float(history.get('positive_share_72h', 0.0))
     avg_72h = float(history.get('avg_funding_hour_pct_72h', 0.0))
     decay_ratio = float(history.get('funding_decay_ratio_24h_vs_72h', 0.0))
+    max_gap_minutes = float(history.get('max_gap_minutes_72h', float('inf')))
+    average_buffer = float(history.get('avg_roundtrip_buffer_pct_72h', 0.0)) or roundtrip_buffer_pct
+    stress_buffer = max(
+        roundtrip_buffer_pct,
+        float(history.get('max_roundtrip_buffer_pct_72h', 0.0)),
+        average_buffer,
+    )
     stress = _stress_metrics(
         average_funding_hour_pct=avg_72h,
-        roundtrip_buffer_pct=roundtrip_buffer_pct,
+        roundtrip_buffer_pct=average_buffer,
+        stress_buffer_pct=stress_buffer,
     )
 
     score = 0.0
@@ -522,11 +565,19 @@ def _score_candidate(
     score += 10.0 if spread_pct <= 0.05 else 5.0 if spread_pct <= MAX_FUTURES_SPREAD_PCT else 0.0
     if basis_pct > 0.0:
         score += min(5.0, basis_pct / 0.5 * 5.0)
-    if samples >= MIN_WATCH_SAMPLES_72H and span_hours >= MIN_WATCH_SPAN_HOURS:
+    if (
+        samples >= MIN_WATCH_SAMPLES_72H
+        and span_hours >= MIN_WATCH_SPAN_HOURS
+        and max_gap_minutes <= MAX_WATCH_GAP_MINUTES
+    ):
         score += min(10.0, positive_share * 10.0)
     score = round(max(0.0, min(100.0, score)), 1)
 
-    stable_history = samples >= MIN_WATCH_SAMPLES_72H and span_hours >= MIN_WATCH_SPAN_HOURS
+    stable_history = (
+        samples >= MIN_WATCH_SAMPLES_72H
+        and span_hours >= MIN_WATCH_SPAN_HOURS
+        and max_gap_minutes <= MAX_WATCH_GAP_MINUTES
+    )
     action = 'VERZAMELEN' if watch_enabled else 'CROSS GEBLOKKEERD'
     if (
         watch_enabled
@@ -538,6 +589,7 @@ def _score_candidate(
         and positive_share >= MIN_POSITIVE_SHARE
         and stress['net_7d_historical_pct'] > 0.50
         and stress['net_7d_cost_stress_2x_pct'] > 0.0
+        and stress['net_7d_basis_shock_1pct_pct'] > 0.0
         and decay_ratio >= 0.50
         and volume_quote >= MIN_VOLUME_QUOTE_USD
         and spread_pct <= MAX_FUTURES_SPREAD_PCT
@@ -862,7 +914,7 @@ def scan_once() -> dict[str, object]:
     generated = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).isoformat()
     scan_duration_ms = max(0, int(time.time() * 1000) - scan_started_ms)
     return {
-        'version': '4.0',
+        'version': '4.1',
         'measurement_generation': MEASUREMENT_GENERATION,
         'mode': 'READ_ONLY_PUBLIC_DATA',
         'generated_at_ms': now_ms,
@@ -871,6 +923,13 @@ def scan_once() -> dict[str, object]:
         'source': 'Kraken Futures/Spot L2-orderboeken + Bitvavo L2-orderboeken',
         'research_notional_usd': notional_usd,
         'max_measurement_skew_ms': MAX_MEASUREMENT_SKEW_MS,
+        'history_requirements': {
+            'minimum_samples_72h': MIN_WATCH_SAMPLES_72H,
+            'minimum_span_hours': MIN_WATCH_SPAN_HOURS,
+            'maximum_gap_minutes': MAX_WATCH_GAP_MINUTES,
+            'basis_shock_must_be_positive': True,
+            'historical_cost_method': 'gemiddelde kosten; 2x-stress met hoogste 72u-kosten',
+        },
         'bitvavo_usdc_markets': len(usdc_markets),
         'cross_exchange_routes_expected': cross_expected,
         'cross_exchange_routes': len(cross_rows),
@@ -907,6 +966,21 @@ def _load_report() -> dict[str, object] | None:
     except (OSError, ValueError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _report_age_seconds(report: dict[str, object], now_ms: int | None = None) -> float:
+    current_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    try:
+        generated_ms = int(report.get('generated_at_ms', 0))
+    except (TypeError, ValueError, OverflowError):
+        return float('inf')
+    if generated_ms <= 0:
+        return float('inf')
+    return max(0.0, (current_ms - generated_ms) / 1000.0)
+
+
+def _report_is_stale(report: dict[str, object], now_ms: int | None = None) -> bool:
+    return _report_age_seconds(report, now_ms) > REPORT_STALE_SECONDS
 
 
 def _print_row(index: int, row: dict[str, Any]) -> None:
@@ -953,18 +1027,26 @@ def _print_row(index: int, row: dict[str, Any]) -> None:
         f" | bij -1% basis {float(row.get('net_7d_basis_shock_1pct_pct',0.0)):+.2f}%"
         f" | basis72u {float(row.get('min_basis_pct_72h',0.0)):+.2f}%..{float(row.get('max_basis_pct_72h',0.0)):+.2f}%"
     )
+    print(
+        f"   kosten72u gem/max {float(row.get('avg_roundtrip_buffer_pct_72h',0.0)):.2f}%/"
+        f"{float(row.get('max_roundtrip_buffer_pct_72h',0.0)):.2f}%"
+        f" | grootste meetpauze {float(row.get('max_gap_minutes_72h',0.0)):.1f} min"
+    )
 
 
 def print_report(report: dict[str, object]) -> None:
-    print('=== FUNDING / BASIS MONITOR v4 | EXECUTABLE L2 | READ ONLY ===')
+    age_seconds = _report_age_seconds(report)
+    freshness = 'VEROUDERD' if age_seconds > REPORT_STALE_SECONDS else 'ACTUEEL'
+    print('=== FUNDING / BASIS MONITOR v4.1 | STRICT HISTORY | READ ONLY ===')
     print(f"UTC                 : {report.get('generated_at_utc', 'n/a')}")
+    print(f"RAPPORTSTATUS       : {freshness} | leeftijd {age_seconds/60.0:.1f} min")
     print(f"BITVAVO USDC ROUTES : {report.get('cross_exchange_routes', 0)}")
     print(f"KRAKEN BESTAAND     : {report.get('native_existing_routes', 0)}")
     print(f"NATIVE WATCHLIST    : {', '.join(str(x) for x in report.get('native_holdings_configured', []))}")
     print(f"CARRY WATCH         : {report.get('watch_count', 0)}")
     print(f"SCHADUWOMVANG       : ${float(report.get('research_notional_usd', 0.0)):.0f} per leg")
     print(f"CROSS LABELS        : {'AAN' if report.get('cross_exchange_watch_enabled') else 'GEBLOKKEERD'}")
-    print('HISTORIE-EIS        : minimaal 72 uur stabiel vóór een kanslabel')
+    print('HISTORIE-EIS        : 72 uur, ≥260 samples, geen meetpauze >30,5 min')
     print(f"MARGE / BEURSRISICO : {report.get('risk_check', 'NIET BEOORDEELD')}")
     print('ORDERS              : ONMOGELIJK | alleen publieke marktdata')
 
@@ -995,9 +1077,9 @@ def print_report(report: dict[str, object]) -> None:
         for text in errors[:5]:
             print(f'  - {text}')
     print()
-    print('LET OP: v4 gebruikt uitvoerbare L2-VWAP, echte Bitvavo-prijzen en een aparte USDC/USD-meting.')
+    print('LET OP: v4.1 gebruikt L2-VWAP en gemiddelde/hoogste uitvoeringskosten uit de hele 72 uur.')
     print('Native rekent alleen de futureshedge; cross-labels blijven fail-closed geblokkeerd.')
-    print('Een native CARRY WATCH vereist 72 uur v4-historie, 2x-kostenstress en handmatige risico-controle.')
+    print('CARRY WATCH vereist ook positieve 2x-kostenstress én positieve -1%-basisstresstest.')
 
 
 def main() -> int:
@@ -1010,12 +1092,12 @@ def main() -> int:
     if args.status:
         report = _load_report()
         if report is None:
-            print('=== FUNDING / BASIS MONITOR v4 | EXECUTABLE L2 | READ ONLY ===')
+            print('=== FUNDING / BASIS MONITOR v4.1 | STRICT HISTORY | READ ONLY ===')
             print('STATUS          : nog geen rapport')
             print(f'RAPPORT         : {_report_path()}')
             return 1
         print_report(report)
-        return 0
+        return 2 if _report_is_stale(report) else 0
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)

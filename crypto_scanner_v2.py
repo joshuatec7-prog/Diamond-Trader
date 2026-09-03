@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import signal
+import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,21 +31,35 @@ STOP = False
 
 EUR_TAKER_FEE_PCT = 0.25
 USDC_TAKER_FEE_PCT = 0.05
+USDC_EUR_TAKER_FEE_PCT = 0.10
 TRADE_GRADE_SCORE = 80.0
 TRADE_GRADE_COST_MULTIPLE = 3.0
+TRADE_GRADE_MIN_NET_RR = 1.50
 WATCH_SCORE = 65.0
 WATCH_COST_MULTIPLE = 2.0
 TRADE_GRADE_MAX_SPREAD_PCT = 0.20
+REPORT_STALE_SECONDS = 35 * 60
+SIGNAL_MAX_HOLD_MS = 24 * 60 * 60 * 1000
 
 
 def _report_path() -> Path:
-    raw = os.getenv('SCANNER_V2_REPORT_PATH')
+    raw = os.getenv('SCANNER_V3_REPORT_PATH') or os.getenv('SCANNER_V2_REPORT_PATH')
     if raw:
         return Path(raw)
     data = Path('/var/data')
     if data.exists() and os.access(data, os.W_OK):
-        return data / 'cryptobot_scanner_v2.json'
-    return Path('data') / 'cryptobot_scanner_v2.json'
+        return data / 'cryptobot_scanner_v3.json'
+    return Path('data') / 'cryptobot_scanner_v3.json'
+
+
+def _db_path() -> Path:
+    raw = os.getenv('SCANNER_V3_DB_PATH')
+    if raw:
+        return Path(raw)
+    data = Path('/var/data')
+    if data.exists() and os.access(data, os.W_OK):
+        return data / 'cryptobot_scanner_v3.db'
+    return Path('data') / 'cryptobot_scanner_v3.db'
 
 
 def _stop(signum: int, frame: object) -> None:
@@ -67,8 +82,45 @@ def _taker_fee_pct(quote: str) -> float:
     return EUR_TAKER_FEE_PCT
 
 
-def _roundtrip_cost_pct(settings: Settings, spread_pct: float, quote: str) -> float:
-    return 2.0 * _taker_fee_pct(quote) + 2.0 * settings.slippage_pct + max(0.0, spread_pct)
+def _roundtrip_cost_pct(
+    settings: Settings,
+    execution_spread_pct: float,
+    quote: str,
+    conversion_cost_pct: float = 0.0,
+) -> float:
+    return (
+        2.0 * _taker_fee_pct(quote)
+        + 2.0 * settings.slippage_pct
+        + max(0.0, execution_spread_pct)
+        + max(0.0, conversion_cost_pct)
+    )
+
+
+def _conversion_cost_pct(settings: Settings, conversion_book: dict[str, float] | None) -> float:
+    if conversion_book is None:
+        return 0.0
+    return (
+        2.0 * USDC_EUR_TAKER_FEE_PCT
+        + 2.0 * settings.slippage_pct
+        + max(0.0, float(conversion_book['execution_spread_pct']))
+    )
+
+
+def _net_reward_risk(
+    *, entry: float, stop: float, target: float, side: str, roundtrip_cost_pct: float
+) -> tuple[float, float, float]:
+    if min(entry, stop, target) <= 0.0:
+        return -999.0, 999.0, 0.0
+    if side == 'SHORT':
+        gross_reward = (entry - target) / entry * 100.0
+        gross_risk = (stop - entry) / entry * 100.0
+    else:
+        gross_reward = (target - entry) / entry * 100.0
+        gross_risk = (entry - stop) / entry * 100.0
+    net_reward = gross_reward - roundtrip_cost_pct
+    total_risk = gross_risk + roundtrip_cost_pct
+    ratio = net_reward / total_risk if net_reward > 0.0 and total_risk > 0.0 else 0.0
+    return net_reward, total_risk, ratio
 
 
 def _grade_action(
@@ -77,6 +129,9 @@ def _grade_action(
     score: float,
     cost_multiple: float,
     spread_pct: float,
+    *,
+    price_in_zone: bool = True,
+    net_reward_risk: float = TRADE_GRADE_MIN_NET_RR,
 ) -> str:
     desired = 'LONG' if regime == 'BULL' else 'SHORT' if regime == 'BEAR' else ''
     if not desired:
@@ -86,9 +141,11 @@ def _grade_action(
         and score >= TRADE_GRADE_SCORE
         and cost_multiple >= TRADE_GRADE_COST_MULTIPLE
         and spread_pct <= TRADE_GRADE_MAX_SPREAD_PCT
+        and price_in_zone
+        and net_reward_risk >= TRADE_GRADE_MIN_NET_RR
     ):
         return f'{desired} TRADE-GRADE'
-    if score >= WATCH_SCORE and cost_multiple >= WATCH_COST_MULTIPLE:
+    if decision_action == desired and score >= WATCH_SCORE and cost_multiple >= WATCH_COST_MULTIPLE:
         return f'{desired} WATCH'
     return 'GEEN TRADE'
 
@@ -107,6 +164,7 @@ def _pair_snapshot(
     candle_limit: int,
     cached_candles: list | None = None,
     cached_metrics: dict[str, float] | None = None,
+    conversion_book: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     quote = _quote_asset(market)
     candles = cached_candles or api.closed_candles(market, settings.interval, candle_limit)
@@ -114,9 +172,16 @@ def _pair_snapshot(
     if not metrics:
         raise RuntimeError('onvoldoende analyse-data')
 
-    book = api.book(market)
-    spread_pct = book.spread_pct
-    cost_pct = _roundtrip_cost_pct(settings, spread_pct, quote)
+    depth = api.depth_book(market, settings.position_eur)
+    spread_pct = float(depth['spread_pct'])
+    execution_spread_pct = float(depth['execution_spread_pct'])
+    conversion_cost_pct = _conversion_cost_pct(settings, conversion_book) if quote == 'USDC' else 0.0
+    cost_pct = _roundtrip_cost_pct(
+        settings,
+        execution_spread_pct,
+        quote,
+        conversion_cost_pct=conversion_cost_pct,
+    )
     movement_proxy = _movement_proxy_pct(metrics)
     cost_multiple = movement_proxy / cost_pct if cost_pct > 0 else 0.0
     close = float(metrics['close'])
@@ -130,18 +195,16 @@ def _pair_snapshot(
 
     if regime == 'BULL':
         side = 'LONG'
-        score = _direction_score(metrics, side, cost_pct, spread_pct, settings.max_spread_pct)
+        score = _direction_score(metrics, side, cost_pct, execution_spread_pct, settings.max_spread_pct)
         decision = directional.evaluate_metrics(metrics, regime, bull_breadth, bear_breadth)
         decision_action = decision.action
         decision_reason = decision.reason
-        action = _grade_action(regime, decision_action, score, cost_multiple, spread_pct)
     elif regime == 'BEAR':
         side = 'SHORT'
-        score = _direction_score(metrics, side, cost_pct, spread_pct, settings.max_spread_pct)
+        score = _direction_score(metrics, side, cost_pct, execution_spread_pct, settings.max_spread_pct)
         decision = analyzer.evaluate_metrics(metrics, regime, bull_breadth, bear_breadth)
         decision_action = decision.action
         decision_reason = decision.reason
-        action = _grade_action(regime, decision_action, score, cost_multiple, spread_pct)
     elif regime == 'SIDEWAYS':
         side = 'LONG'
         band_decision = band.evaluate(candles)
@@ -149,7 +212,7 @@ def _pair_snapshot(
             band_decision.metrics,
             movement_proxy,
             cost_pct,
-            spread_pct,
+            execution_spread_pct,
             settings.max_spread_pct,
         )
         decision_action = band_decision.action
@@ -158,9 +221,32 @@ def _pair_snapshot(
             action = 'SIDEWAYS WATCH'
 
     plan = _price_plan(close, atr_pct, cost_pct, side if side != 'NONE' else 'LONG')
-    reasons = _reasons(metrics, side, cost_multiple, spread_pct)
+    executable_entry = float(depth['sell_vwap'] if side == 'SHORT' else depth['buy_vwap'])
+    price_in_zone = float(plan['entry_zone_low']) <= executable_entry <= float(plan['entry_zone_high'])
+    net_reward_pct, total_risk_pct, net_reward_risk = _net_reward_risk(
+        entry=executable_entry,
+        stop=float(plan['stop_hint']),
+        target=float(plan['target_hint']),
+        side=side if side != 'NONE' else 'LONG',
+        roundtrip_cost_pct=cost_pct,
+    )
+    if regime in {'BULL', 'BEAR'}:
+        action = _grade_action(
+            regime,
+            decision_action,
+            score,
+            cost_multiple,
+            execution_spread_pct,
+            price_in_zone=price_in_zone,
+            net_reward_risk=net_reward_risk,
+        )
+    reasons = _reasons(metrics, side, cost_multiple, execution_spread_pct)
     if quote == 'USDC':
-        reasons.insert(0, 'USDC fee 0,05% per kant')
+        reasons.insert(0, 'USDC-route inclusief EUR↔USDC-omwisseling')
+    if not price_in_zone:
+        reasons.insert(0, 'actuele uitvoerprijs buiten besliszone')
+    elif net_reward_risk < TRADE_GRADE_MIN_NET_RR:
+        reasons.insert(0, f'netto R/R {net_reward_risk:.2f} < {TRADE_GRADE_MIN_NET_RR:.2f}')
     if regime == 'SIDEWAYS' and action == 'SIDEWAYS WATCH':
         reasons.insert(0, 'sideways alleen observatie')
 
@@ -174,13 +260,35 @@ def _pair_snapshot(
         'decision_action': decision_action,
         'decision_reason': decision_reason,
         'spread_pct': round(spread_pct, 4),
+        'execution_spread_pct': round(execution_spread_pct, 4),
+        'shadow_notional_eur': round(settings.position_eur, 2),
+        'best_bid': round(float(depth['bid']), 8),
+        'best_ask': round(float(depth['ask']), 8),
+        'sell_vwap': round(float(depth['sell_vwap']), 8),
+        'buy_vwap': round(float(depth['buy_vwap']), 8),
+        'executable_entry': round(executable_entry, 8),
+        'bid_depth_quote': round(float(depth['bid_depth_quote']), 2),
+        'ask_depth_quote': round(float(depth['ask_depth_quote']), 2),
+        'price_in_zone': price_in_zone,
         'taker_fee_pct': _taker_fee_pct(quote),
+        'conversion_cost_pct': round(conversion_cost_pct, 4),
         'roundtrip_cost_pct': round(cost_pct, 4),
         'movement_proxy_pct': round(movement_proxy, 4),
         'cost_multiple': round(cost_multiple, 2),
         'three_x_cost_margin_pct': round(movement_proxy - 3.0 * cost_pct, 4),
         'atr_pct': round(atr_pct, 4),
         'momentum_pct': round(float(metrics.get('momentum_pct', 0.0)), 4),
+        'net_reward_pct': round(net_reward_pct, 4),
+        'total_risk_pct': round(total_risk_pct, 4),
+        'net_reward_risk': round(net_reward_risk, 3),
+        'latest_candle_ms': int(candles[-1].timestamp_ms),
+        'latest_candle_high': round(float(candles[-1].high), 8),
+        'latest_candle_low': round(float(candles[-1].low), 8),
+        'latest_candle_close': round(float(candles[-1].close), 8),
+        '_outcome_candles': [
+            [int(c.timestamp_ms), float(c.high), float(c.low), float(c.close)]
+            for c in candles[-100:]
+        ],
         'reasons': reasons[:5],
         **{key: round(value, 8) for key, value in plan.items()},
     }
@@ -223,6 +331,12 @@ def scan_once(settings: Settings) -> dict[str, object]:
     eur_candles: dict[str, list] = {}
     eur_metrics: dict[str, dict[str, float]] = {}
     errors: list[str] = []
+    conversion_book: dict[str, float] | None = None
+    if usdc_markets:
+        try:
+            conversion_book = api.depth_book('USDC-EUR', settings.position_eur)
+        except Exception as exc:
+            errors.append(f'USDC-EUR omwisseling: {type(exc).__name__}: {exc}')
 
     for market in eur_markets:
         try:
@@ -247,9 +361,8 @@ def scan_once(settings: Settings) -> dict[str, object]:
         base = _base_asset(eur_market)
         pair_options = [eur_market]
         usdc_market = f'{base}-USDC'
-        if usdc_market in usdc_markets:
+        if usdc_market in usdc_markets and conversion_book is not None:
             pair_options.append(usdc_market)
-            usdc_available += 1
 
         rows: list[dict[str, Any]] = []
         for market in pair_options:
@@ -281,12 +394,15 @@ def scan_once(settings: Settings) -> dict[str, object]:
                         bull_breadth=bull_breadth,
                         bear_breadth=bear_breadth,
                         candle_limit=candle_limit,
+                        conversion_book=conversion_book,
                     )
                 rows.append(row)
                 all_pairs.append(row)
             except Exception as exc:
                 errors.append(f'{market}: {type(exc).__name__}: {exc}')
 
+        if any(str(row.get('quote')) == 'USDC' for row in rows):
+            usdc_available += 1
         if rows:
             best = max(rows, key=_rank_key)
             best = {**best, 'pair_options': [row['market'] for row in rows]}
@@ -296,8 +412,8 @@ def scan_once(settings: Settings) -> dict[str, object]:
     trade_grade = [row for row in chosen if 'TRADE-GRADE' in str(row.get('action', ''))]
     generated_ms = int(time.time() * 1000)
     return {
-        'version': '2.0',
-        'mode': 'READ_ONLY_SCANNER',
+        'version': '3.0',
+        'mode': 'STRICT_L2_READ_ONLY_SCANNER',
         'generated_at_ms': generated_ms,
         'generated_at_utc': datetime.fromtimestamp(generated_ms / 1000.0, tz=timezone.utc).isoformat(),
         'interval': settings.interval,
@@ -319,8 +435,12 @@ def scan_once(settings: Settings) -> dict[str, object]:
             'trade_grade_score_min': TRADE_GRADE_SCORE,
             'trade_grade_cost_multiple_min': TRADE_GRADE_COST_MULTIPLE,
             'trade_grade_max_spread_pct': TRADE_GRADE_MAX_SPREAD_PCT,
+            'trade_grade_min_net_reward_risk': TRADE_GRADE_MIN_NET_RR,
+            'price_must_be_in_zone': True,
+            'shadow_notional_eur': settings.position_eur,
             'eur_taker_fee_pct': EUR_TAKER_FEE_PCT,
             'usdc_taker_fee_pct': USDC_TAKER_FEE_PCT,
+            'usdc_eur_taker_fee_pct': USDC_EUR_TAKER_FEE_PCT,
         },
         'note': 'Zeldzame kansen zijn een strenge beslisfilter, geen koop- of verkoopadvies. De scanner opent nooit orders.',
     }
@@ -345,15 +465,226 @@ def _load_report() -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
+def _report_age_seconds(report: dict[str, object], now_ms: int | None = None) -> float:
+    current_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    try:
+        generated_ms = int(report.get('generated_at_ms', 0))
+    except (TypeError, ValueError, OverflowError):
+        return float('inf')
+    if generated_ms <= 0:
+        return float('inf')
+    return max(0.0, (current_ms - generated_ms) / 1000.0)
+
+
+def _report_is_stale(report: dict[str, object], now_ms: int | None = None) -> bool:
+    return _report_age_seconds(report, now_ms) > REPORT_STALE_SECONDS
+
+
+def _scanner_db_connect() -> sqlite3.Connection:
+    path = _db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute(
+        '''CREATE TABLE IF NOT EXISTS snapshots (
+            generated_ms INTEGER NOT NULL,
+            market TEXT NOT NULL,
+            action TEXT NOT NULL,
+            score REAL NOT NULL,
+            executable_entry REAL NOT NULL,
+            roundtrip_cost_pct REAL NOT NULL,
+            net_reward_risk REAL NOT NULL,
+            price_in_zone INTEGER NOT NULL,
+            PRIMARY KEY (generated_ms, market)
+        )'''
+    )
+    conn.execute(
+        '''CREATE TABLE IF NOT EXISTS signals (
+            generated_ms INTEGER NOT NULL,
+            market TEXT NOT NULL,
+            side TEXT NOT NULL,
+            signal_candle_ms INTEGER NOT NULL,
+            entry_price REAL NOT NULL,
+            stop_price REAL NOT NULL,
+            target_price REAL NOT NULL,
+            roundtrip_cost_pct REAL NOT NULL,
+            net_reward_risk REAL NOT NULL,
+            status TEXT NOT NULL,
+            evaluated_candle_ms INTEGER,
+            exit_price REAL,
+            outcome TEXT,
+            net_return_pct REAL,
+            PRIMARY KEY (generated_ms, market)
+        )'''
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_scanner_one_open_signal "
+        "ON signals(market) WHERE status='OPEN'"
+    )
+    conn.commit()
+    return conn
+
+
+def _signal_net_return(side: str, entry: float, exit_price: float, cost_pct: float) -> float:
+    gross = (
+        (entry - exit_price) / entry * 100.0
+        if side == 'SHORT'
+        else (exit_price - entry) / entry * 100.0
+    )
+    return gross - cost_pct
+
+
+def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
+    generated_ms = int(report.get('generated_at_ms', 0))
+    snapshots = report.get('candidates', [])
+    all_pairs = report.get('all_pair_snapshots', [])
+    rare = report.get('rare_opportunities', [])
+    pair_by_market = {
+        str(row.get('market')): row
+        for row in all_pairs
+        if isinstance(row, dict) and row.get('market')
+    } if isinstance(all_pairs, list) else {}
+
+    conn = _scanner_db_connect()
+    try:
+        if isinstance(snapshots, list):
+            for row in snapshots:
+                if not isinstance(row, dict):
+                    continue
+                conn.execute(
+                    '''INSERT OR REPLACE INTO snapshots
+                       (generated_ms,market,action,score,executable_entry,roundtrip_cost_pct,
+                        net_reward_risk,price_in_zone) VALUES (?,?,?,?,?,?,?,?)''',
+                    (
+                        generated_ms, str(row.get('market', '')), str(row.get('action', '')),
+                        float(row.get('score', 0.0)), float(row.get('executable_entry', 0.0)),
+                        float(row.get('roundtrip_cost_pct', 0.0)),
+                        float(row.get('net_reward_risk', 0.0)), int(bool(row.get('price_in_zone'))),
+                    ),
+                )
+
+        open_signals = conn.execute(
+            '''SELECT generated_ms,market,side,signal_candle_ms,entry_price,stop_price,
+                      target_price,roundtrip_cost_pct FROM signals WHERE status='OPEN' '''
+        ).fetchall()
+        for signal in open_signals:
+            signal_ms, market, side, signal_candle_ms, entry, stop, target, cost = signal
+            row = pair_by_market.get(str(market))
+            if row is None:
+                continue
+            outcome = ''
+            exit_price = 0.0
+            evaluated_candle_ms = 0
+            raw_candles = row.get('_outcome_candles', [])
+            candles = raw_candles if isinstance(raw_candles, list) else []
+            if not candles:
+                candles = [[
+                    row.get('latest_candle_ms', 0), row.get('latest_candle_high', 0.0),
+                    row.get('latest_candle_low', 0.0), row.get('latest_candle_close', 0.0),
+                ]]
+            for candle in candles:
+                if not isinstance(candle, (list, tuple)) or len(candle) < 4:
+                    continue
+                candle_ms, high, low, close = (
+                    int(candle[0]), float(candle[1]), float(candle[2]), float(candle[3])
+                )
+                if candle_ms <= int(signal_candle_ms):
+                    continue
+                if str(side) == 'SHORT':
+                    stop_hit = high >= float(stop)
+                    target_hit = low <= float(target)
+                else:
+                    stop_hit = low <= float(stop)
+                    target_hit = high >= float(target)
+                if stop_hit:
+                    outcome, exit_price = 'STOP', float(stop)
+                elif target_hit:
+                    outcome, exit_price = 'TARGET', float(target)
+                elif candle_ms - int(signal_candle_ms) >= SIGNAL_MAX_HOLD_MS:
+                    outcome, exit_price = 'TIME', close
+                if outcome:
+                    evaluated_candle_ms = candle_ms
+                    break
+            if not outcome:
+                continue
+            net_return = _signal_net_return(str(side), float(entry), exit_price, float(cost))
+            conn.execute(
+                '''UPDATE signals SET status='CLOSED',evaluated_candle_ms=?,exit_price=?,
+                   outcome=?,net_return_pct=? WHERE generated_ms=? AND market=?''',
+                (evaluated_candle_ms, exit_price, outcome, net_return, signal_ms, market),
+            )
+
+        if isinstance(rare, list):
+            for row in rare:
+                if not isinstance(row, dict):
+                    continue
+                conn.execute(
+                    '''INSERT OR IGNORE INTO signals
+                       (generated_ms,market,side,signal_candle_ms,entry_price,stop_price,
+                        target_price,roundtrip_cost_pct,net_reward_risk,status)
+                       VALUES (?,?,?,?,?,?,?,?,?,'OPEN')''',
+                    (
+                        generated_ms, str(row.get('market', '')), str(row.get('side', '')),
+                        int(row.get('latest_candle_ms', 0)), float(row.get('executable_entry', 0.0)),
+                        float(row.get('stop_hint', 0.0)), float(row.get('target_hint', 0.0)),
+                        float(row.get('roundtrip_cost_pct', 0.0)),
+                        float(row.get('net_reward_risk', 0.0)),
+                    ),
+                )
+
+        retention_cutoff = generated_ms - 100 * 24 * 60 * 60 * 1000
+        conn.execute('DELETE FROM snapshots WHERE generated_ms<?', (retention_cutoff,))
+        conn.commit()
+        total, open_count, closed, wins, net_sum, positive_sum, negative_sum = conn.execute(
+            '''SELECT COUNT(*),
+                      SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN status='CLOSED' AND net_return_pct>0 THEN 1 ELSE 0 END),
+                      COALESCE(SUM(CASE WHEN status='CLOSED' THEN net_return_pct ELSE 0 END),0),
+                      COALESCE(SUM(CASE WHEN net_return_pct>0 THEN net_return_pct ELSE 0 END),0),
+                      COALESCE(SUM(CASE WHEN net_return_pct<0 THEN -net_return_pct ELSE 0 END),0)
+               FROM signals'''
+        ).fetchone()
+        profit_factor = float(positive_sum) / float(negative_sum) if float(negative_sum) > 0 else 0.0
+        return {
+            'database': str(_db_path()),
+            'signals_total': int(total or 0),
+            'signals_open': int(open_count or 0),
+            'signals_closed': int(closed or 0),
+            'wins': int(wins or 0),
+            'losses': int((closed or 0) - (wins or 0)),
+            'net_return_sum_pct': round(float(net_sum), 3),
+            'profit_factor': round(profit_factor, 3),
+            'outcome_rule': 'STOP eerst als stop en target in dezelfde 15m-candle liggen',
+        }
+    finally:
+        conn.close()
+
+
+def _strip_internal_research_data(report: dict[str, object]) -> None:
+    for value in report.values():
+        if not isinstance(value, list):
+            continue
+        for row in value:
+            if isinstance(row, dict):
+                row.pop('_outcome_candles', None)
+
+
 def print_report(report: dict[str, object]) -> None:
-    print('=== CRYPTO SCANNER v2 | EUR + USDC | READ ONLY ===')
+    age_seconds = _report_age_seconds(report)
+    freshness = 'VEROUDERD' if age_seconds > REPORT_STALE_SECONDS else 'ACTUEEL'
+    print('=== CRYPTO SCANNER v3 | STRICT L2 | READ ONLY ===')
     print(f"UTC             : {report.get('generated_at_utc', 'n/a')}")
+    print(f"RAPPORTSTATUS   : {freshness} | leeftijd {age_seconds/60.0:.1f} min")
     print(f"REGIME          : {report.get('regime', 'UNKNOWN')}")
     print(f"BULL BREADTH    : {float(report.get('bull_breadth_pct', 0.0)):.1f}%")
     print(f"BEAR BREADTH    : {float(report.get('bear_breadth_pct', 0.0)):.1f}%")
     print(f"MARKTEN GELDIG  : {report.get('valid_reference_markets', 0)}/{len(report.get('reference_universe', []))}")
-    print(f"USDC BESCHIKBAAR: {report.get('usdc_available_for_reference_assets', 0)}/{len(report.get('reference_universe', []))}")
+    print(f"USDC BRUIKBAAR  : {report.get('usdc_available_for_reference_assets', 0)}/{len(report.get('reference_universe', []))}")
     print(f"ZELDZAME KANSEN : {report.get('rare_opportunity_count', report.get('trade_grade_count', 0))}")
+    rules = report.get('rules', {})
+    shadow = rules.get('shadow_notional_eur', 0.0) if isinstance(rules, dict) else 0.0
+    print(f"SCHADUWOMVANG   : €{float(shadow):.0f} met volledige orderboekdiepte")
     print('BESLISSING       : ALTIJD ZELF | dit is geen koop- of verkoopadvies')
     print('ORDERS           : ONMOGELIJK | scanner heeft geen private trading-capability')
     print()
@@ -369,7 +700,12 @@ def print_report(report: dict[str, object]) -> None:
                 f"{index}. {str(row.get('market','?')):12s} | {_display_action(row.get('action'))}"
                 f" | score {float(row.get('score',0.0)):.1f}/100"
                 f" | xkosten {float(row.get('cost_multiple',0.0)):.2f}"
-                f" | spread {float(row.get('spread_pct',0.0)):.3f}%"
+                f" | netto R/R {float(row.get('net_reward_risk',0.0)):.2f}"
+            )
+            print(
+                f"   uitvoerprijs {_fmt_price(row.get('executable_entry'))}"
+                f" | L2-spread {float(row.get('execution_spread_pct',0.0)):.3f}%"
+                f" | kosten {float(row.get('roundtrip_cost_pct',0.0)):.2f}%"
             )
             print(
                 f"   besliszone {_fmt_price(row.get('entry_zone_low'))} - {_fmt_price(row.get('entry_zone_high'))}"
@@ -391,10 +727,11 @@ def print_report(report: dict[str, object]) -> None:
                 f" | score {float(row.get('score',0.0)):5.1f}/100"
                 f" | kosten {float(row.get('roundtrip_cost_pct',0.0)):.2f}%"
                 f" | beweging {float(row.get('movement_proxy_pct',0.0)):.2f}%"
-                f" | xkosten {float(row.get('cost_multiple',0.0)):.2f}"
+                f" | netto R/R {float(row.get('net_reward_risk',0.0)):.2f}"
             )
             print(
                 f"   opties {', '.join(str(x) for x in row.get('pair_options', []))}"
+                f" | uitvoer {_fmt_price(row.get('executable_entry'))}"
                 f" | zone {_fmt_price(row.get('entry_zone_low'))} - {_fmt_price(row.get('entry_zone_high'))}"
                 f" | stop {_fmt_price(row.get('stop_hint'))} | target {_fmt_price(row.get('target_hint'))}"
             )
@@ -407,8 +744,19 @@ def print_report(report: dict[str, object]) -> None:
         print(f'WAARSCHUWINGEN   : {len(errors)}')
         for text in errors[:5]:
             print(f'  - {text}')
+    research = report.get('signal_research', {})
+    if isinstance(research, dict):
+        print()
+        print('=== PROSPECTIEVE SIGNAALCONTROLE ===')
+        print(
+            f"signalen {int(research.get('signals_total',0))}"
+            f" | open {int(research.get('signals_open',0))}"
+            f" | gesloten {int(research.get('signals_closed',0))}"
+            f" | W/L {int(research.get('wins',0))}/{int(research.get('losses',0))}"
+            f" | PF {float(research.get('profit_factor',0.0)):.3f}"
+        )
     print()
-    print('LET OP: een ZELDZAME KANS is een strenge beslisfilter, geen bewezen winstverwachting.')
+    print('LET OP: alleen actuele €200-L2-uitvoer, prijs in zone en netto R/R ≥ 1,50 kunnen een kanslabel geven.')
 
 
 def main() -> int:
@@ -428,12 +776,12 @@ def main() -> int:
     if args.status:
         report = _load_report()
         if report is None:
-            print('=== CRYPTO SCANNER v2 | EUR + USDC | READ ONLY ===')
+            print('=== CRYPTO SCANNER v3 | STRICT L2 | READ ONLY ===')
             print('STATUS          : nog geen rapport beschikbaar')
             print(f'RAPPORT         : {_report_path()}')
             return 1
         print_report(report)
-        return 0
+        return 2 if _report_is_stale(report) else 0
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
@@ -442,6 +790,8 @@ def main() -> int:
     while not STOP:
         try:
             report = scan_once(settings)
+            report['signal_research'] = _persist_signal_research(report)
+            _strip_internal_research_data(report)
             _write_report(report)
             print_report(report)
         except Exception as exc:

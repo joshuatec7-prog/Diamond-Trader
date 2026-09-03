@@ -181,3 +181,76 @@ class BitvavoPublic:
         if not book.is_valid:
             raise RuntimeError(f'ongeldige bid/ask voor {market}')
         return book
+
+    @staticmethod
+    def _depth_levels(value: Any, *, reverse: bool) -> List[tuple[float, float]]:
+        if not isinstance(value, list):
+            raise RuntimeError('orderboekniveaus ontbreken')
+        levels: List[tuple[float, float]] = []
+        for row in value:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            try:
+                price = float(row[0])
+                amount = float(row[1])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(price) and math.isfinite(amount) and price > 0 and amount > 0:
+                levels.append((price, amount))
+        if not levels:
+            raise RuntimeError('orderboek bevat geen geldige niveaus')
+        levels.sort(key=lambda item: item[0], reverse=reverse)
+        return levels
+
+    @staticmethod
+    def _depth_vwap(levels: List[tuple[float, float]], notional_quote: float) -> tuple[float, float]:
+        remaining = notional_quote
+        quote_used = 0.0
+        base_used = 0.0
+        for price, amount in levels:
+            available_quote = price * amount
+            used_quote = min(remaining, available_quote)
+            quote_used += used_quote
+            base_used += used_quote / price
+            remaining -= used_quote
+            if remaining <= max(1e-9, notional_quote * 1e-9):
+                break
+        total_depth = sum(price * amount for price, amount in levels)
+        if remaining > max(1e-9, notional_quote * 1e-9) or base_used <= 0:
+            raise RuntimeError(
+                f'onvoldoende orderboekdiepte: {total_depth:.2f} beschikbaar voor {notional_quote:.2f}'
+            )
+        return quote_used / base_used, total_depth
+
+    def depth_book(self, market: str, notional_quote: float, depth: int = 100) -> Dict[str, float]:
+        """Meet uitvoerbare koop/verkoop-VWAP voor een concrete schaduworder."""
+        if not math.isfinite(notional_quote) or notional_quote <= 0:
+            raise ValueError('notional_quote moet positief en eindig zijn')
+        payload = self._get(f'/{market}/book', {'depth': depth})
+        if not isinstance(payload, dict):
+            raise RuntimeError(f'ongeldig orderboek voor {market}')
+        returned_market = str(payload.get('market', market)).upper()
+        if returned_market != market.upper():
+            raise RuntimeError(f'orderboek hoort bij {returned_market}, niet {market}')
+        bids = self._depth_levels(payload.get('bids'), reverse=True)
+        asks = self._depth_levels(payload.get('asks'), reverse=False)
+        bid = bids[0][0]
+        ask = asks[0][0]
+        if ask < bid:
+            raise RuntimeError(f'gekruist orderboek voor {market}')
+        sell_vwap, bid_depth_quote = self._depth_vwap(bids, notional_quote)
+        buy_vwap, ask_depth_quote = self._depth_vwap(asks, notional_quote)
+        mid = (bid + ask) / 2.0
+        return {
+            'bid': bid,
+            'ask': ask,
+            'mid': mid,
+            'spread_pct': (ask / bid - 1.0) * 100.0,
+            'sell_vwap': sell_vwap,
+            'buy_vwap': buy_vwap,
+            'execution_spread_pct': (buy_vwap / sell_vwap - 1.0) * 100.0,
+            'bid_depth_quote': bid_depth_quote,
+            'ask_depth_quote': ask_depth_quote,
+            'notional_quote': notional_quote,
+            'captured_at_ms': float(int(time.time() * 1000)),
+        }
