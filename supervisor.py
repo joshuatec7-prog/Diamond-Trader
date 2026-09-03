@@ -66,19 +66,12 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
+    # De verliesgevende PAPER-strategieën en langdurige researchprocessen blijven als
+    # broncode en database bewaard, maar worden niet meer gestart. Alleen de twee
+    # actuele read-only monitors blijven actief; beide kunnen nooit orders plaatsen.
     CHILDREN = [
-        Child([sys.executable, '-u', 'main.py'], critical=True),
-        Child([sys.executable, '-u', 'trend_v7_main.py'], critical=True),
-        Child([sys.executable, '-u', 'continuation_v6_main.py'], critical=True),
-        Child([sys.executable, '-u', 'adaptive_trend_main.py'], critical=True),
-        Child([sys.executable, '-u', 'adaptive_ls_main.py'], critical=True),
-        Child([sys.executable, '-u', 'adaptive_ls_strict_main.py'], critical=False),
         Child([sys.executable, '-u', 'crypto_scanner_v2.py'], critical=False),
-        Child([sys.executable, '-u', 'crypto_research_v4.py'], critical=False),
         Child([sys.executable, '-u', 'funding_basis_monitor.py'], critical=False),
-        Child([sys.executable, '-u', 'audit_all.py'], critical=False),
-        Child([sys.executable, '-u', 'auto_research_controller_d2.py'], critical=False),
-        Child([sys.executable, '-u', 'research_report_publisher.py'], critical=False),
     ]
 
     for child in CHILDREN:
