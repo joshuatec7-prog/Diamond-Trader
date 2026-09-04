@@ -413,8 +413,8 @@ def scan_once(settings: Settings) -> dict[str, object]:
     trade_grade = [row for row in chosen if 'TRADE-GRADE' in str(row.get('action', ''))]
     generated_ms = int(time.time() * 1000)
     return {
-        'version': '3.0',
-        'mode': 'STRICT_L2_READ_ONLY_SCANNER',
+        'version': '3.1',
+        'mode': 'STRICT_L2_AUDIT_READ_ONLY_SCANNER',
         'generated_at_ms': generated_ms,
         'generated_at_utc': datetime.fromtimestamp(generated_ms / 1000.0, tz=timezone.utc).isoformat(),
         'interval': settings.interval,
