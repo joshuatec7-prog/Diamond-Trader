@@ -13,6 +13,7 @@ from crypto_scanner_v2 import (
     _net_reward_risk,
     _pair_snapshot,
     _persist_signal_research,
+    _practical_net_return,
     _report_is_stale,
     _roundtrip_cost_pct,
     _taker_fee_pct,
@@ -289,6 +290,98 @@ class CryptoScannerTests(unittest.TestCase):
             self.assertIn('decision_reason', columns)
             self.assertIn('cost_multiple', columns)
             self.assertIn('reasons_json', columns)
+
+    def test_practical_watch_tracker_uses_l2_prices_and_trailing_profit(self):
+        watch = {
+            'market': 'WATCH-EUR', 'action': 'LONG WATCH', 'side': 'LONG',
+            'decision_action': 'LONG', 'decision_reason': 'test_long',
+            'score': 75.0, 'executable_entry': 100.0,
+            'buy_vwap': 100.0, 'sell_vwap': 99.9,
+            'roundtrip_cost_pct': 0.76, 'execution_spread_pct': 0.10,
+            'cost_multiple': 4.0, 'net_reward_risk': 1.2,
+            'price_in_zone': False, 'reasons': [],
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            first = {
+                'generated_at_ms': 1_000,
+                'regime': 'BULL',
+                'rules': {'shadow_notional_eur': 200.0},
+                'candidates': [watch],
+                'all_pair_snapshots': [watch],
+                'rare_opportunities': [],
+            }
+            stats = _persist_signal_research(first)
+            self.assertEqual(stats['practical_total'], 1)
+            self.assertEqual(stats['practical_open'], 1)
+
+            rising = {**watch, 'action': 'GEEN TRADE', 'sell_vwap': 102.0}
+            stats = _persist_signal_research({
+                **first,
+                'generated_at_ms': 901_000,
+                'candidates': [rising],
+                'all_pair_snapshots': [rising],
+            })
+            self.assertEqual(stats['practical_open'], 1)
+
+            pullback = {**rising, 'sell_vwap': 100.99}
+            stats = _persist_signal_research({
+                **first,
+                'generated_at_ms': 1_801_000,
+                'candidates': [pullback],
+                'all_pair_snapshots': [pullback],
+            })
+            self.assertEqual(stats['practical_open'], 0)
+            self.assertEqual(stats['practical_closed'], 1)
+            self.assertEqual(stats['practical_wins'], 1)
+            self.assertEqual(stats['practical_outcomes']['trail'], 1)
+            self.assertGreater(stats['practical_pnl_eur'], 0.0)
+
+            conn = sqlite3.connect(os.environ['SCANNER_V3_DB_PATH'])
+            outcome, net_return = conn.execute(
+                'SELECT outcome,net_return_pct FROM practical_signals'
+            ).fetchone()
+            conn.close()
+            self.assertEqual(outcome, 'TRAIL')
+            self.assertAlmostEqual(net_return, _practical_net_return(100.0, 100.99, 0.66))
+
+    def test_practical_watch_tracker_opens_only_one_route_per_asset(self):
+        eur = {
+            'market': 'AAA-EUR', 'base': 'AAA', 'action': 'LONG WATCH', 'side': 'LONG',
+            'buy_vwap': 100.0, 'sell_vwap': 99.9, 'roundtrip_cost_pct': 0.76,
+            'execution_spread_pct': 0.10, 'score': 75.0,
+            'net_reward_risk': 1.2, 'price_in_zone': False,
+        }
+        usdc = {**eur, 'market': 'AAA-USDC', 'buy_vwap': 100.1}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            stats = _persist_signal_research({
+                'generated_at_ms': 1_000, 'regime': 'BULL',
+                'candidates': [eur, usdc], 'all_pair_snapshots': [eur, usdc],
+                'rare_opportunities': [],
+            })
+            self.assertEqual(stats['practical_total'], 1)
+            self.assertEqual(stats['practical_open'], 1)
+
+    def test_practical_watch_tracker_does_not_open_short_watch(self):
+        short_watch = {
+            'market': 'SHORT-EUR', 'action': 'SHORT WATCH', 'side': 'SHORT',
+            'score': 75.0, 'executable_entry': 100.0,
+            'buy_vwap': 100.1, 'sell_vwap': 100.0,
+            'roundtrip_cost_pct': 0.76, 'execution_spread_pct': 0.10,
+            'net_reward_risk': 2.0, 'price_in_zone': True,
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            stats = _persist_signal_research({
+                'generated_at_ms': 1_000, 'regime': 'BEAR',
+                'candidates': [short_watch], 'all_pair_snapshots': [short_watch],
+                'rare_opportunities': [],
+            })
+            self.assertEqual(stats['practical_total'], 0)
 
 
 if __name__ == '__main__':

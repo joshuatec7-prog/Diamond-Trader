@@ -41,6 +41,11 @@ TRADE_GRADE_MAX_SPREAD_PCT = 0.20
 REPORT_STALE_SECONDS = 35 * 60
 SIGNAL_MAX_HOLD_MS = 24 * 60 * 60 * 1000
 AUDIT_WINDOW_MS = 24 * 60 * 60 * 1000
+PRACTICAL_MAX_HOLD_MS = 48 * 60 * 60 * 1000
+PRACTICAL_STOP_NET_PCT = -3.00
+PRACTICAL_TRAIL_ACTIVATE_NET_PCT = 1.00
+PRACTICAL_TRAIL_GIVEBACK_PCT = 1.00
+PRACTICAL_MIN_LOCK_NET_PCT = 0.25
 
 
 def _report_path() -> Path:
@@ -413,8 +418,8 @@ def scan_once(settings: Settings) -> dict[str, object]:
     trade_grade = [row for row in chosen if 'TRADE-GRADE' in str(row.get('action', ''))]
     generated_ms = int(time.time() * 1000)
     return {
-        'version': '3.1',
-        'mode': 'STRICT_L2_AUDIT_READ_ONLY_SCANNER',
+        'version': '3.2',
+        'mode': 'STRICT_L2_AUDIT_PRACTICAL_PAPER_SCANNER',
         'generated_at_ms': generated_ms,
         'generated_at_utc': datetime.fromtimestamp(generated_ms / 1000.0, tz=timezone.utc).isoformat(),
         'interval': settings.interval,
@@ -544,6 +549,28 @@ def _scanner_db_connect() -> sqlite3.Connection:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_scanner_one_open_signal "
         "ON signals(market) WHERE status='OPEN'"
     )
+    conn.execute(
+        '''CREATE TABLE IF NOT EXISTS practical_signals (
+            generated_ms INTEGER NOT NULL,
+            market TEXT NOT NULL,
+            base_asset TEXT NOT NULL,
+            signal_action TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            non_book_cost_pct REAL NOT NULL,
+            status TEXT NOT NULL,
+            max_net_return_pct REAL NOT NULL DEFAULT 0,
+            trailing_floor_pct REAL,
+            evaluated_ms INTEGER,
+            exit_price REAL,
+            outcome TEXT,
+            net_return_pct REAL,
+            PRIMARY KEY (generated_ms, market)
+        )'''
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_scanner_one_open_practical_base "
+        "ON practical_signals(base_asset) WHERE status='OPEN'"
+    )
     conn.commit()
     return conn
 
@@ -557,8 +584,18 @@ def _signal_net_return(side: str, entry: float, exit_price: float, cost_pct: flo
     return gross - cost_pct
 
 
+def _practical_net_return(entry: float, executable_sell: float, non_book_cost_pct: float) -> float:
+    if entry <= 0.0 or executable_sell <= 0.0:
+        return -999.0
+    return (executable_sell / entry - 1.0) * 100.0 - max(0.0, non_book_cost_pct)
+
+
 def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
     generated_ms = int(report.get('generated_at_ms', 0))
+    rules = report.get('rules', {})
+    shadow_notional_eur = (
+        float(rules.get('shadow_notional_eur', 200.0)) if isinstance(rules, dict) else 200.0
+    )
     snapshots = report.get('candidates', [])
     all_pairs = report.get('all_pair_snapshots', [])
     rare = report.get('rare_opportunities', [])
@@ -663,6 +700,104 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
                     ),
                 )
 
+        closed_practical_bases: set[str] = set()
+        open_practical = conn.execute(
+            '''SELECT generated_ms,market,base_asset,entry_price,non_book_cost_pct,
+                      max_net_return_pct,trailing_floor_pct
+               FROM practical_signals WHERE status='OPEN' '''
+        ).fetchall()
+        for practical in open_practical:
+            (
+                practical_ms,
+                market,
+                base_asset,
+                entry_price,
+                non_book_cost_pct,
+                stored_max_net,
+                stored_trailing_floor,
+            ) = practical
+            row = pair_by_market.get(str(market))
+            if row is None:
+                continue
+            executable_sell = float(row.get('sell_vwap', 0.0))
+            net_return = _practical_net_return(
+                float(entry_price), executable_sell, float(non_book_cost_pct)
+            )
+            max_net = max(float(stored_max_net), net_return)
+            trailing_floor = (
+                float(stored_trailing_floor) if stored_trailing_floor is not None else None
+            )
+            if max_net >= PRACTICAL_TRAIL_ACTIVATE_NET_PCT:
+                new_floor = max(
+                    PRACTICAL_MIN_LOCK_NET_PCT,
+                    max_net - PRACTICAL_TRAIL_GIVEBACK_PCT,
+                )
+                trailing_floor = max(trailing_floor, new_floor) if trailing_floor is not None else new_floor
+
+            outcome = ''
+            if net_return <= PRACTICAL_STOP_NET_PCT:
+                outcome = 'STOP'
+            elif trailing_floor is not None and net_return <= trailing_floor:
+                outcome = 'TRAIL'
+            elif generated_ms - int(practical_ms) >= PRACTICAL_MAX_HOLD_MS:
+                outcome = 'TIME'
+
+            if outcome:
+                conn.execute(
+                    '''UPDATE practical_signals
+                       SET status='CLOSED',max_net_return_pct=?,trailing_floor_pct=?,
+                           evaluated_ms=?,exit_price=?,outcome=?,net_return_pct=?
+                       WHERE generated_ms=? AND market=?''',
+                    (
+                        max_net,
+                        trailing_floor,
+                        generated_ms,
+                        executable_sell,
+                        outcome,
+                        net_return,
+                        practical_ms,
+                        market,
+                    ),
+                )
+                closed_practical_bases.add(str(base_asset))
+            else:
+                conn.execute(
+                    '''UPDATE practical_signals
+                       SET max_net_return_pct=?,trailing_floor_pct=?
+                       WHERE generated_ms=? AND market=?''',
+                    (max_net, trailing_floor, practical_ms, market),
+                )
+
+        if isinstance(snapshots, list):
+            for row in snapshots:
+                if not isinstance(row, dict):
+                    continue
+                market = str(row.get('market', ''))
+                base_asset = str(row.get('base') or _base_asset(market)) if market else ''
+                action = str(row.get('action', ''))
+                if (
+                    not market
+                    or not base_asset
+                    or base_asset in closed_practical_bases
+                    or action not in {'LONG WATCH', 'LONG TRADE-GRADE', 'SIDEWAYS WATCH'}
+                ):
+                    continue
+                entry_price = float(row.get('buy_vwap', row.get('executable_entry', 0.0)))
+                non_book_cost = max(
+                    0.0,
+                    float(row.get('roundtrip_cost_pct', 0.0))
+                    - float(row.get('execution_spread_pct', 0.0)),
+                )
+                if entry_price <= 0.0:
+                    continue
+                conn.execute(
+                    '''INSERT OR IGNORE INTO practical_signals
+                       (generated_ms,market,base_asset,signal_action,entry_price,non_book_cost_pct,
+                        status,max_net_return_pct)
+                       VALUES (?,?,?,?,?,?,'OPEN',0)''',
+                    (generated_ms, market, base_asset, action, entry_price, non_book_cost),
+                )
+
         retention_cutoff = generated_ms - 100 * 24 * 60 * 60 * 1000
         conn.execute('DELETE FROM snapshots WHERE generated_ms<?', (retention_cutoff,))
         conn.commit()
@@ -731,7 +866,47 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
                 (audit_cutoff,),
             ).fetchall()
         ]
+        (
+            practical_total,
+            practical_open_count,
+            practical_closed,
+            practical_wins,
+            practical_net_sum,
+            practical_positive_sum,
+            practical_negative_sum,
+            practical_stops,
+            practical_trails,
+            practical_times,
+        ) = conn.execute(
+            '''SELECT COUNT(*),
+                      SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN status='CLOSED' AND net_return_pct>0 THEN 1 ELSE 0 END),
+                      COALESCE(SUM(CASE WHEN status='CLOSED' THEN net_return_pct ELSE 0 END),0),
+                      COALESCE(SUM(CASE WHEN net_return_pct>0 THEN net_return_pct ELSE 0 END),0),
+                      COALESCE(SUM(CASE WHEN net_return_pct<0 THEN -net_return_pct ELSE 0 END),0),
+                      SUM(CASE WHEN outcome='STOP' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN outcome='TRAIL' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN outcome='TIME' THEN 1 ELSE 0 END)
+               FROM practical_signals'''
+        ).fetchone()
+        practical_open_net_sum = 0.0
+        for market, entry_price, non_book_cost in conn.execute(
+            '''SELECT market,entry_price,non_book_cost_pct
+               FROM practical_signals WHERE status='OPEN' '''
+        ).fetchall():
+            current = pair_by_market.get(str(market))
+            if current is None:
+                continue
+            practical_open_net_sum += _practical_net_return(
+                float(entry_price), float(current.get('sell_vwap', 0.0)), float(non_book_cost)
+            )
         profit_factor = float(positive_sum) / float(negative_sum) if float(negative_sum) > 0 else 0.0
+        practical_profit_factor = (
+            float(practical_positive_sum) / float(practical_negative_sum)
+            if float(practical_negative_sum) > 0
+            else 0.0
+        )
         return {
             'database': str(_db_path()),
             'signals_total': int(total or 0),
@@ -758,6 +933,35 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
                 'net_reward_risk': int(blocked_net_rr or 0),
             },
             'audit_top_decision_reasons': top_decision_reasons,
+            'practical_total': int(practical_total or 0),
+            'practical_open': int(practical_open_count or 0),
+            'practical_closed': int(practical_closed or 0),
+            'practical_wins': int(practical_wins or 0),
+            'practical_losses': int((practical_closed or 0) - (practical_wins or 0)),
+            'practical_net_return_sum_pct': round(float(practical_net_sum), 3),
+            'practical_open_net_return_sum_pct': round(float(practical_open_net_sum), 3),
+            'practical_pnl_eur': round(
+                float(practical_net_sum) * shadow_notional_eur / 100.0, 2
+            ),
+            'practical_open_pnl_eur': round(
+                float(practical_open_net_sum) * shadow_notional_eur / 100.0, 2
+            ),
+            'practical_profit_factor': round(practical_profit_factor, 3),
+            'practical_outcomes': {
+                'stop': int(practical_stops or 0),
+                'trail': int(practical_trails or 0),
+                'time': int(practical_times or 0),
+            },
+            'practical_rules': {
+                'entry': 'LONG WATCH, SIDEWAYS WATCH of zeldzame LONG tegen L2-buy-VWAP',
+                'exit': 'iedere 15 minuten tegen L2-sell-VWAP',
+                'stop_net_pct': PRACTICAL_STOP_NET_PCT,
+                'trail_activate_net_pct': PRACTICAL_TRAIL_ACTIVATE_NET_PCT,
+                'trail_giveback_pct': PRACTICAL_TRAIL_GIVEBACK_PCT,
+                'minimum_locked_net_pct': PRACTICAL_MIN_LOCK_NET_PCT,
+                'max_hold_hours': PRACTICAL_MAX_HOLD_MS // (60 * 60 * 1000),
+                'shadow_notional_eur': shadow_notional_eur,
+            },
         }
     finally:
         conn.close()
@@ -775,7 +979,7 @@ def _strip_internal_research_data(report: dict[str, object]) -> None:
 def print_report(report: dict[str, object]) -> None:
     age_seconds = _report_age_seconds(report)
     freshness = 'VEROUDERD' if age_seconds > REPORT_STALE_SECONDS else 'ACTUEEL'
-    print('=== CRYPTO SCANNER v3.1 | STRICT L2 + AUDIT | READ ONLY ===')
+    print('=== CRYPTO SCANNER v3.2 | STRICT L2 + PRAKTISCHE PAPERTEST | READ ONLY ===')
     print(f"UTC             : {report.get('generated_at_utc', 'n/a')}")
     print(f"RAPPORTSTATUS   : {freshness} | leeftijd {age_seconds/60.0:.1f} min")
     print(f"REGIME          : {report.get('regime', 'UNKNOWN')}")
@@ -877,6 +1081,30 @@ def print_report(report: dict[str, object]) -> None:
             for item in top_reasons:
                 if isinstance(item, dict):
                     print(f"  {item.get('reason','onbekend')}: {int(item.get('count',0))}")
+        print()
+        print('=== PRAKTISCHE WATCH-PAPERTEST ===')
+        print(
+            f"entries {int(research.get('practical_total',0))}"
+            f" | open {int(research.get('practical_open',0))}"
+            f" | gesloten {int(research.get('practical_closed',0))}"
+            f" | W/L {int(research.get('practical_wins',0))}/{int(research.get('practical_losses',0))}"
+        )
+        print(
+            f"gesloten PnL €{float(research.get('practical_pnl_eur',0.0)):+.2f}"
+            f" | open indicatie €{float(research.get('practical_open_pnl_eur',0.0)):+.2f}"
+            f" | PF {float(research.get('practical_profit_factor',0.0)):.3f}"
+        )
+        outcomes = research.get('practical_outcomes', {})
+        if isinstance(outcomes, dict):
+            print(
+                f"uitgangen stop {int(outcomes.get('stop',0))}"
+                f" | trailing {int(outcomes.get('trail',0))}"
+                f" | tijd {int(outcomes.get('time',0))}"
+            )
+        print(
+            'regels: €200 per kans | alleen LONG/SIDEWAYS WATCH'
+            ' | stop netto -3,00% | winstbeveiliging vanaf +1,00% | max 48 uur'
+        )
         print()
         print('=== PROSPECTIEVE ZELDZAME-SIGNAALCONTROLE ===')
         print(
