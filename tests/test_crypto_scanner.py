@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -189,6 +190,8 @@ class CryptoScannerTests(unittest.TestCase):
             }
             stats = _persist_signal_research(first)
             self.assertEqual(stats['signals_open'], 1)
+            self.assertEqual(stats['audit_candidates'], 1)
+            self.assertEqual(stats['audit_rare_moments'], 1)
             duplicate = {**first, 'generated_at_ms': 3_000}
             stats = _persist_signal_research(duplicate)
             self.assertEqual(stats['signals_total'], 1)
@@ -210,6 +213,82 @@ class CryptoScannerTests(unittest.TestCase):
             self.assertEqual(stats['signals_open'], 0)
             self.assertEqual(stats['signals_closed'], 1)
             self.assertEqual(stats['wins'], 1)
+
+    def test_candidate_audit_reports_watches_and_overlapping_blockers(self):
+        watch = {
+            'market': 'WATCH-EUR', 'action': 'LONG WATCH', 'side': 'LONG',
+            'decision_action': 'LONG', 'decision_reason': 'test_long',
+            'score': 75.0, 'executable_entry': 101.0, 'roundtrip_cost_pct': 0.8,
+            'cost_multiple': 4.0, 'execution_spread_pct': 0.05,
+            'net_reward_risk': 2.0, 'price_in_zone': False,
+            'reasons': ['actuele uitvoerprijs buiten besliszone'],
+        }
+        rare = {
+            **watch, 'market': 'RARE-EUR', 'action': 'LONG TRADE-GRADE',
+            'score': 90.0, 'price_in_zone': True,
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            stats = _persist_signal_research({
+                'generated_at_ms': 10_000,
+                'regime': 'BULL',
+                'candidates': [watch, rare],
+                'all_pair_snapshots': [],
+                'rare_opportunities': [],
+            })
+            self.assertEqual(stats['audit_cycles'], 1)
+            self.assertEqual(stats['audit_candidates'], 2)
+            self.assertEqual(stats['audit_watch_moments'], 1)
+            self.assertEqual(stats['audit_rare_moments'], 1)
+            self.assertEqual(stats['audit_detailed_candidates'], 2)
+            self.assertEqual(stats['audit_blockers_overlap']['score'], 1)
+            self.assertEqual(stats['audit_blockers_overlap']['price_zone'], 1)
+            self.assertEqual(stats['audit_blockers_overlap']['strategy_direction'], 0)
+
+    def test_candidate_audit_migrates_existing_snapshot_table(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            db_path = os.environ['SCANNER_V3_DB_PATH']
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                '''CREATE TABLE snapshots (
+                    generated_ms INTEGER NOT NULL,
+                    market TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    executable_entry REAL NOT NULL,
+                    roundtrip_cost_pct REAL NOT NULL,
+                    net_reward_risk REAL NOT NULL,
+                    price_in_zone INTEGER NOT NULL,
+                    PRIMARY KEY (generated_ms, market)
+                )'''
+            )
+            conn.execute(
+                '''INSERT INTO snapshots VALUES
+                   (1000,'OLD-EUR','LONG WATCH',70,100,0.8,1.4,0)'''
+            )
+            conn.commit()
+            conn.close()
+
+            stats = _persist_signal_research({
+                'generated_at_ms': 2_000,
+                'regime': 'SIDEWAYS',
+                'candidates': [],
+                'all_pair_snapshots': [],
+                'rare_opportunities': [],
+            })
+            self.assertEqual(stats['audit_candidates'], 1)
+            self.assertEqual(stats['audit_watch_moments'], 1)
+            self.assertEqual(stats['audit_detailed_candidates'], 0)
+
+            conn = sqlite3.connect(db_path)
+            columns = {row[1] for row in conn.execute('PRAGMA table_info(snapshots)')}
+            conn.close()
+            self.assertIn('decision_reason', columns)
+            self.assertIn('cost_multiple', columns)
+            self.assertIn('reasons_json', columns)
 
 
 if __name__ == '__main__':

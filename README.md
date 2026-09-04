@@ -11,10 +11,12 @@ Clean-room crypto trading research project for Bitvavo public EUR market data.
 
 ## Nieuwe read-only onderzoekslaag
 
-`crypto_scanner_v2.py` bevat nu scanner v3. Een handmatig kanslabel vereist een uitvoerbare €200-L2-VWAP,
+`crypto_scanner_v2.py` bevat nu scanner v3.1. Een handmatig kanslabel vereist een uitvoerbare €200-L2-VWAP,
 een actuele uitvoerprijs binnen de besliszone en een netto risico/opbrengst van minimaal 1,50. Een USDC-route
 wordt inclusief EUR↔USDC-omwisseling beoordeeld. Alle kanslabels en hun latere stop/target/timeout-uitkomst
-worden prospectief opgeslagen in `cryptobot_scanner_v3.db`.
+worden prospectief opgeslagen in `cryptobot_scanner_v3.db`. De bestaande kandidaat-snapshots worden nu ook
+in de status uitgelezen: WATCH-momenten, zeldzame kansen en overlappende afwijsredenen zijn over de laatste
+24 uur zichtbaar. Vanaf v3.1 worden daarvoor ook regime, strategiebeslissing, kostenruimte en spread bewaard.
 
 `crypto_research_v4.py` blijft als bewaarde broncode beschikbaar, maar draait niet meer in de lean runtime.
 

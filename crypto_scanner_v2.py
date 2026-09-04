@@ -40,6 +40,7 @@ WATCH_COST_MULTIPLE = 2.0
 TRADE_GRADE_MAX_SPREAD_PCT = 0.20
 REPORT_STALE_SECONDS = 35 * 60
 SIGNAL_MAX_HOLD_MS = 24 * 60 * 60 * 1000
+AUDIT_WINDOW_MS = 24 * 60 * 60 * 1000
 
 
 def _report_path() -> Path:
@@ -495,9 +496,31 @@ def _scanner_db_connect() -> sqlite3.Connection:
             roundtrip_cost_pct REAL NOT NULL,
             net_reward_risk REAL NOT NULL,
             price_in_zone INTEGER NOT NULL,
+            regime TEXT NOT NULL DEFAULT 'UNKNOWN',
+            side TEXT NOT NULL DEFAULT 'NONE',
+            decision_action TEXT NOT NULL DEFAULT 'SKIP',
+            decision_reason TEXT NOT NULL DEFAULT '',
+            cost_multiple REAL NOT NULL DEFAULT 0,
+            execution_spread_pct REAL NOT NULL DEFAULT 0,
+            reasons_json TEXT NOT NULL DEFAULT '[]',
             PRIMARY KEY (generated_ms, market)
         )'''
     )
+    existing_snapshot_columns = {
+        str(row[1]) for row in conn.execute('PRAGMA table_info(snapshots)').fetchall()
+    }
+    snapshot_migrations = {
+        'regime': "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+        'side': "TEXT NOT NULL DEFAULT 'NONE'",
+        'decision_action': "TEXT NOT NULL DEFAULT 'SKIP'",
+        'decision_reason': "TEXT NOT NULL DEFAULT ''",
+        'cost_multiple': 'REAL NOT NULL DEFAULT 0',
+        'execution_spread_pct': 'REAL NOT NULL DEFAULT 0',
+        'reasons_json': "TEXT NOT NULL DEFAULT '[]'",
+    }
+    for column, declaration in snapshot_migrations.items():
+        if column not in existing_snapshot_columns:
+            conn.execute(f'ALTER TABLE snapshots ADD COLUMN {column} {declaration}')
     conn.execute(
         '''CREATE TABLE IF NOT EXISTS signals (
             generated_ms INTEGER NOT NULL,
@@ -554,12 +577,20 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
                 conn.execute(
                     '''INSERT OR REPLACE INTO snapshots
                        (generated_ms,market,action,score,executable_entry,roundtrip_cost_pct,
-                        net_reward_risk,price_in_zone) VALUES (?,?,?,?,?,?,?,?)''',
+                        net_reward_risk,price_in_zone,regime,side,decision_action,
+                        decision_reason,cost_multiple,execution_spread_pct,reasons_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                     (
                         generated_ms, str(row.get('market', '')), str(row.get('action', '')),
                         float(row.get('score', 0.0)), float(row.get('executable_entry', 0.0)),
                         float(row.get('roundtrip_cost_pct', 0.0)),
                         float(row.get('net_reward_risk', 0.0)), int(bool(row.get('price_in_zone'))),
+                        str(report.get('regime', 'UNKNOWN')), str(row.get('side', 'NONE')),
+                        str(row.get('decision_action', 'SKIP')),
+                        str(row.get('decision_reason', '')),
+                        float(row.get('cost_multiple', 0.0)),
+                        float(row.get('execution_spread_pct', 0.0)),
+                        json.dumps(row.get('reasons', []), ensure_ascii=False),
                     ),
                 )
 
@@ -645,6 +676,61 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
                       COALESCE(SUM(CASE WHEN net_return_pct<0 THEN -net_return_pct ELSE 0 END),0)
                FROM signals'''
         ).fetchone()
+        audit_cutoff = generated_ms - AUDIT_WINDOW_MS
+        (
+            audit_cycles,
+            audit_candidates,
+            audit_watches,
+            audit_rare,
+            audit_detailed,
+            blocked_regime,
+            blocked_direction,
+            blocked_score,
+            blocked_cost_room,
+            blocked_spread,
+            blocked_zone,
+            blocked_net_rr,
+        ) = conn.execute(
+            '''SELECT
+                   COUNT(DISTINCT generated_ms),
+                   COUNT(*),
+                   SUM(CASE WHEN action LIKE '%WATCH%' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN action LIKE '%TRADE-GRADE%' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN regime IN ('BULL','BEAR','SIDEWAYS') THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN regime='SIDEWAYS' THEN 1 ELSE 0 END),
+                   SUM(CASE
+                         WHEN regime='BULL' AND decision_action!='LONG' THEN 1
+                         WHEN regime='BEAR' AND decision_action!='SHORT' THEN 1
+                         ELSE 0 END),
+                   SUM(CASE WHEN regime IN ('BULL','BEAR') AND score<? THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN regime IN ('BULL','BEAR') AND cost_multiple<? THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN regime IN ('BULL','BEAR') AND execution_spread_pct>? THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN regime IN ('BULL','BEAR') AND price_in_zone!=1 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN regime IN ('BULL','BEAR') AND net_reward_risk<? THEN 1 ELSE 0 END)
+               FROM snapshots WHERE generated_ms>=?''',
+            (
+                TRADE_GRADE_SCORE,
+                TRADE_GRADE_COST_MULTIPLE,
+                TRADE_GRADE_MAX_SPREAD_PCT,
+                TRADE_GRADE_MIN_NET_RR,
+                audit_cutoff,
+            ),
+        ).fetchone()
+        top_decision_reasons = [
+            {'reason': str(reason), 'count': int(count)}
+            for reason, count in conn.execute(
+                '''SELECT decision_reason,COUNT(*)
+                   FROM snapshots
+                   WHERE generated_ms>=?
+                     AND regime IN ('BULL','BEAR','SIDEWAYS')
+                     AND decision_reason!=''
+                     AND decision_action NOT IN ('LONG','SHORT','BUY')
+                   GROUP BY decision_reason
+                   ORDER BY COUNT(*) DESC,decision_reason
+                   LIMIT 5''',
+                (audit_cutoff,),
+            ).fetchall()
+        ]
         profit_factor = float(positive_sum) / float(negative_sum) if float(negative_sum) > 0 else 0.0
         return {
             'database': str(_db_path()),
@@ -656,6 +742,22 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
             'net_return_sum_pct': round(float(net_sum), 3),
             'profit_factor': round(profit_factor, 3),
             'outcome_rule': 'STOP eerst als stop en target in dezelfde 15m-candle liggen',
+            'audit_window_hours': 24,
+            'audit_cycles': int(audit_cycles or 0),
+            'audit_candidates': int(audit_candidates or 0),
+            'audit_watch_moments': int(audit_watches or 0),
+            'audit_rare_moments': int(audit_rare or 0),
+            'audit_detailed_candidates': int(audit_detailed or 0),
+            'audit_blockers_overlap': {
+                'regime_sideways': int(blocked_regime or 0),
+                'strategy_direction': int(blocked_direction or 0),
+                'score': int(blocked_score or 0),
+                'cost_room': int(blocked_cost_room or 0),
+                'spread': int(blocked_spread or 0),
+                'price_zone': int(blocked_zone or 0),
+                'net_reward_risk': int(blocked_net_rr or 0),
+            },
+            'audit_top_decision_reasons': top_decision_reasons,
         }
     finally:
         conn.close()
@@ -673,7 +775,7 @@ def _strip_internal_research_data(report: dict[str, object]) -> None:
 def print_report(report: dict[str, object]) -> None:
     age_seconds = _report_age_seconds(report)
     freshness = 'VEROUDERD' if age_seconds > REPORT_STALE_SECONDS else 'ACTUEEL'
-    print('=== CRYPTO SCANNER v3 | STRICT L2 | READ ONLY ===')
+    print('=== CRYPTO SCANNER v3.1 | STRICT L2 + AUDIT | READ ONLY ===')
     print(f"UTC             : {report.get('generated_at_utc', 'n/a')}")
     print(f"RAPPORTSTATUS   : {freshness} | leeftijd {age_seconds/60.0:.1f} min")
     print(f"REGIME          : {report.get('regime', 'UNKNOWN')}")
@@ -747,9 +849,38 @@ def print_report(report: dict[str, object]) -> None:
     research = report.get('signal_research', {})
     if isinstance(research, dict):
         print()
-        print('=== PROSPECTIEVE SIGNAALCONTROLE ===')
+        print('=== SCANNERHISTORIE LAATSTE 24 UUR ===')
         print(
-            f"signalen {int(research.get('signals_total',0))}"
+            f"cycli {int(research.get('audit_cycles',0))}"
+            f" | kandidaten {int(research.get('audit_candidates',0))}"
+            f" | WATCH {int(research.get('audit_watch_moments',0))}"
+            f" | zeldzame kansen {int(research.get('audit_rare_moments',0))}"
+        )
+        detailed = int(research.get('audit_detailed_candidates', 0))
+        blockers = research.get('audit_blockers_overlap', {})
+        if detailed > 0 and isinstance(blockers, dict):
+            print(f'gedetailleerde blokkades vanaf v3.1: n={detailed}; aantallen kunnen overlappen')
+            print(
+                f"  regime {int(blockers.get('regime_sideways',0))}"
+                f" | richting {int(blockers.get('strategy_direction',0))}"
+                f" | score {int(blockers.get('score',0))}"
+                f" | xkosten {int(blockers.get('cost_room',0))}"
+            )
+            print(
+                f"  spread {int(blockers.get('spread',0))}"
+                f" | prijszone {int(blockers.get('price_zone',0))}"
+                f" | netto R/R {int(blockers.get('net_reward_risk',0))}"
+            )
+        top_reasons = research.get('audit_top_decision_reasons', [])
+        if isinstance(top_reasons, list) and top_reasons:
+            print('meest voorkomende strategieredenen:')
+            for item in top_reasons:
+                if isinstance(item, dict):
+                    print(f"  {item.get('reason','onbekend')}: {int(item.get('count',0))}")
+        print()
+        print('=== PROSPECTIEVE ZELDZAME-SIGNAALCONTROLE ===')
+        print(
+            f"zeldzame signalen {int(research.get('signals_total',0))}"
             f" | open {int(research.get('signals_open',0))}"
             f" | gesloten {int(research.get('signals_closed',0))}"
             f" | W/L {int(research.get('wins',0))}/{int(research.get('losses',0))}"
