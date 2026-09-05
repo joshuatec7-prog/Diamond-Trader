@@ -13,6 +13,7 @@ STOP = False
 REPORT_MAX_AGE_SECONDS = 35 * 60
 REPORT_STARTUP_GRACE_SECONDS = 5 * 60
 REPORT_HEALTH_CHECK_SECONDS = 30
+PRACTICAL_MONITOR_MAX_AGE_SECONDS = 5 * 60
 
 
 @dataclass
@@ -72,6 +73,14 @@ def _report_health_error(child: Child, now: float | None = None) -> str | None:
     age_seconds = current - generated_ms / 1000.0
     if generated_ms <= 0 or age_seconds > REPORT_MAX_AGE_SECONDS:
         return f'rapport verouderd: {max(0.0, age_seconds)/60.0:.1f} min'
+    research = report.get('signal_research', {})
+    if isinstance(research, dict) and int(research.get('practical_open', 0) or 0) > 0:
+        attempted_ms = int(research.get('practical_monitor_attempted_ms', 0) or 0)
+        monitor_age = current - attempted_ms / 1000.0
+        if attempted_ms <= 0:
+            return '30s-winstmonitor heeft nog geen levenssignaal'
+        if monitor_age > PRACTICAL_MONITOR_MAX_AGE_SECONDS:
+            return f'30s-winstmonitor stilgevallen: {max(0.0, monitor_age):.0f} sec'
     return None
 
 

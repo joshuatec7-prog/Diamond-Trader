@@ -8,6 +8,7 @@ from unittest import mock
 from bitvavo_public import BitvavoPublic
 from crypto_scanner import _direction_score, _sideways_score
 from crypto_scanner_v2 import (
+    PRACTICAL_REENTRY_COOLDOWN_MS,
     _conversion_cost_pct,
     _grade_action,
     _net_reward_risk,
@@ -155,6 +156,38 @@ class CryptoScannerTests(unittest.TestCase):
         total = _roundtrip_cost_pct(settings, 0.12, 'USDC', extra)
         self.assertAlmostEqual(total, 0.76)
 
+    def test_usdc_l2_order_uses_eur_converted_quote_amount(self):
+        class Api:
+            requested_notional = 0.0
+
+            def depth_book(self, market, notional):
+                self.requested_notional = notional
+                return {
+                    'bid': 1.99, 'ask': 2.0, 'spread_pct': 0.5,
+                    'sell_vwap': 1.99, 'buy_vwap': 2.0,
+                    'execution_spread_pct': 0.5,
+                    'bid_depth_quote': 10_000.0, 'ask_depth_quote': 10_000.0,
+                }
+
+        api = Api()
+        settings = SimpleNamespace(
+            position_eur=200.0, slippage_pct=0.08, max_spread_pct=0.40, interval='15m'
+        )
+        candles = [Candle(1_000, 2.0, 2.1, 1.9, 2.0, 10.0)]
+        row = _pair_snapshot(
+            api=api, settings=settings, analyzer=SimpleNamespace(),
+            directional=SimpleNamespace(
+                evaluate_metrics=lambda *args: Decision('LONG', 'test', {})
+            ),
+            band=SimpleNamespace(), market='AAA-USDC', regime='BULL',
+            bull_breadth=1.0, bear_breadth=0.0, candle_limit=240,
+            cached_candles=candles, cached_metrics=self._strong_metrics(),
+            conversion_book={'buy_vwap': 0.8, 'execution_spread_pct': 0.02},
+        )
+        self.assertAlmostEqual(api.requested_notional, 250.0)
+        self.assertAlmostEqual(row['shadow_notional_quote'], 250.0)
+        self.assertAlmostEqual(row['base_quantity'], 125.0)
+
     def test_net_reward_risk_subtracts_all_costs(self):
         reward, risk, ratio = _net_reward_risk(
             entry=100.0, stop=98.0, target=105.0, side='LONG', roundtrip_cost_pct=1.0
@@ -169,6 +202,15 @@ class CryptoScannerTests(unittest.TestCase):
         self.assertAlmostEqual(depth, 305.0)
         with self.assertRaisesRegex(RuntimeError, 'onvoldoende orderboekdiepte'):
             BitvavoPublic._depth_vwap([(100.0, 0.5)], 200.0)
+
+    def test_sell_vwap_uses_exact_original_base_quantity(self):
+        vwap, depth = BitvavoPublic._depth_vwap_by_base(
+            [(101.0, 1.0), (100.0, 2.0)], 1.5
+        )
+        self.assertAlmostEqual(vwap, (101.0 + 50.0) / 1.5)
+        self.assertAlmostEqual(depth, 3.0)
+        with self.assertRaisesRegex(RuntimeError, 'onvoldoende orderboekdiepte'):
+            BitvavoPublic._depth_vwap_by_base([(100.0, 0.5)], 1.0)
 
     def test_old_report_is_explicitly_stale(self):
         report = {'generated_at_ms': 1_000}
@@ -436,6 +478,156 @@ class CryptoScannerTests(unittest.TestCase):
             })
             self.assertEqual(stats['practical_total'], 1)
             self.assertEqual(stats['practical_open'], 1)
+
+    def test_practical_portfolio_enforces_configured_open_limit(self):
+        first = {
+            'market': 'AAA-EUR', 'base': 'AAA', 'action': 'LONG WATCH', 'side': 'LONG',
+            'buy_vwap': 100.0, 'sell_vwap': 99.9, 'roundtrip_cost_pct': 0.76,
+            'execution_spread_pct': 0.10, 'score': 75.0,
+            'net_reward_risk': 1.2, 'price_in_zone': False,
+        }
+        second = {**first, 'market': 'BBB-EUR', 'base': 'BBB'}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            stats = _persist_signal_research({
+                'generated_at_ms': 1_000, 'regime': 'BULL',
+                'rules': {
+                    'shadow_notional_eur': 200.0,
+                    'paper_start_eur': 5_000.0,
+                    'max_open_positions': 1,
+                },
+                'candidates': [first, second],
+                'all_pair_snapshots': [first, second],
+                'rare_opportunities': [],
+            })
+            self.assertEqual(stats['practical_total'], 1)
+            self.assertEqual(stats['practical_open'], 1)
+            self.assertEqual(stats['practical_open_notional_eur'], 200.0)
+
+    def test_existing_practical_database_is_migrated_without_losing_position(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            db_path = os.environ['SCANNER_V3_DB_PATH']
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                '''CREATE TABLE practical_signals (
+                    generated_ms INTEGER NOT NULL,
+                    market TEXT NOT NULL,
+                    base_asset TEXT NOT NULL,
+                    signal_action TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    non_book_cost_pct REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    max_net_return_pct REAL NOT NULL DEFAULT 0,
+                    trailing_floor_pct REAL,
+                    evaluated_ms INTEGER,
+                    exit_price REAL,
+                    outcome TEXT,
+                    net_return_pct REAL,
+                    PRIMARY KEY (generated_ms, market)
+                )'''
+            )
+            conn.execute(
+                '''INSERT INTO practical_signals
+                   (generated_ms,market,base_asset,signal_action,entry_price,
+                    non_book_cost_pct,status,max_net_return_pct)
+                   VALUES (1000,'OLD-EUR','OLD','LONG WATCH',50,0.66,'OPEN',1.2)'''
+            )
+            conn.commit()
+            conn.close()
+
+            stats = _persist_signal_research({
+                'generated_at_ms': 2_000,
+                'candidates': [], 'all_pair_snapshots': [], 'rare_opportunities': [],
+            })
+            self.assertEqual(stats['practical_open'], 1)
+            conn = sqlite3.connect(db_path)
+            columns = {row[1] for row in conn.execute('PRAGMA table_info(practical_signals)')}
+            notional, quantity = conn.execute(
+                'SELECT notional_eur,base_quantity FROM practical_signals'
+            ).fetchone()
+            conn.close()
+            self.assertTrue({'notional_eur', 'base_quantity', 'last_mark_ms'} <= columns)
+            self.assertAlmostEqual(notional, 200.0)
+            self.assertAlmostEqual(quantity, 4.0)
+
+    def test_practical_pnl_keeps_entry_notional_and_exact_base_amount(self):
+        class Api:
+            sell_vwap = 102.0
+            requested_base = 0.0
+
+            def sell_vwap_for_base(self, market, base_amount):
+                self.requested_base = base_amount
+                return {'sell_vwap': self.sell_vwap}
+
+        api = Api()
+        watch = {
+            'market': 'FIXED-EUR', 'base': 'FIXED', 'action': 'LONG WATCH', 'side': 'LONG',
+            'buy_vwap': 100.0, 'sell_vwap': 99.9, 'roundtrip_cost_pct': 0.76,
+            'execution_spread_pct': 0.10, 'score': 75.0,
+            'net_reward_risk': 1.2, 'price_in_zone': False,
+            'shadow_notional_quote': 100.0, 'base_quantity': 1.0,
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            _persist_signal_research({
+                'generated_at_ms': 1_000, 'regime': 'BULL',
+                'rules': {
+                    'shadow_notional_eur': 100.0,
+                    'paper_start_eur': 1_000.0,
+                    'max_open_positions': 1,
+                },
+                'candidates': [watch], 'all_pair_snapshots': [watch],
+                'rare_opportunities': [],
+            })
+            settings = SimpleNamespace(position_eur=500.0)
+            _monitor_practical_positions(settings, api=api, generated_ms=2_000)
+            self.assertAlmostEqual(api.requested_base, 1.0)
+            api.sell_vwap = 100.99
+            stats = _monitor_practical_positions(settings, api=api, generated_ms=3_000)
+            expected_pct = _practical_net_return(100.0, 100.99, 0.66)
+            self.assertAlmostEqual(stats['practical_pnl_eur'], expected_pct, places=2)
+
+    def test_practical_reentry_waits_four_hours_after_exit(self):
+        class Api:
+            def sell_vwap_for_base(self, market, base_amount):
+                return {'sell_vwap': 96.0}
+
+        watch = {
+            'market': 'COOL-EUR', 'base': 'COOL', 'action': 'LONG WATCH', 'side': 'LONG',
+            'buy_vwap': 100.0, 'sell_vwap': 99.9, 'roundtrip_cost_pct': 0.76,
+            'execution_spread_pct': 0.10, 'score': 75.0,
+            'net_reward_risk': 1.2, 'price_in_zone': False,
+        }
+        rules = {'shadow_notional_eur': 200.0, 'max_open_positions': 1}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            _persist_signal_research({
+                'generated_at_ms': 1_000, 'regime': 'BULL', 'rules': rules,
+                'candidates': [watch], 'all_pair_snapshots': [watch],
+                'rare_opportunities': [],
+            })
+            _monitor_practical_positions(
+                SimpleNamespace(position_eur=200.0), api=Api(), generated_ms=2_000
+            )
+            blocked = _persist_signal_research({
+                'generated_at_ms': 3_000, 'regime': 'BULL', 'rules': rules,
+                'candidates': [watch], 'all_pair_snapshots': [watch],
+                'rare_opportunities': [],
+            })
+            self.assertEqual(blocked['practical_total'], 1)
+            reopened = _persist_signal_research({
+                'generated_at_ms': 2_000 + PRACTICAL_REENTRY_COOLDOWN_MS + 1,
+                'regime': 'BULL', 'rules': rules,
+                'candidates': [watch], 'all_pair_snapshots': [watch],
+                'rare_opportunities': [],
+            })
+            self.assertEqual(reopened['practical_total'], 2)
+            self.assertEqual(reopened['practical_open'], 1)
 
     def test_practical_watch_tracker_does_not_open_short_watch(self):
         short_watch = {

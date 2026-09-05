@@ -222,6 +222,29 @@ class BitvavoPublic:
             )
         return quote_used / base_used, total_depth
 
+    @staticmethod
+    def _depth_vwap_by_base(
+        levels: List[tuple[float, float]], base_amount: float
+    ) -> tuple[float, float]:
+        """Bereken VWAP voor exact dezelfde hoeveelheid base asset als bij de instap."""
+        remaining = base_amount
+        quote_used = 0.0
+        base_used = 0.0
+        for price, amount in levels:
+            used_base = min(remaining, amount)
+            quote_used += used_base * price
+            base_used += used_base
+            remaining -= used_base
+            if remaining <= max(1e-12, base_amount * 1e-9):
+                break
+        total_base = sum(amount for _, amount in levels)
+        if remaining > max(1e-12, base_amount * 1e-9) or base_used <= 0:
+            raise RuntimeError(
+                f'onvoldoende orderboekdiepte: {total_base:.8f} base beschikbaar voor '
+                f'{base_amount:.8f}'
+            )
+        return quote_used / base_used, total_base
+
     def depth_book(self, market: str, notional_quote: float, depth: int = 100) -> Dict[str, float]:
         """Meet uitvoerbare koop/verkoop-VWAP voor een concrete schaduworder."""
         if not math.isfinite(notional_quote) or notional_quote <= 0:
@@ -252,5 +275,26 @@ class BitvavoPublic:
             'bid_depth_quote': bid_depth_quote,
             'ask_depth_quote': ask_depth_quote,
             'notional_quote': notional_quote,
+            'captured_at_ms': float(int(time.time() * 1000)),
+        }
+
+    def sell_vwap_for_base(
+        self, market: str, base_amount: float, depth: int = 100
+    ) -> Dict[str, float]:
+        """Meet de uitvoerbare verkoopprijs voor een exact aantal munten."""
+        if not math.isfinite(base_amount) or base_amount <= 0:
+            raise ValueError('base_amount moet positief en eindig zijn')
+        payload = self._get(f'/{market}/book', {'depth': depth})
+        if not isinstance(payload, dict):
+            raise RuntimeError(f'ongeldig orderboek voor {market}')
+        returned_market = str(payload.get('market', market)).upper()
+        if returned_market != market.upper():
+            raise RuntimeError(f'orderboek hoort bij {returned_market}, niet {market}')
+        bids = self._depth_levels(payload.get('bids'), reverse=True)
+        sell_vwap, bid_depth_base = self._depth_vwap_by_base(bids, base_amount)
+        return {
+            'sell_vwap': sell_vwap,
+            'bid_depth_base': bid_depth_base,
+            'base_amount': base_amount,
             'captured_at_ms': float(int(time.time() * 1000)),
         }

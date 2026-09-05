@@ -10,7 +10,7 @@ Deze branch is een schone PAPER-only herstart. De runtime bevat geen private Bit
 - Het huidige vaste universe bestaat uit 20 liquide EUR-markten.
 - Interval is 15 minuten.
 - Nieuwe entries worden alleen op gesloten 15m-candles beoordeeld.
-- Open paperposities worden standaard iedere 120 seconden met actuele bid/ask bewaakt.
+- Open PAPER-posities worden iedere 30 seconden met exacte muntomvang en actuele L2-diepte bewaakt.
 - Paper startkapitaal en bestaande Bitvavo-saldi staan volledig los van elkaar.
 - Fees, slippage en spread worden expliciet meegenomen.
 

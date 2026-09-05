@@ -11,7 +11,7 @@ Clean-room crypto trading research project for Bitvavo public EUR market data.
 
 ## Nieuwe read-only onderzoekslaag
 
-`crypto_scanner_v2.py` bevat nu scanner v3.3. Een handmatig kanslabel vereist een uitvoerbare €200-L2-VWAP,
+`crypto_scanner_v2.py` bevat nu scanner v3.4. Een handmatig kanslabel vereist een uitvoerbare €200-L2-VWAP,
 een actuele uitvoerprijs binnen de besliszone en een netto risico/opbrengst van minimaal 1,50. Een USDC-route
 wordt inclusief EUR↔USDC-omwisseling beoordeeld. Alle kanslabels en hun latere stop/target/timeout-uitkomst
 worden prospectief opgeslagen in `cryptobot_scanner_v3.db`. De bestaande kandidaat-snapshots worden nu ook
@@ -60,7 +60,11 @@ uitvoeringskostenniveau uit de volledige 72 uur. Orders blijven onmogelijk.
 
 - Interval: 15 minuten.
 - Universe: 20 liquide EUR-markten, eenmaal geselecteerd op actueel 24-uurs quotevolume en daarna vastgezet.
-- Open paperposities worden tussen candle-closes door bewaakt met actuele bid/ask.
+- Instappen blijft op gesloten 15m-candles; open PAPER-posities worden iedere 30 seconden bewaakt.
+- De uitstap-VWAP gebruikt exact hetzelfde aantal munten als bij de PAPER-instap.
+- Positieomvang, maximaal aantal gelijktijdige posities en beschikbaar PAPER-geld worden afgedwongen.
+- Na een uitstap geldt per munt vier uur afkoeling om kunstmatige kostenchurn te voorkomen.
+- De status toont cash, equity, drawdown en of er genoeg trades en testdagen zijn voor beoordeling.
 - Alleen scanner v3 en fundingmonitor v4.1 draaien; de oude PAPER-strategieën blijven bewaard maar gestopt.
 
 ## Strategy A — Mean Reversion

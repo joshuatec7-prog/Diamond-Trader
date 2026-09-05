@@ -47,6 +47,7 @@ PRACTICAL_TRAIL_ACTIVATE_NET_PCT = 1.00
 PRACTICAL_TRAIL_GIVEBACK_PCT = 1.00
 PRACTICAL_MIN_LOCK_NET_PCT = 0.25
 PRACTICAL_MONITOR_SECONDS = 30
+PRACTICAL_REENTRY_COOLDOWN_MS = 4 * 60 * 60 * 1000
 
 
 def _report_path() -> Path:
@@ -179,7 +180,13 @@ def _pair_snapshot(
     if not metrics:
         raise RuntimeError('onvoldoende analyse-data')
 
-    depth = api.depth_book(market, settings.position_eur)
+    market_notional_quote = settings.position_eur
+    if quote == 'USDC' and conversion_book is not None:
+        conversion_buy = float(conversion_book.get('buy_vwap', 0.0))
+        if conversion_buy <= 0.0:
+            raise RuntimeError('ongeldige USDC-EUR uitvoerprijs')
+        market_notional_quote = settings.position_eur / conversion_buy
+    depth = api.depth_book(market, market_notional_quote)
     spread_pct = float(depth['spread_pct'])
     execution_spread_pct = float(depth['execution_spread_pct'])
     conversion_cost_pct = _conversion_cost_pct(settings, conversion_book) if quote == 'USDC' else 0.0
@@ -269,6 +276,8 @@ def _pair_snapshot(
         'spread_pct': round(spread_pct, 4),
         'execution_spread_pct': round(execution_spread_pct, 4),
         'shadow_notional_eur': round(settings.position_eur, 2),
+        'shadow_notional_quote': round(market_notional_quote, 8),
+        'base_quantity': round(market_notional_quote / float(depth['buy_vwap']), 12),
         'best_bid': round(float(depth['bid']), 8),
         'best_ask': round(float(depth['ask']), 8),
         'sell_vwap': round(float(depth['sell_vwap']), 8),
@@ -419,8 +428,8 @@ def scan_once(settings: Settings) -> dict[str, object]:
     trade_grade = [row for row in chosen if 'TRADE-GRADE' in str(row.get('action', ''))]
     generated_ms = int(time.time() * 1000)
     return {
-        'version': '3.3',
-        'mode': 'STRICT_L2_AUDIT_30S_PRACTICAL_PAPER_SCANNER',
+        'version': '3.4',
+        'mode': 'STRICT_L2_AUDIT_30S_PORTFOLIO_PAPER_SCANNER',
         'generated_at_ms': generated_ms,
         'generated_at_utc': datetime.fromtimestamp(generated_ms / 1000.0, tz=timezone.utc).isoformat(),
         'interval': settings.interval,
@@ -445,6 +454,12 @@ def scan_once(settings: Settings) -> dict[str, object]:
             'trade_grade_min_net_reward_risk': TRADE_GRADE_MIN_NET_RR,
             'price_must_be_in_zone': True,
             'shadow_notional_eur': settings.position_eur,
+            'paper_start_eur': settings.paper_start_eur,
+            'max_open_positions': settings.max_open_positions,
+            'eval_min_trades': settings.eval_min_trades,
+            'eval_min_span_days': settings.eval_min_span_days,
+            'eval_min_profit_factor': settings.eval_min_profit_factor,
+            'eval_max_drawdown_pct': settings.eval_max_drawdown_pct,
             'eur_taker_fee_pct': EUR_TAKER_FEE_PCT,
             'usdc_taker_fee_pct': USDC_TAKER_FEE_PCT,
             'usdc_eur_taker_fee_pct': USDC_EUR_TAKER_FEE_PCT,
@@ -558,15 +573,43 @@ def _scanner_db_connect() -> sqlite3.Connection:
             signal_action TEXT NOT NULL,
             entry_price REAL NOT NULL,
             non_book_cost_pct REAL NOT NULL,
+            notional_eur REAL NOT NULL DEFAULT 200,
+            base_quantity REAL NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
             max_net_return_pct REAL NOT NULL DEFAULT 0,
             trailing_floor_pct REAL,
+            last_mark_ms INTEGER,
+            last_sell_price REAL,
+            last_net_return_pct REAL,
             evaluated_ms INTEGER,
             exit_price REAL,
             outcome TEXT,
             net_return_pct REAL,
             PRIMARY KEY (generated_ms, market)
         )'''
+    )
+    existing_practical_columns = {
+        str(row[1]) for row in conn.execute('PRAGMA table_info(practical_signals)').fetchall()
+    }
+    practical_migrations = {
+        'notional_eur': 'REAL NOT NULL DEFAULT 200',
+        'base_quantity': 'REAL NOT NULL DEFAULT 0',
+        'last_mark_ms': 'INTEGER',
+        'last_sell_price': 'REAL',
+        'last_net_return_pct': 'REAL',
+    }
+    for column, declaration in practical_migrations.items():
+        if column not in existing_practical_columns:
+            conn.execute(f'ALTER TABLE practical_signals ADD COLUMN {column} {declaration}')
+    conn.execute(
+        '''UPDATE practical_signals
+           SET notional_eur=200
+           WHERE notional_eur IS NULL OR notional_eur<=0'''
+    )
+    conn.execute(
+        '''UPDATE practical_signals
+           SET base_quantity=notional_eur/entry_price
+           WHERE (base_quantity IS NULL OR base_quantity<=0) AND entry_price>0'''
     )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_scanner_one_open_practical_base "
@@ -596,6 +639,27 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
     rules = report.get('rules', {})
     shadow_notional_eur = (
         float(rules.get('shadow_notional_eur', 200.0)) if isinstance(rules, dict) else 200.0
+    )
+    paper_start_eur = (
+        float(rules.get('paper_start_eur', 5000.0)) if isinstance(rules, dict) else 5000.0
+    )
+    max_open_positions = (
+        max(1, int(rules.get('max_open_positions', 1))) if isinstance(rules, dict) else 1
+    )
+    eval_min_trades = (
+        max(1, int(rules.get('eval_min_trades', 40))) if isinstance(rules, dict) else 40
+    )
+    eval_min_span_days = (
+        max(0.0, float(rules.get('eval_min_span_days', 14.0)))
+        if isinstance(rules, dict) else 14.0
+    )
+    eval_min_profit_factor = (
+        max(0.0, float(rules.get('eval_min_profit_factor', 1.25)))
+        if isinstance(rules, dict) else 1.25
+    )
+    eval_max_drawdown_pct = (
+        max(0.0, float(rules.get('eval_max_drawdown_pct', 10.0)))
+        if isinstance(rules, dict) else 10.0
     )
     snapshots = report.get('candidates', [])
     all_pairs = report.get('all_pair_snapshots', [])
@@ -750,11 +814,15 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
                 conn.execute(
                     '''UPDATE practical_signals
                        SET status='CLOSED',max_net_return_pct=?,trailing_floor_pct=?,
+                           last_mark_ms=?,last_sell_price=?,last_net_return_pct=?,
                            evaluated_ms=?,exit_price=?,outcome=?,net_return_pct=?
                        WHERE generated_ms=? AND market=?''',
                     (
                         max_net,
                         trailing_floor,
+                        generated_ms,
+                        executable_sell,
+                        net_return,
                         generated_ms,
                         executable_sell,
                         outcome,
@@ -767,12 +835,25 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
             else:
                 conn.execute(
                     '''UPDATE practical_signals
-                       SET max_net_return_pct=?,trailing_floor_pct=?
+                       SET max_net_return_pct=?,trailing_floor_pct=?,last_mark_ms=?,
+                           last_sell_price=?,last_net_return_pct=?
                        WHERE generated_ms=? AND market=?''',
-                    (max_net, trailing_floor, practical_ms, market),
+                    (
+                        max_net,
+                        trailing_floor,
+                        generated_ms,
+                        executable_sell,
+                        net_return,
+                        practical_ms,
+                        market,
+                    ),
                 )
 
         if isinstance(snapshots, list):
+            open_position_count, open_notional_eur = conn.execute(
+                '''SELECT COUNT(*),COALESCE(SUM(notional_eur),0)
+                   FROM practical_signals WHERE status='OPEN' '''
+            ).fetchone()
             for row in snapshots:
                 if not isinstance(row, dict):
                     continue
@@ -784,23 +865,62 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
                     or not base_asset
                     or base_asset in closed_practical_bases
                     or action not in {'LONG WATCH', 'LONG TRADE-GRADE', 'SIDEWAYS WATCH'}
+                    or str(row.get('side', 'LONG')) != 'LONG'
+                    or int(open_position_count or 0) >= max_open_positions
+                    or float(open_notional_eur or 0.0) + shadow_notional_eur > paper_start_eur
+                ):
+                    continue
+                last_exit = conn.execute(
+                    '''SELECT MAX(evaluated_ms) FROM practical_signals
+                       WHERE base_asset=? AND status='CLOSED' ''',
+                    (base_asset,),
+                ).fetchone()[0]
+                if (
+                    last_exit is not None
+                    and 0 <= generated_ms - int(last_exit) < PRACTICAL_REENTRY_COOLDOWN_MS
                 ):
                     continue
                 entry_price = float(row.get('buy_vwap', row.get('executable_entry', 0.0)))
+                quote_notional = float(row.get('shadow_notional_quote', shadow_notional_eur))
+                base_quantity = float(
+                    row.get('base_quantity', quote_notional / entry_price if entry_price > 0 else 0.0)
+                )
                 non_book_cost = max(
                     0.0,
                     float(row.get('roundtrip_cost_pct', 0.0))
                     - float(row.get('execution_spread_pct', 0.0)),
                 )
-                if entry_price <= 0.0:
+                initial_sell = float(row.get('sell_vwap', 0.0))
+                if entry_price <= 0.0 or base_quantity <= 0.0:
                     continue
-                conn.execute(
+                initial_net = (
+                    _practical_net_return(entry_price, initial_sell, non_book_cost)
+                    if initial_sell > 0.0 else None
+                )
+                cursor = conn.execute(
                     '''INSERT OR IGNORE INTO practical_signals
                        (generated_ms,market,base_asset,signal_action,entry_price,non_book_cost_pct,
-                        status,max_net_return_pct)
-                       VALUES (?,?,?,?,?,?,'OPEN',0)''',
-                    (generated_ms, market, base_asset, action, entry_price, non_book_cost),
+                        notional_eur,base_quantity,status,max_net_return_pct,last_mark_ms,
+                        last_sell_price,last_net_return_pct)
+                       VALUES (?,?,?,?,?,?,?,?,'OPEN',?,?,?,?)''',
+                    (
+                        generated_ms,
+                        market,
+                        base_asset,
+                        action,
+                        entry_price,
+                        non_book_cost,
+                        shadow_notional_eur,
+                        base_quantity,
+                        max(0.0, initial_net or 0.0),
+                        generated_ms if initial_net is not None else None,
+                        initial_sell if initial_net is not None else None,
+                        initial_net,
+                    ),
                 )
+                if cursor.rowcount > 0:
+                    open_position_count = int(open_position_count or 0) + 1
+                    open_notional_eur = float(open_notional_eur or 0.0) + shadow_notional_eur
 
         retention_cutoff = generated_ms - 100 * 24 * 60 * 60 * 1000
         conn.execute('DELETE FROM snapshots WHERE generated_ms<?', (retention_cutoff,))
@@ -876,70 +996,127 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
             practical_closed,
             practical_wins,
             practical_net_sum,
-            practical_positive_sum,
-            practical_negative_sum,
+            practical_realized_pnl_eur,
+            practical_positive_eur,
+            practical_negative_eur,
             practical_stops,
             practical_trails,
             practical_times,
+            practical_first_ms,
         ) = conn.execute(
             '''SELECT COUNT(*),
                       SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),
                       SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END),
                       SUM(CASE WHEN status='CLOSED' AND net_return_pct>0 THEN 1 ELSE 0 END),
                       COALESCE(SUM(CASE WHEN status='CLOSED' THEN net_return_pct ELSE 0 END),0),
-                      COALESCE(SUM(CASE WHEN net_return_pct>0 THEN net_return_pct ELSE 0 END),0),
-                      COALESCE(SUM(CASE WHEN net_return_pct<0 THEN -net_return_pct ELSE 0 END),0),
+                      COALESCE(SUM(CASE WHEN status='CLOSED'
+                           THEN net_return_pct*notional_eur/100.0 ELSE 0 END),0),
+                      COALESCE(SUM(CASE WHEN status='CLOSED' AND net_return_pct>0
+                           THEN net_return_pct*notional_eur/100.0 ELSE 0 END),0),
+                      COALESCE(SUM(CASE WHEN status='CLOSED' AND net_return_pct<0
+                           THEN -net_return_pct*notional_eur/100.0 ELSE 0 END),0),
                       SUM(CASE WHEN outcome='STOP' THEN 1 ELSE 0 END),
                       SUM(CASE WHEN outcome='TRAIL' THEN 1 ELSE 0 END),
-                      SUM(CASE WHEN outcome='TIME' THEN 1 ELSE 0 END)
+                      SUM(CASE WHEN outcome='TIME' THEN 1 ELSE 0 END),
+                      MIN(generated_ms)
                FROM practical_signals'''
         ).fetchone()
         practical_open_net_sum = 0.0
+        practical_open_pnl_eur = 0.0
+        practical_open_notional_eur = 0.0
+        practical_unpriced_open = 0
         practical_open_positions: list[dict[str, object]] = []
         for (
             practical_ms,
             market,
             entry_price,
-            non_book_cost,
+            notional_eur,
+            base_quantity,
             max_net_return,
             trailing_floor,
+            last_mark_ms,
+            last_sell_price,
+            last_net_return,
         ) in conn.execute(
-            '''SELECT generated_ms,market,entry_price,non_book_cost_pct,
-                      max_net_return_pct,trailing_floor_pct
+            '''SELECT generated_ms,market,entry_price,notional_eur,base_quantity,
+                      max_net_return_pct,trailing_floor_pct,last_mark_ms,last_sell_price,
+                      last_net_return_pct
                FROM practical_signals WHERE status='OPEN' '''
         ).fetchall():
-            current = pair_by_market.get(str(market))
-            if current is None:
-                practical_open_positions.append({
-                    'market': str(market),
-                    'age_hours': round((generated_ms - int(practical_ms)) / 3_600_000.0, 2),
-                    'current_net_pct': None,
-                    'current_pnl_eur': None,
-                    'max_net_pct': round(float(max_net_return), 3),
-                    'trailing_floor_pct': (
-                        None if trailing_floor is None else round(float(trailing_floor), 3)
-                    ),
-                })
-                continue
-            current_net = _practical_net_return(
-                float(entry_price), float(current.get('sell_vwap', 0.0)), float(non_book_cost)
-            )
-            practical_open_net_sum += current_net
+            position_notional = float(notional_eur)
+            practical_open_notional_eur += position_notional
+            current_net = None if last_net_return is None else float(last_net_return)
+            if current_net is None:
+                practical_unpriced_open += 1
+            else:
+                practical_open_net_sum += current_net
+                practical_open_pnl_eur += current_net * position_notional / 100.0
             practical_open_positions.append({
                 'market': str(market),
                 'age_hours': round((generated_ms - int(practical_ms)) / 3_600_000.0, 2),
-                'current_net_pct': round(current_net, 3),
-                'current_pnl_eur': round(current_net * shadow_notional_eur / 100.0, 2),
+                'notional_eur': round(position_notional, 2),
+                'base_quantity': round(float(base_quantity), 12),
+                'current_sell_price': (
+                    None if last_sell_price is None else round(float(last_sell_price), 8)
+                ),
+                'current_net_pct': None if current_net is None else round(current_net, 3),
+                'current_pnl_eur': (
+                    None if current_net is None
+                    else round(current_net * position_notional / 100.0, 2)
+                ),
                 'max_net_pct': round(float(max_net_return), 3),
                 'trailing_floor_pct': (
                     None if trailing_floor is None else round(float(trailing_floor), 3)
                 ),
+                'last_mark_age_seconds': (
+                    None if last_mark_ms is None
+                    else round(max(0.0, (generated_ms - int(last_mark_ms)) / 1000.0), 1)
+                ),
             })
         profit_factor = float(positive_sum) / float(negative_sum) if float(negative_sum) > 0 else 0.0
         practical_profit_factor = (
-            float(practical_positive_sum) / float(practical_negative_sum)
-            if float(practical_negative_sum) > 0
-            else 0.0
+            float(practical_positive_eur) / float(practical_negative_eur)
+            if float(practical_negative_eur) > 0
+            else (999.0 if float(practical_positive_eur) > 0 else 0.0)
+        )
+        balance = paper_start_eur
+        peak = balance
+        max_drawdown_pct = 0.0
+        for net_pct, notional in conn.execute(
+            '''SELECT net_return_pct,notional_eur FROM practical_signals
+               WHERE status='CLOSED' ORDER BY evaluated_ms,generated_ms,market'''
+        ).fetchall():
+            balance += float(net_pct) * float(notional) / 100.0
+            peak = max(peak, balance)
+            if peak > 0.0:
+                max_drawdown_pct = max(max_drawdown_pct, (peak - balance) / peak * 100.0)
+        test_span_days = (
+            0.0 if practical_first_ms is None
+            else max(0.0, (generated_ms - int(practical_first_ms)) / 86_400_000.0)
+        )
+        enough_history = (
+            int(practical_closed or 0) >= eval_min_trades
+            and test_span_days >= eval_min_span_days
+        )
+        if not enough_history:
+            evaluation_status = 'VERZAMELEN'
+        elif (
+            practical_profit_factor >= eval_min_profit_factor
+            and max_drawdown_pct <= eval_max_drawdown_pct
+            and float(practical_realized_pnl_eur) > 0.0
+        ):
+            evaluation_status = 'PAPER KANDIDAAT'
+        else:
+            evaluation_status = 'ONVOLDOENDE'
+        paper_cash_eur = (
+            paper_start_eur
+            + float(practical_realized_pnl_eur)
+            - practical_open_notional_eur
+        )
+        paper_equity_eur = (
+            paper_start_eur
+            + float(practical_realized_pnl_eur)
+            + practical_open_pnl_eur
         )
         return {
             'database': str(_db_path()),
@@ -974,14 +1151,23 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
             'practical_losses': int((practical_closed or 0) - (practical_wins or 0)),
             'practical_net_return_sum_pct': round(float(practical_net_sum), 3),
             'practical_open_net_return_sum_pct': round(float(practical_open_net_sum), 3),
-            'practical_pnl_eur': round(
-                float(practical_net_sum) * shadow_notional_eur / 100.0, 2
-            ),
-            'practical_open_pnl_eur': round(
-                float(practical_open_net_sum) * shadow_notional_eur / 100.0, 2
-            ),
+            'practical_pnl_eur': round(float(practical_realized_pnl_eur), 2),
+            'practical_open_pnl_eur': round(practical_open_pnl_eur, 2),
+            'practical_open_notional_eur': round(practical_open_notional_eur, 2),
+            'practical_unpriced_open': practical_unpriced_open,
+            'practical_paper_cash_eur': round(paper_cash_eur, 2),
+            'practical_paper_equity_eur': round(paper_equity_eur, 2),
             'practical_open_positions': practical_open_positions,
             'practical_profit_factor': round(practical_profit_factor, 3),
+            'practical_max_drawdown_pct': round(max_drawdown_pct, 3),
+            'practical_test_span_days': round(test_span_days, 2),
+            'practical_evaluation': {
+                'status': evaluation_status,
+                'min_closed_trades': eval_min_trades,
+                'min_span_days': eval_min_span_days,
+                'min_profit_factor': eval_min_profit_factor,
+                'max_drawdown_pct': eval_max_drawdown_pct,
+            },
             'practical_outcomes': {
                 'stop': int(practical_stops or 0),
                 'trail': int(practical_trails or 0),
@@ -997,6 +1183,11 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
                 'max_hold_hours': PRACTICAL_MAX_HOLD_MS // (60 * 60 * 1000),
                 'max_hold_only_without_trailing': True,
                 'shadow_notional_eur': shadow_notional_eur,
+                'paper_start_eur': paper_start_eur,
+                'max_open_positions': max_open_positions,
+                'reentry_cooldown_hours': (
+                    PRACTICAL_REENTRY_COOLDOWN_MS // (60 * 60 * 1000)
+                ),
             },
         }
     finally:
@@ -1008,14 +1199,16 @@ def _monitor_practical_positions(
     *,
     api: BitvavoPublic | None = None,
     generated_ms: int | None = None,
+    monitor_interval_seconds: int = PRACTICAL_MONITOR_SECONDS,
 ) -> dict[str, object]:
     now_ms = int(time.time() * 1000) if generated_ms is None else int(generated_ms)
     conn = _scanner_db_connect()
     try:
-        markets = [
-            str(row[0])
+        positions = [
+            (str(row[0]), float(row[1]), float(row[2]))
             for row in conn.execute(
-                "SELECT market FROM practical_signals WHERE status='OPEN' ORDER BY market"
+                '''SELECT market,base_quantity,notional_eur
+                   FROM practical_signals WHERE status='OPEN' ORDER BY market'''
             ).fetchall()
         ]
     finally:
@@ -1028,9 +1221,12 @@ def _monitor_practical_positions(
     )
     current_rows: list[dict[str, object]] = []
     errors: list[str] = []
-    for market in markets:
+    for market, base_quantity, notional_eur in positions:
         try:
-            depth = market_api.depth_book(market, settings.position_eur)
+            if hasattr(market_api, 'sell_vwap_for_base'):
+                depth = market_api.sell_vwap_for_base(market, base_quantity)
+            else:
+                depth = market_api.depth_book(market, notional_eur)
             current_rows.append({
                 'market': market,
                 'sell_vwap': float(depth['sell_vwap']),
@@ -1041,13 +1237,24 @@ def _monitor_practical_positions(
     research = _persist_signal_research({
         'generated_at_ms': now_ms,
         'regime': 'UNKNOWN',
-        'rules': {'shadow_notional_eur': settings.position_eur},
+        'rules': {
+            'shadow_notional_eur': settings.position_eur,
+            'paper_start_eur': getattr(settings, 'paper_start_eur', 5000.0),
+            'max_open_positions': getattr(settings, 'max_open_positions', 1),
+            'eval_min_trades': getattr(settings, 'eval_min_trades', 40),
+            'eval_min_span_days': getattr(settings, 'eval_min_span_days', 14.0),
+            'eval_min_profit_factor': getattr(settings, 'eval_min_profit_factor', 1.25),
+            'eval_max_drawdown_pct': getattr(settings, 'eval_max_drawdown_pct', 10.0),
+        },
         'candidates': [],
         'all_pair_snapshots': current_rows,
         'rare_opportunities': [],
     })
-    research['practical_monitor_interval_seconds'] = PRACTICAL_MONITOR_SECONDS
-    research['practical_monitor_generated_ms'] = now_ms
+    research['practical_monitor_interval_seconds'] = monitor_interval_seconds
+    research['practical_monitor_attempted_ms'] = now_ms
+    research['practical_monitor_generated_ms'] = now_ms if current_rows or not positions else 0
+    research['practical_monitor_position_count'] = len(positions)
+    research['practical_monitor_success_count'] = len(current_rows)
     research['practical_monitor_errors'] = errors
     return research
 
@@ -1072,7 +1279,7 @@ def _strip_internal_research_data(report: dict[str, object]) -> None:
 def print_report(report: dict[str, object]) -> None:
     age_seconds = _report_age_seconds(report)
     freshness = 'VEROUDERD' if age_seconds > REPORT_STALE_SECONDS else 'ACTUEEL'
-    print('=== CRYPTO SCANNER v3.3 | 15M ENTRY + 30S WINSTBEWAKING | READ ONLY ===')
+    print('=== CRYPTO SCANNER v3.4 | REALISTISCHE PAPERPORTEFEUILLE | READ ONLY ===')
     print(f"UTC             : {report.get('generated_at_utc', 'n/a')}")
     print(f"RAPPORTSTATUS   : {freshness} | leeftijd {age_seconds/60.0:.1f} min")
     print(f"REGIME          : {report.get('regime', 'UNKNOWN')}")
@@ -1185,8 +1392,20 @@ def print_report(report: dict[str, object]) -> None:
         print(
             f"gesloten PnL €{float(research.get('practical_pnl_eur',0.0)):+.2f}"
             f" | open indicatie €{float(research.get('practical_open_pnl_eur',0.0)):+.2f}"
-            f" | PF {float(research.get('practical_profit_factor',0.0)):.3f}"
+            f" | PF {'∞' if float(research.get('practical_profit_factor',0.0)) >= 999.0 else f'{float(research.get('practical_profit_factor',0.0)):.3f}'}"
         )
+        print(
+            f"paper cash €{float(research.get('practical_paper_cash_eur',0.0)):.2f}"
+            f" | equity €{float(research.get('practical_paper_equity_eur',0.0)):.2f}"
+            f" | max drawdown {float(research.get('practical_max_drawdown_pct',0.0)):.2f}%"
+        )
+        evaluation = research.get('practical_evaluation', {})
+        if isinstance(evaluation, dict):
+            print(
+                f"evaluatie {evaluation.get('status','VERZAMELEN')}"
+                f" | vereist {int(evaluation.get('min_closed_trades',40))} gesloten trades"
+                f" en {float(evaluation.get('min_span_days',14.0)):.0f} dagen"
+            )
         outcomes = research.get('practical_outcomes', {})
         if isinstance(outcomes, dict):
             print(
@@ -1194,18 +1413,32 @@ def print_report(report: dict[str, object]) -> None:
                 f" | trailing {int(outcomes.get('trail',0))}"
                 f" | tijd {int(outcomes.get('time',0))}"
             )
+        practical_rules = research.get('practical_rules', {})
+        if not isinstance(practical_rules, dict):
+            practical_rules = {}
         print(
-            'regels: €200 per kans | alleen LONG/SIDEWAYS WATCH'
-            ' | open positie iedere 30 sec via L2'
+            f"regels: €{float(practical_rules.get('shadow_notional_eur',shadow)):.0f} per kans"
+            f" | max {int(practical_rules.get('max_open_positions',1))} tegelijk"
+            ' | alleen LONG/SIDEWAYS WATCH'
+        )
+        print(
+            f"exacte muntomvang iedere "
+            f"{int(research.get('practical_monitor_interval_seconds',PRACTICAL_MONITOR_SECONDS))} sec via L2"
+            f" | herinstap na {int(practical_rules.get('reentry_cooldown_hours',4))} uur"
         )
         print(
             'stop netto -3,00% | winstbeveiliging vanaf +1,00%'
             ' | max 48 uur vervalt zodra trailing actief is'
         )
+        attempted_ms = int(research.get('practical_monitor_attempted_ms', 0) or 0)
         monitor_ms = int(research.get('practical_monitor_generated_ms', 0) or 0)
-        if monitor_ms > 0:
+        if int(research.get('practical_open', 0)) <= 0:
+            print('winstmonitor: stand-by; geen open PAPER-positie')
+        elif monitor_ms > 0:
             monitor_age = max(0.0, (time.time() * 1000.0 - monitor_ms) / 1000.0)
-            print(f'winstmonitor: laatste L2-meting {monitor_age:.0f} sec geleden')
+            print(f'winstmonitor: laatste geldige L2-meting {monitor_age:.0f} sec geleden')
+        elif attempted_ms > 0:
+            print('winstmonitor: draait, maar laatste L2-meting is mislukt')
         else:
             print('winstmonitor: wacht op eerste 30-secondenmeting')
         practical_positions = research.get('practical_open_positions', [])
@@ -1222,10 +1455,12 @@ def print_report(report: dict[str, object]) -> None:
                 )
                 floor = item.get('trailing_floor_pct')
                 floor_text = 'uit' if floor is None else f'{float(floor):+.3f}%'
+                mark_age = item.get('last_mark_age_seconds')
+                mark_text = 'geen meting' if mark_age is None else f'meting {float(mark_age):.0f}s oud'
                 print(
                     f"  {str(item.get('market','?')):12s} | {current_text}"
                     f" | max {float(item.get('max_net_pct',0.0)):+.3f}%"
-                    f" | trailing {floor_text} | {float(item.get('age_hours',0.0)):.2f}u"
+                    f" | trailing {floor_text} | {mark_text} | {float(item.get('age_hours',0.0)):.2f}u"
                 )
         monitor_errors = research.get('practical_monitor_errors', [])
         if isinstance(monitor_errors, list) and monitor_errors:
@@ -1242,7 +1477,10 @@ def print_report(report: dict[str, object]) -> None:
             f" | PF {float(research.get('profit_factor',0.0)):.3f}"
         )
     print()
-    print('LET OP: alleen actuele €200-L2-uitvoer, prijs in zone en netto R/R ≥ 1,50 kunnen een kanslabel geven.')
+    print(
+        f'LET OP: alleen actuele €{float(shadow):.0f}-L2-uitvoer, prijs in zone en '
+        'netto R/R ≥ 1,50 kunnen een kanslabel geven.'
+    )
 
 
 def main() -> int:
@@ -1277,15 +1515,33 @@ def main() -> int:
         int(os.getenv('SCANNER_PRACTICAL_MONITOR_SECONDS', str(PRACTICAL_MONITOR_SECONDS))),
     )
     try:
-        research = _monitor_practical_positions(settings)
+        research = _monitor_practical_positions(
+            settings, monitor_interval_seconds=monitor_seconds
+        )
         _write_practical_monitor_to_report(research)
     except Exception as exc:
         logger.exception('eerste praktische 30s-monitor mislukt: %s', exc)
 
     while not STOP:
         try:
+            previous_report = _load_report()
             report = scan_once(settings)
             report['signal_research'] = _persist_signal_research(report)
+            previous_research = (
+                previous_report.get('signal_research', {})
+                if isinstance(previous_report, dict) else {}
+            )
+            if isinstance(previous_research, dict):
+                for key in (
+                    'practical_monitor_interval_seconds',
+                    'practical_monitor_attempted_ms',
+                    'practical_monitor_generated_ms',
+                    'practical_monitor_position_count',
+                    'practical_monitor_success_count',
+                    'practical_monitor_errors',
+                ):
+                    if key in previous_research:
+                        report['signal_research'][key] = previous_research[key]
             _strip_internal_research_data(report)
             _write_report(report)
             print_report(report)
@@ -1301,7 +1557,9 @@ def main() -> int:
                 break
             if time.monotonic() >= next_monitor_at:
                 try:
-                    research = _monitor_practical_positions(settings)
+                    research = _monitor_practical_positions(
+                        settings, monitor_interval_seconds=monitor_seconds
+                    )
                     _write_practical_monitor_to_report(research)
                 except Exception as exc:
                     logger.exception('praktische 30s-monitor mislukt: %s', exc)
