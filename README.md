@@ -11,7 +11,7 @@ Clean-room crypto trading research project for Bitvavo public EUR market data.
 
 ## Nieuwe read-only onderzoekslaag
 
-`crypto_scanner_v2.py` bevat nu scanner v3.4. Een handmatig kanslabel vereist een uitvoerbare €200-L2-VWAP,
+`crypto_scanner_v2.py` bevat nu scanner v3.5. Een handmatig kanslabel vereist een uitvoerbare €200-L2-VWAP,
 een actuele uitvoerprijs binnen de besliszone en een netto risico/opbrengst van minimaal 1,50. Een USDC-route
 wordt inclusief EUR↔USDC-omwisseling beoordeeld. Alle kanslabels en hun latere stop/target/timeout-uitkomst
 worden prospectief opgeslagen in `cryptobot_scanner_v3.db`. De bestaande kandidaat-snapshots worden nu ook
@@ -24,6 +24,16 @@ De test gebruikt een netto stop van -3%, activeert winstbeveiliging vanaf +1%
 en laat daarna maximaal 1 procentpunt teruglopen met minimaal +0,25% als winstslot. De 48-uurslimiet geldt
 alleen zolang trailing nog niet actief is; een actieve runner blijft meelopen tot de winstgrens wordt geraakt.
 Fees en vaste slippage worden naast de echte orderboekprijzen afgetrokken; echte orders blijven onmogelijk.
+
+Vanaf v3.5 blijft deze v3.4-portefeuille ongewijzigd als controlegroep en loopt binnen hetzelfde read-only
+proces een afzonderlijke menselijke PAPER-challenger. Die maakt uit de 15m/1h-scan maximaal vijf kansrijke
+EUR-longs en controleert die iedere minuut opnieuw met gesloten 5m-candles en een actuele L2-uitvoerprijs.
+Een PAPER-instap vereist een 5m-breakout, pullbackhervatting of volumehervatting, voldoende volume,
+geen extreme koersuitrekking, geen plotselinge Bitcoinmarktschok, acceptabele nabije bied/laatdruk,
+voldoende kostenruimte en een actuele netto risico/opbrengst. Iedere instap of blokkade wordt met alle
+redenen in SQLite opgeslagen. De challenger heeft een eigen virtueel kapitaal en kan de v3.4-resultaten
+daarom eerlijk vergelijken. Nieuws is bewust nog geen automatische factor: zonder betrouwbare bron staat
+dit expliciet als ontbrekende menselijke controle in de status in plaats van dat de bot zekerheid simuleert.
 
 `crypto_research_v4.py` blijft als bewaarde broncode beschikbaar, maar draait niet meer in de lean runtime.
 
@@ -60,12 +70,13 @@ uitvoeringskostenniveau uit de volledige 72 uur. Orders blijven onmogelijk.
 
 - Interval: 15 minuten.
 - Universe: 20 liquide EUR-markten, eenmaal geselecteerd op actueel 24-uurs quotevolume en daarna vastgezet.
-- Instappen blijft op gesloten 15m-candles; open PAPER-posities worden iedere 30 seconden bewaakt.
+- De v3.4-basis stapt op de 15m-context in; de v3.5-challenger zoekt iedere minuut een gesloten 5m-trigger.
+- Open PAPER-posities van beide portefeuilles worden iedere 30 seconden bewaakt.
 - De uitstap-VWAP gebruikt exact hetzelfde aantal munten als bij de PAPER-instap.
 - Positieomvang, maximaal aantal gelijktijdige posities en beschikbaar PAPER-geld worden afgedwongen.
 - Na een uitstap geldt per munt vier uur afkoeling om kunstmatige kostenchurn te voorkomen.
 - De status toont cash, equity, drawdown en of er genoeg trades en testdagen zijn voor beoordeling.
-- Alleen scanner v3 en fundingmonitor v4.1 draaien; de oude PAPER-strategieën blijven bewaard maar gestopt.
+- Alleen scanner v3.5 en fundingmonitor v4.1 draaien; de oude PAPER-strategieën blijven bewaard maar gestopt.
 
 ## Strategy A — Mean Reversion
 

@@ -25,6 +25,14 @@ from crypto_scanner import (
     _sideways_score,
 )
 from strategy import BandReentryStrategy
+from human_decision import (
+    HUMAN_ENTRY_SCORE,
+    HUMAN_SHORTLIST_SIZE,
+    HUMAN_TRIGGER_INTERVAL,
+    HUMAN_TRIGGER_POLL_SECONDS,
+    evaluate_human_entry,
+    five_minute_features,
+)
 
 logger = logging.getLogger('cryptobot_scanner_v2')
 STOP = False
@@ -285,6 +293,9 @@ def _pair_snapshot(
         'executable_entry': round(executable_entry, 8),
         'bid_depth_quote': round(float(depth['bid_depth_quote']), 2),
         'ask_depth_quote': round(float(depth['ask_depth_quote']), 2),
+        'near_bid_depth_quote': round(float(depth.get('near_bid_depth_quote', 0.0)), 2),
+        'near_ask_depth_quote': round(float(depth.get('near_ask_depth_quote', 0.0)), 2),
+        'near_book_imbalance': round(float(depth.get('near_book_imbalance', 0.0)), 4),
         'price_in_zone': price_in_zone,
         'taker_fee_pct': _taker_fee_pct(quote),
         'conversion_cost_pct': round(conversion_cost_pct, 4),
@@ -428,8 +439,8 @@ def scan_once(settings: Settings) -> dict[str, object]:
     trade_grade = [row for row in chosen if 'TRADE-GRADE' in str(row.get('action', ''))]
     generated_ms = int(time.time() * 1000)
     return {
-        'version': '3.4',
-        'mode': 'STRICT_L2_AUDIT_30S_PORTFOLIO_PAPER_SCANNER',
+        'version': '3.5',
+        'mode': 'BASELINE_PLUS_HUMAN_CONTEXT_PAPER_SCANNER',
         'generated_at_ms': generated_ms,
         'generated_at_utc': datetime.fromtimestamp(generated_ms / 1000.0, tz=timezone.utc).isoformat(),
         'interval': settings.interval,
@@ -460,6 +471,10 @@ def scan_once(settings: Settings) -> dict[str, object]:
             'eval_min_span_days': settings.eval_min_span_days,
             'eval_min_profit_factor': settings.eval_min_profit_factor,
             'eval_max_drawdown_pct': settings.eval_max_drawdown_pct,
+            'human_trigger_interval': HUMAN_TRIGGER_INTERVAL,
+            'human_trigger_poll_seconds': HUMAN_TRIGGER_POLL_SECONDS,
+            'human_shortlist_size': HUMAN_SHORTLIST_SIZE,
+            'human_entry_score_min': HUMAN_ENTRY_SCORE,
             'eur_taker_fee_pct': EUR_TAKER_FEE_PCT,
             'usdc_taker_fee_pct': USDC_TAKER_FEE_PCT,
             'usdc_eur_taker_fee_pct': USDC_EUR_TAKER_FEE_PCT,
@@ -615,6 +630,49 @@ def _scanner_db_connect() -> sqlite3.Connection:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_scanner_one_open_practical_base "
         "ON practical_signals(base_asset) WHERE status='OPEN'"
     )
+    conn.execute(
+        '''CREATE TABLE IF NOT EXISTS human_decisions (
+            evaluated_ms INTEGER NOT NULL,
+            context_generated_ms INTEGER NOT NULL,
+            market TEXT NOT NULL,
+            action TEXT NOT NULL,
+            score REAL NOT NULL,
+            trigger_name TEXT NOT NULL,
+            blockers_json TEXT NOT NULL,
+            details_json TEXT NOT NULL,
+            PRIMARY KEY (evaluated_ms, market)
+        )'''
+    )
+    conn.execute(
+        '''CREATE TABLE IF NOT EXISTS human_signals (
+            generated_ms INTEGER NOT NULL,
+            market TEXT NOT NULL,
+            base_asset TEXT NOT NULL,
+            signal_action TEXT NOT NULL,
+            decision_score REAL NOT NULL,
+            decision_details_json TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            non_book_cost_pct REAL NOT NULL,
+            notional_eur REAL NOT NULL DEFAULT 200,
+            base_quantity REAL NOT NULL,
+            status TEXT NOT NULL,
+            max_net_return_pct REAL NOT NULL DEFAULT 0,
+            trailing_floor_pct REAL,
+            last_mark_ms INTEGER,
+            last_sell_price REAL,
+            last_net_return_pct REAL,
+            evaluated_ms INTEGER,
+            exit_price REAL,
+            outcome TEXT,
+            net_return_pct REAL,
+            paper_slot INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (generated_ms, market)
+        )'''
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_scanner_one_open_human_slot "
+        "ON human_signals(paper_slot) WHERE status='OPEN'"
+    )
     conn.commit()
     return conn
 
@@ -632,6 +690,534 @@ def _practical_net_return(entry: float, executable_sell: float, non_book_cost_pc
     if entry <= 0.0 or executable_sell <= 0.0:
         return -999.0
     return (executable_sell / entry - 1.0) * 100.0 - max(0.0, non_book_cost_pct)
+
+
+def _human_shortlist(report: dict[str, object]) -> list[dict[str, Any]]:
+    candidates = report.get('all_pair_snapshots', report.get('candidates', []))
+    if not isinstance(candidates, list):
+        return []
+    eligible: list[dict[str, Any]] = []
+    for value in candidates:
+        if (
+            not isinstance(value, dict)
+            or str(value.get('side', '')) != 'LONG'
+            or str(value.get('quote', _quote_asset(str(value.get('market', ''))))) != 'EUR'
+        ):
+            continue
+        action = str(value.get('action', ''))
+        decision_action = str(value.get('decision_action', ''))
+        if (
+            action not in {'LONG WATCH', 'LONG TRADE-GRADE', 'SIDEWAYS WATCH'}
+            and decision_action not in {'LONG', 'BUY'}
+        ):
+            continue
+        if float(value.get('score', 0.0)) < 55.0:
+            continue
+        if float(value.get('cost_multiple', 0.0)) < 2.0:
+            continue
+        eligible.append(value)
+    eligible.sort(key=_rank_key, reverse=True)
+    unique: list[dict[str, Any]] = []
+    seen_bases: set[str] = set()
+    for row in eligible:
+        base = str(row.get('base') or _base_asset(str(row.get('market', ''))))
+        if base in seen_bases:
+            continue
+        seen_bases.add(base)
+        unique.append(row)
+        if len(unique) >= HUMAN_SHORTLIST_SIZE:
+            break
+    return unique
+
+
+def _human_stats(settings: Settings, generated_ms: int) -> dict[str, object]:
+    paper_start_eur = float(getattr(settings, 'paper_start_eur', 5000.0))
+    conn = _scanner_db_connect()
+    try:
+        (
+            total,
+            open_count,
+            closed,
+            wins,
+            realized_pnl_eur,
+            positive_eur,
+            negative_eur,
+            stops,
+            trails,
+            times,
+            first_ms,
+        ) = conn.execute(
+            '''SELECT COUNT(*),
+                      SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN status='CLOSED' AND net_return_pct>0 THEN 1 ELSE 0 END),
+                      COALESCE(SUM(CASE WHEN status='CLOSED'
+                           THEN net_return_pct*notional_eur/100.0 ELSE 0 END),0),
+                      COALESCE(SUM(CASE WHEN status='CLOSED' AND net_return_pct>0
+                           THEN net_return_pct*notional_eur/100.0 ELSE 0 END),0),
+                      COALESCE(SUM(CASE WHEN status='CLOSED' AND net_return_pct<0
+                           THEN -net_return_pct*notional_eur/100.0 ELSE 0 END),0),
+                      SUM(CASE WHEN outcome='STOP' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN outcome='TRAIL' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN outcome='TIME' THEN 1 ELSE 0 END),
+                      MIN(generated_ms)
+               FROM human_signals'''
+        ).fetchone()
+        open_pnl_eur = 0.0
+        open_notional_eur = 0.0
+        unpriced_open = 0
+        open_positions: list[dict[str, object]] = []
+        for row in conn.execute(
+            '''SELECT generated_ms,market,decision_score,notional_eur,base_quantity,
+                      max_net_return_pct,trailing_floor_pct,last_mark_ms,last_sell_price,
+                      last_net_return_pct
+               FROM human_signals WHERE status='OPEN' ORDER BY market'''
+        ).fetchall():
+            (
+                opened_ms,
+                market,
+                decision_score,
+                notional_eur,
+                base_quantity,
+                max_net,
+                trailing_floor,
+                last_mark_ms,
+                last_sell_price,
+                last_net,
+            ) = row
+            notional = float(notional_eur)
+            open_notional_eur += notional
+            current_net = None if last_net is None else float(last_net)
+            if current_net is None:
+                unpriced_open += 1
+            else:
+                open_pnl_eur += current_net * notional / 100.0
+            open_positions.append({
+                'market': str(market),
+                'decision_score': round(float(decision_score), 1),
+                'age_hours': round(max(0.0, (generated_ms - int(opened_ms)) / 3_600_000.0), 2),
+                'notional_eur': round(notional, 2),
+                'base_quantity': round(float(base_quantity), 12),
+                'current_sell_price': (
+                    None if last_sell_price is None else round(float(last_sell_price), 8)
+                ),
+                'current_net_pct': None if current_net is None else round(current_net, 3),
+                'current_pnl_eur': (
+                    None if current_net is None
+                    else round(current_net * notional / 100.0, 2)
+                ),
+                'max_net_pct': round(float(max_net), 3),
+                'trailing_floor_pct': (
+                    None if trailing_floor is None else round(float(trailing_floor), 3)
+                ),
+                'last_mark_age_seconds': (
+                    None if last_mark_ms is None
+                    else round(max(0.0, (generated_ms - int(last_mark_ms)) / 1000.0), 1)
+                ),
+            })
+
+        decision_cutoff = generated_ms - AUDIT_WINDOW_MS
+        decision_total, entry_decisions = conn.execute(
+            '''SELECT COUNT(*),SUM(CASE WHEN action='PAPER ENTRY' THEN 1 ELSE 0 END)
+               FROM human_decisions WHERE evaluated_ms>=?''',
+            (decision_cutoff,),
+        ).fetchone()
+        blocker_counts: dict[str, int] = {}
+        for (raw_blockers,) in conn.execute(
+            'SELECT blockers_json FROM human_decisions WHERE evaluated_ms>=?',
+            (decision_cutoff,),
+        ).fetchall():
+            try:
+                blockers = json.loads(str(raw_blockers))
+            except (TypeError, ValueError):
+                blockers = []
+            if isinstance(blockers, list):
+                for blocker in set(str(value) for value in blockers):
+                    blocker_counts[blocker] = blocker_counts.get(blocker, 0) + 1
+        top_blockers = [
+            {'reason': reason, 'count': count}
+            for reason, count in sorted(
+                blocker_counts.items(), key=lambda item: (-item[1], item[0])
+            )[:5]
+        ]
+        latest_decisions: list[dict[str, object]] = []
+        for evaluated_ms, market, action, score, trigger, blockers_json in conn.execute(
+            '''SELECT evaluated_ms,market,action,score,trigger_name,blockers_json
+               FROM human_decisions ORDER BY evaluated_ms DESC,score DESC LIMIT 5'''
+        ).fetchall():
+            try:
+                blockers = json.loads(str(blockers_json))
+            except (TypeError, ValueError):
+                blockers = []
+            latest_decisions.append({
+                'evaluated_ms': int(evaluated_ms),
+                'market': str(market),
+                'action': str(action),
+                'score': round(float(score), 1),
+                'trigger': str(trigger),
+                'blockers': blockers if isinstance(blockers, list) else [],
+            })
+
+        profit_factor = (
+            float(positive_eur) / float(negative_eur)
+            if float(negative_eur) > 0.0
+            else (999.0 if float(positive_eur) > 0.0 else 0.0)
+        )
+        balance = paper_start_eur
+        peak = balance
+        max_drawdown_pct = 0.0
+        for net_pct, notional in conn.execute(
+            '''SELECT net_return_pct,notional_eur FROM human_signals
+               WHERE status='CLOSED' ORDER BY evaluated_ms,generated_ms,market'''
+        ).fetchall():
+            balance += float(net_pct) * float(notional) / 100.0
+            peak = max(peak, balance)
+            if peak > 0.0:
+                max_drawdown_pct = max(max_drawdown_pct, (peak - balance) / peak * 100.0)
+        test_span_days = (
+            0.0 if first_ms is None
+            else max(0.0, (generated_ms - int(first_ms)) / 86_400_000.0)
+        )
+        eval_min_trades = int(getattr(settings, 'eval_min_trades', 40))
+        eval_min_span_days = float(getattr(settings, 'eval_min_span_days', 14.0))
+        enough_history = int(closed or 0) >= eval_min_trades and test_span_days >= eval_min_span_days
+        if not enough_history:
+            evaluation = 'VERZAMELEN'
+        elif (
+            profit_factor >= float(getattr(settings, 'eval_min_profit_factor', 1.25))
+            and max_drawdown_pct <= float(getattr(settings, 'eval_max_drawdown_pct', 10.0))
+            and float(realized_pnl_eur) > 0.0
+        ):
+            evaluation = 'PAPER KANDIDAAT'
+        else:
+            evaluation = 'ONVOLDOENDE'
+
+        return {
+            'human_decisions_24h': int(decision_total or 0),
+            'human_entry_decisions_24h': int(entry_decisions or 0),
+            'human_top_blockers_24h': top_blockers,
+            'human_latest_decisions': latest_decisions,
+            'human_total': int(total or 0),
+            'human_open': int(open_count or 0),
+            'human_closed': int(closed or 0),
+            'human_wins': int(wins or 0),
+            'human_losses': int((closed or 0) - (wins or 0)),
+            'human_pnl_eur': round(float(realized_pnl_eur), 2),
+            'human_open_pnl_eur': round(open_pnl_eur, 2),
+            'human_paper_cash_eur': round(
+                paper_start_eur + float(realized_pnl_eur) - open_notional_eur, 2
+            ),
+            'human_paper_equity_eur': round(
+                paper_start_eur + float(realized_pnl_eur) + open_pnl_eur, 2
+            ),
+            'human_profit_factor': round(profit_factor, 3),
+            'human_max_drawdown_pct': round(max_drawdown_pct, 3),
+            'human_test_span_days': round(test_span_days, 2),
+            'human_evaluation': evaluation,
+            'human_open_positions': open_positions,
+            'human_unpriced_open': unpriced_open,
+            'human_outcomes': {
+                'stop': int(stops or 0),
+                'trail': int(trails or 0),
+                'time': int(times or 0),
+            },
+            'human_rules': {
+                'entry_score_min': HUMAN_ENTRY_SCORE,
+                'shortlist_size': HUMAN_SHORTLIST_SIZE,
+                'trigger_interval': HUMAN_TRIGGER_INTERVAL,
+                'trigger_poll_seconds': HUMAN_TRIGGER_POLL_SECONDS,
+                'position_monitor_seconds': PRACTICAL_MONITOR_SECONDS,
+                'stop_net_pct': PRACTICAL_STOP_NET_PCT,
+                'trail_activate_net_pct': PRACTICAL_TRAIL_ACTIVATE_NET_PCT,
+                'trail_giveback_pct': PRACTICAL_TRAIL_GIVEBACK_PCT,
+                'minimum_locked_net_pct': PRACTICAL_MIN_LOCK_NET_PCT,
+                'news_check': 'NIET GEAUTOMATISEERD',
+            },
+        }
+    finally:
+        conn.close()
+
+
+def _monitor_human_positions(
+    settings: Settings,
+    *,
+    api: BitvavoPublic | None = None,
+    generated_ms: int | None = None,
+    monitor_interval_seconds: int = PRACTICAL_MONITOR_SECONDS,
+) -> dict[str, object]:
+    now_ms = int(time.time() * 1000) if generated_ms is None else int(generated_ms)
+    conn = _scanner_db_connect()
+    try:
+        positions = [
+            (int(row[0]), str(row[1]), float(row[2]))
+            for row in conn.execute(
+                '''SELECT generated_ms,market,base_quantity FROM human_signals
+                   WHERE status='OPEN' ORDER BY market'''
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    market_api = api or BitvavoPublic(
+        settings.api_base_url,
+        settings.request_timeout_seconds,
+        settings.request_retries,
+    )
+    marks: dict[tuple[int, str], float] = {}
+    errors: list[str] = []
+    for opened_ms, market, base_quantity in positions:
+        try:
+            depth = market_api.sell_vwap_for_base(market, base_quantity)
+            marks[(opened_ms, market)] = float(depth['sell_vwap'])
+        except Exception as exc:
+            errors.append(f'{market}: {type(exc).__name__}: {exc}')
+
+    conn = _scanner_db_connect()
+    try:
+        for row in conn.execute(
+            '''SELECT generated_ms,market,entry_price,non_book_cost_pct,
+                      max_net_return_pct,trailing_floor_pct
+               FROM human_signals WHERE status='OPEN' '''
+        ).fetchall():
+            opened_ms, market, entry, non_book_cost, stored_max, stored_floor = row
+            executable_sell = marks.get((int(opened_ms), str(market)))
+            if executable_sell is None:
+                continue
+            net_return = _practical_net_return(
+                float(entry), executable_sell, float(non_book_cost)
+            )
+            max_net = max(float(stored_max), net_return)
+            trailing_floor = None if stored_floor is None else float(stored_floor)
+            if max_net >= PRACTICAL_TRAIL_ACTIVATE_NET_PCT:
+                new_floor = max(
+                    PRACTICAL_MIN_LOCK_NET_PCT,
+                    max_net - PRACTICAL_TRAIL_GIVEBACK_PCT,
+                )
+                trailing_floor = (
+                    new_floor if trailing_floor is None else max(trailing_floor, new_floor)
+                )
+            outcome = ''
+            if net_return <= PRACTICAL_STOP_NET_PCT:
+                outcome = 'STOP'
+            elif trailing_floor is not None and net_return <= trailing_floor:
+                outcome = 'TRAIL'
+            elif trailing_floor is None and now_ms - int(opened_ms) >= PRACTICAL_MAX_HOLD_MS:
+                outcome = 'TIME'
+            if outcome:
+                conn.execute(
+                    '''UPDATE human_signals
+                       SET status='CLOSED',max_net_return_pct=?,trailing_floor_pct=?,
+                           last_mark_ms=?,last_sell_price=?,last_net_return_pct=?,
+                           evaluated_ms=?,exit_price=?,outcome=?,net_return_pct=?
+                       WHERE generated_ms=? AND market=?''',
+                    (
+                        max_net, trailing_floor, now_ms, executable_sell, net_return,
+                        now_ms, executable_sell, outcome, net_return, opened_ms, market,
+                    ),
+                )
+            else:
+                conn.execute(
+                    '''UPDATE human_signals
+                       SET max_net_return_pct=?,trailing_floor_pct=?,last_mark_ms=?,
+                           last_sell_price=?,last_net_return_pct=?
+                       WHERE generated_ms=? AND market=?''',
+                    (
+                        max_net, trailing_floor, now_ms, executable_sell, net_return,
+                        opened_ms, market,
+                    ),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    stats = _human_stats(settings, now_ms)
+    stats.update({
+        'human_monitor_interval_seconds': monitor_interval_seconds,
+        'human_monitor_attempted_ms': now_ms,
+        'human_monitor_generated_ms': now_ms if marks or not positions else 0,
+        'human_monitor_position_count': len(positions),
+        'human_monitor_success_count': len(marks),
+        'human_monitor_errors': errors,
+    })
+    return stats
+
+
+def _monitor_human_entries(
+    settings: Settings,
+    report: dict[str, object],
+    *,
+    api: BitvavoPublic | None = None,
+    generated_ms: int | None = None,
+) -> dict[str, object]:
+    now_ms = int(time.time() * 1000) if generated_ms is None else int(generated_ms)
+    stats = _human_stats(settings, now_ms)
+    stats.update({
+        'human_entry_attempted_ms': now_ms,
+        'human_entry_generated_ms': 0,
+        'human_shortlist_count': 0,
+        'human_entry_errors': [],
+    })
+    if _report_is_stale(report, now_ms):
+        stats['human_entry_errors'] = ['15m-context is verouderd; geen PAPER-instap']
+        return stats
+    if int(stats.get('human_open', 0)) > 0:
+        stats['human_entry_generated_ms'] = now_ms
+        stats['human_entry_status'] = 'POSITIE OPEN; nieuwe instap stand-by'
+        return stats
+
+    shortlist = _human_shortlist(report)
+    stats['human_shortlist_count'] = len(shortlist)
+    if not shortlist:
+        stats['human_entry_generated_ms'] = now_ms
+        stats['human_entry_status'] = 'GEEN 15M-SHORTLIST'
+        return stats
+
+    market_api = api or BitvavoPublic(
+        settings.api_base_url,
+        settings.request_timeout_seconds,
+        settings.request_retries,
+    )
+    errors: list[str] = []
+    try:
+        bitcoin_candles = market_api.closed_candles(
+            'BTC-EUR', HUMAN_TRIGGER_INTERVAL, 40, now_ms=now_ms
+        )
+        bitcoin_features = five_minute_features(bitcoin_candles)
+    except Exception as exc:
+        bitcoin_features = {'valid': False, 'reason': f'{type(exc).__name__}: {exc}'}
+        errors.append(f'BTC-EUR 5m: {type(exc).__name__}: {exc}')
+
+    decisions: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for context in shortlist:
+        market = str(context.get('market', ''))
+        try:
+            quote_notional = float(
+                context.get('shadow_notional_quote', getattr(settings, 'position_eur', 200.0))
+            )
+            candles = market_api.closed_candles(
+                market, HUMAN_TRIGGER_INTERVAL, 40, now_ms=now_ms
+            )
+            depth = market_api.depth_book(market, quote_notional)
+            adjusted_context = {
+                **context,
+                'execution_spread_pct': float(depth['execution_spread_pct']),
+                'roundtrip_cost_pct': max(
+                    0.0,
+                    float(context.get('roundtrip_cost_pct', 0.0))
+                    - float(context.get('execution_spread_pct', 0.0)),
+                ) + float(depth['execution_spread_pct']),
+            }
+            features = five_minute_features(candles, live_price=float(depth['buy_vwap']))
+            decision = evaluate_human_entry(
+                context=adjusted_context,
+                regime=str(report.get('regime', 'UNKNOWN')),
+                five_minute=features,
+                bitcoin_five_minute=bitcoin_features,
+                depth=depth,
+            )
+            decisions.append((decision, adjusted_context))
+        except Exception as exc:
+            errors.append(f'{market}: {type(exc).__name__}: {exc}')
+
+    context_generated_ms = int(report.get('generated_at_ms', 0))
+    conn = _scanner_db_connect()
+    try:
+        for decision, _ in decisions:
+            conn.execute(
+                '''INSERT OR REPLACE INTO human_decisions
+                   (evaluated_ms,context_generated_ms,market,action,score,trigger_name,
+                    blockers_json,details_json) VALUES (?,?,?,?,?,?,?,?)''',
+                (
+                    now_ms,
+                    context_generated_ms,
+                    str(decision.get('market', '')),
+                    str(decision.get('action', 'WACHTEN')),
+                    float(decision.get('score', 0.0)),
+                    str(decision.get('trigger', 'geen')),
+                    json.dumps(decision.get('blockers', []), ensure_ascii=False),
+                    json.dumps(decision, ensure_ascii=False),
+                ),
+            )
+        best = max(
+            (
+                item for item in decisions if bool(item[0].get('eligible'))
+            ),
+            key=lambda item: float(item[0].get('score', 0.0)),
+            default=None,
+        )
+        opened = False
+        if best is not None:
+            decision, context = best
+            market = str(decision.get('market', ''))
+            base_asset = str(context.get('base') or _base_asset(market))
+            last_exit = conn.execute(
+                '''SELECT MAX(evaluated_ms) FROM human_signals
+                   WHERE base_asset=? AND status='CLOSED' ''',
+                (base_asset,),
+            ).fetchone()[0]
+            cooldown_ok = (
+                last_exit is None
+                or now_ms - int(last_exit) >= PRACTICAL_REENTRY_COOLDOWN_MS
+                or now_ms - int(last_exit) < 0
+            )
+            if cooldown_ok:
+                entry_price = float(decision.get('buy_vwap', 0.0))
+                sell_price = float(decision.get('sell_vwap', 0.0))
+                quote_notional = float(
+                    context.get('shadow_notional_quote', getattr(settings, 'position_eur', 200.0))
+                )
+                non_book_cost = max(
+                    0.0,
+                    float(context.get('roundtrip_cost_pct', 0.0))
+                    - float(context.get('execution_spread_pct', 0.0)),
+                )
+                base_quantity = quote_notional / entry_price if entry_price > 0.0 else 0.0
+                initial_net = (
+                    _practical_net_return(entry_price, sell_price, non_book_cost)
+                    if sell_price > 0.0 else None
+                )
+                if entry_price > 0.0 and base_quantity > 0.0:
+                    cursor = conn.execute(
+                        '''INSERT OR IGNORE INTO human_signals
+                           (generated_ms,market,base_asset,signal_action,decision_score,
+                            decision_details_json,entry_price,non_book_cost_pct,notional_eur,
+                            base_quantity,status,max_net_return_pct,last_mark_ms,last_sell_price,
+                            last_net_return_pct,paper_slot)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,'OPEN',?,?,?,?,1)''',
+                        (
+                            now_ms,
+                            market,
+                            base_asset,
+                            str(decision.get('trigger', '5m')),
+                            float(decision.get('score', 0.0)),
+                            json.dumps(decision, ensure_ascii=False),
+                            entry_price,
+                            non_book_cost,
+                            float(getattr(settings, 'position_eur', 200.0)),
+                            base_quantity,
+                            max(0.0, initial_net or 0.0),
+                            now_ms if initial_net is not None else None,
+                            sell_price if initial_net is not None else None,
+                            initial_net,
+                        ),
+                    )
+                    opened = cursor.rowcount > 0
+        retention_cutoff = now_ms - 30 * 24 * 60 * 60 * 1000
+        conn.execute('DELETE FROM human_decisions WHERE evaluated_ms<?', (retention_cutoff,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    stats = _human_stats(settings, now_ms)
+    stats.update({
+        'human_entry_attempted_ms': now_ms,
+        'human_entry_generated_ms': now_ms if decisions or not errors else 0,
+        'human_shortlist_count': len(shortlist),
+        'human_entry_evaluated_count': len(decisions),
+        'human_entry_opened': opened,
+        'human_entry_errors': errors,
+        'human_entry_status': 'PAPER-POSITIE GEOPEND' if opened else 'WACHTEN OP BEVESTIGING',
+    })
+    return stats
 
 
 def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
@@ -1267,6 +1853,17 @@ def _write_practical_monitor_to_report(research: dict[str, object]) -> None:
     _write_report(report)
 
 
+def _write_human_research_to_report(research: dict[str, object]) -> None:
+    report = _load_report()
+    if report is None:
+        return
+    existing = report.get('human_research', {})
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    merged.update(research)
+    report['human_research'] = merged
+    _write_report(report)
+
+
 def _strip_internal_research_data(report: dict[str, object]) -> None:
     for value in report.values():
         if not isinstance(value, list):
@@ -1279,7 +1876,7 @@ def _strip_internal_research_data(report: dict[str, object]) -> None:
 def print_report(report: dict[str, object]) -> None:
     age_seconds = _report_age_seconds(report)
     freshness = 'VEROUDERD' if age_seconds > REPORT_STALE_SECONDS else 'ACTUEEL'
-    print('=== CRYPTO SCANNER v3.4 | REALISTISCHE PAPERPORTEFEUILLE | READ ONLY ===')
+    print('=== CRYPTO SCANNER v3.5 | BASIS + MENSELIJKE BESLISLAAG | READ ONLY ===')
     print(f"UTC             : {report.get('generated_at_utc', 'n/a')}")
     print(f"RAPPORTSTATUS   : {freshness} | leeftijd {age_seconds/60.0:.1f} min")
     print(f"REGIME          : {report.get('regime', 'UNKNOWN')}")
@@ -1467,6 +2064,87 @@ def print_report(report: dict[str, object]) -> None:
             print(f'winstmonitor-waarschuwingen: {len(monitor_errors)}')
             for monitor_error in monitor_errors[:3]:
                 print(f'  - {monitor_error}')
+    human = report.get('human_research', {})
+    if isinstance(human, dict):
+        print()
+        print('=== MENSELIJKE BESLISLAAG — 5M PAPER CHALLENGER ===')
+        print(
+            f"shortlist {int(human.get('human_shortlist_count',0))}"
+            f" | controles 24u {int(human.get('human_decisions_24h',0))}"
+            f" | instapbesluiten 24u {int(human.get('human_entry_decisions_24h',0))}"
+        )
+        print(
+            f"entries {int(human.get('human_total',0))}"
+            f" | open {int(human.get('human_open',0))}"
+            f" | gesloten {int(human.get('human_closed',0))}"
+            f" | W/L {int(human.get('human_wins',0))}/{int(human.get('human_losses',0))}"
+        )
+        human_pf = float(human.get('human_profit_factor', 0.0))
+        print(
+            f"gesloten PnL €{float(human.get('human_pnl_eur',0.0)):+.2f}"
+            f" | open indicatie €{float(human.get('human_open_pnl_eur',0.0)):+.2f}"
+            f" | PF {'∞' if human_pf >= 999.0 else f'{human_pf:.3f}'}"
+        )
+        print(
+            f"paper equity €{float(human.get('human_paper_equity_eur',0.0)):.2f}"
+            f" | max drawdown {float(human.get('human_max_drawdown_pct',0.0)):.2f}%"
+            f" | evaluatie {human.get('human_evaluation','VERZAMELEN')}"
+        )
+        print('alleen EUR-routes | context 15m/1h | timing 5m iedere 60 sec')
+        print('volume + BTC + L2-orderboekdruk | eigen PAPER-kapitaal, max 1 positie')
+        print(
+            'anti-pump + marktschokveto actief | nieuws nog niet betrouwbaar geautomatiseerd'
+        )
+        human_status = str(human.get('human_entry_status', 'WACHT OP EERSTE CONTROLE'))
+        print(f'beslisstatus: {human_status}')
+        latest = human.get('human_latest_decisions', [])
+        if isinstance(latest, list):
+            seen: set[str] = set()
+            for item in latest:
+                if not isinstance(item, dict):
+                    continue
+                market = str(item.get('market', '?'))
+                if market in seen:
+                    continue
+                seen.add(market)
+                blockers = item.get('blockers', [])
+                reason = ', '.join(str(value) for value in blockers[:3]) if isinstance(blockers, list) else ''
+                print(
+                    f"  {market:12s} | {str(item.get('action','WACHTEN')):11s}"
+                    f" | score {float(item.get('score',0.0)):4.1f}"
+                    f" | {item.get('trigger','geen')}"
+                    + (f" | blokkade: {reason}" if reason else '')
+                )
+                if len(seen) >= 3:
+                    break
+        human_positions = human.get('human_open_positions', [])
+        if isinstance(human_positions, list):
+            for item in human_positions:
+                if not isinstance(item, dict):
+                    continue
+                current_net = item.get('current_net_pct')
+                current = (
+                    'geen actuele L2-prijs' if current_net is None
+                    else f"netto {float(current_net):+.3f}% / €{float(item.get('current_pnl_eur',0.0)):+.2f}"
+                )
+                floor = item.get('trailing_floor_pct')
+                print(
+                    f"  OPEN {str(item.get('market','?')):7s} | {current}"
+                    f" | max {float(item.get('max_net_pct',0.0)):+.3f}%"
+                    f" | trailing {'uit' if floor is None else f'{float(floor):+.3f}%'}"
+                )
+        human_errors = human.get('human_entry_errors', [])
+        monitor_errors = human.get('human_monitor_errors', [])
+        combined_errors = []
+        if isinstance(human_errors, list):
+            combined_errors.extend(human_errors)
+        if isinstance(monitor_errors, list):
+            combined_errors.extend(monitor_errors)
+        if combined_errors:
+            print(f'menselijke-laag waarschuwingen: {len(combined_errors)}')
+            for human_error in combined_errors[:3]:
+                print(f'  - {human_error}')
+    if isinstance(research, dict):
         print()
         print('=== PROSPECTIEVE ZELDZAME-SIGNAALCONTROLE ===')
         print(
@@ -1514,6 +2192,10 @@ def main() -> int:
         10,
         int(os.getenv('SCANNER_PRACTICAL_MONITOR_SECONDS', str(PRACTICAL_MONITOR_SECONDS))),
     )
+    human_seconds = max(
+        30,
+        int(os.getenv('SCANNER_HUMAN_TRIGGER_SECONDS', str(HUMAN_TRIGGER_POLL_SECONDS))),
+    )
     try:
         research = _monitor_practical_positions(
             settings, monitor_interval_seconds=monitor_seconds
@@ -1521,6 +2203,13 @@ def main() -> int:
         _write_practical_monitor_to_report(research)
     except Exception as exc:
         logger.exception('eerste praktische 30s-monitor mislukt: %s', exc)
+    try:
+        human_research = _monitor_human_positions(
+            settings, monitor_interval_seconds=monitor_seconds
+        )
+        _write_human_research_to_report(human_research)
+    except Exception as exc:
+        logger.exception('eerste menselijke PAPER-positiemonitor mislukt: %s', exc)
 
     while not STOP:
         try:
@@ -1542,6 +2231,23 @@ def main() -> int:
                 ):
                     if key in previous_research:
                         report['signal_research'][key] = previous_research[key]
+            human_research = _monitor_human_entries(settings, report)
+            previous_human = (
+                previous_report.get('human_research', {})
+                if isinstance(previous_report, dict) else {}
+            )
+            if isinstance(previous_human, dict):
+                for key in (
+                    'human_monitor_interval_seconds',
+                    'human_monitor_attempted_ms',
+                    'human_monitor_generated_ms',
+                    'human_monitor_position_count',
+                    'human_monitor_success_count',
+                    'human_monitor_errors',
+                ):
+                    if key in previous_human:
+                        human_research[key] = previous_human[key]
+            report['human_research'] = human_research
             _strip_internal_research_data(report)
             _write_report(report)
             print_report(report)
@@ -1552,6 +2258,7 @@ def main() -> int:
         if args.once:
             return 0
         next_monitor_at = time.monotonic() + monitor_seconds
+        next_human_at = time.monotonic() + human_seconds
         for _ in range(poll_seconds):
             if STOP:
                 break
@@ -1563,7 +2270,23 @@ def main() -> int:
                     _write_practical_monitor_to_report(research)
                 except Exception as exc:
                     logger.exception('praktische 30s-monitor mislukt: %s', exc)
+                try:
+                    human_research = _monitor_human_positions(
+                        settings, monitor_interval_seconds=monitor_seconds
+                    )
+                    _write_human_research_to_report(human_research)
+                except Exception as exc:
+                    logger.exception('menselijke PAPER-positiemonitor mislukt: %s', exc)
                 next_monitor_at = time.monotonic() + monitor_seconds
+            if time.monotonic() >= next_human_at:
+                try:
+                    current_report = _load_report()
+                    if current_report is not None:
+                        human_research = _monitor_human_entries(settings, current_report)
+                        _write_human_research_to_report(human_research)
+                except Exception as exc:
+                    logger.exception('menselijke 5m-beslislaag mislukt: %s', exc)
+                next_human_at = time.monotonic() + human_seconds
             time.sleep(1)
     return 0
 

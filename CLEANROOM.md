@@ -9,10 +9,13 @@ Deze branch is een schone PAPER-only herstart. De runtime bevat geen private Bit
 - De eerste EUR-marktselectie wordt op actueel 24-uurs quotevolume gemaakt en daarna in SQLite vastgezet.
 - Het huidige vaste universe bestaat uit 20 liquide EUR-markten.
 - Interval is 15 minuten.
-- Nieuwe entries worden alleen op gesloten 15m-candles beoordeeld.
+- De basisportefeuille beoordeelt entries op gesloten 15m-candles.
+- De afzonderlijke menselijke PAPER-challenger gebruikt 15m/1h-context en een gesloten 5m-trigger,
+  iedere minuut aangevuld met actuele L2-orderboekdruk en Bitcoinrichting.
 - Open PAPER-posities worden iedere 30 seconden met exacte muntomvang en actuele L2-diepte bewaakt.
 - Paper startkapitaal en bestaande Bitvavo-saldi staan volledig los van elkaar.
 - Fees, slippage en spread worden expliciet meegenomen.
+- De basis en menselijke challenger hebben gescheiden PAPER-resultaten; echte orders blijven onmogelijk.
 
 ## Strategy A — Mean Reversion
 
@@ -43,7 +46,7 @@ De maximale momentumgrens voorkomt blind najagen van een extreme pump. Execution
 - Prospectieve trade-tijden gebruiken wall-clock runtime-tijd.
 - Intracycle stop-loss gebruikt de actuele biedprijs als uitvoerbare referentie.
 - Strategy A en B hebben ieder eigen cash, posities, trades, beslissingen en performance.
-- De lean runtime start alleen scanner v3 en fundingmonitor v4.1; beide zijn read-only.
+- De lean runtime start alleen scanner v3.5 en fundingmonitor v4.1; beide zijn read-only.
 - `supervisor.py` bewaakt proces én rapportleeftijd en herstart alleen de ongezonde monitor.
 
 ## Evaluatie

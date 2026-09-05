@@ -264,6 +264,18 @@ class BitvavoPublic:
         sell_vwap, bid_depth_quote = self._depth_vwap(bids, notional_quote)
         buy_vwap, ask_depth_quote = self._depth_vwap(asks, notional_quote)
         mid = (bid + ask) / 2.0
+        near_band = 0.005
+        near_bid_depth_quote = sum(
+            price * amount for price, amount in bids if price >= mid * (1.0 - near_band)
+        )
+        near_ask_depth_quote = sum(
+            price * amount for price, amount in asks if price <= mid * (1.0 + near_band)
+        )
+        near_total = near_bid_depth_quote + near_ask_depth_quote
+        near_book_imbalance = (
+            (near_bid_depth_quote - near_ask_depth_quote) / near_total
+            if near_total > 0.0 else 0.0
+        )
         return {
             'bid': bid,
             'ask': ask,
@@ -274,6 +286,10 @@ class BitvavoPublic:
             'execution_spread_pct': (buy_vwap / sell_vwap - 1.0) * 100.0,
             'bid_depth_quote': bid_depth_quote,
             'ask_depth_quote': ask_depth_quote,
+            'near_bid_depth_quote': near_bid_depth_quote,
+            'near_ask_depth_quote': near_ask_depth_quote,
+            'near_book_imbalance': near_book_imbalance,
+            'near_book_band_pct': near_band * 100.0,
             'notional_quote': notional_quote,
             'captured_at_ms': float(int(time.time() * 1000)),
         }

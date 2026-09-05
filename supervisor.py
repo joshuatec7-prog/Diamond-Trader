@@ -14,6 +14,7 @@ REPORT_MAX_AGE_SECONDS = 35 * 60
 REPORT_STARTUP_GRACE_SECONDS = 5 * 60
 REPORT_HEALTH_CHECK_SECONDS = 30
 PRACTICAL_MONITOR_MAX_AGE_SECONDS = 5 * 60
+HUMAN_TRIGGER_MAX_AGE_SECONDS = 5 * 60
 
 
 @dataclass
@@ -81,6 +82,23 @@ def _report_health_error(child: Child, now: float | None = None) -> str | None:
             return '30s-winstmonitor heeft nog geen levenssignaal'
         if monitor_age > PRACTICAL_MONITOR_MAX_AGE_SECONDS:
             return f'30s-winstmonitor stilgevallen: {max(0.0, monitor_age):.0f} sec'
+    human = report.get('human_research', {})
+    if str(report.get('version', '')) == '3.5':
+        if not isinstance(human, dict):
+            return 'menselijke 5m-beslislaag ontbreekt'
+        entry_attempted_ms = int(human.get('human_entry_attempted_ms', 0) or 0)
+        entry_age = current - entry_attempted_ms / 1000.0
+        if entry_attempted_ms <= 0:
+            return 'menselijke 5m-beslislaag heeft nog geen levenssignaal'
+        if entry_age > HUMAN_TRIGGER_MAX_AGE_SECONDS:
+            return f'menselijke 5m-beslislaag stilgevallen: {max(0.0, entry_age):.0f} sec'
+        if int(human.get('human_open', 0) or 0) > 0:
+            monitor_attempted_ms = int(human.get('human_monitor_attempted_ms', 0) or 0)
+            monitor_age = current - monitor_attempted_ms / 1000.0
+            if monitor_attempted_ms <= 0:
+                return 'menselijke 30s-winstmonitor heeft nog geen levenssignaal'
+            if monitor_age > PRACTICAL_MONITOR_MAX_AGE_SECONDS:
+                return f'menselijke 30s-winstmonitor stilgevallen: {max(0.0, monitor_age):.0f} sec'
     return None
 
 

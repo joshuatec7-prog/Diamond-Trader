@@ -11,6 +11,9 @@ from crypto_scanner_v2 import (
     PRACTICAL_REENTRY_COOLDOWN_MS,
     _conversion_cost_pct,
     _grade_action,
+    _human_shortlist,
+    _monitor_human_entries,
+    _monitor_human_positions,
     _net_reward_risk,
     _monitor_practical_positions,
     _pair_snapshot,
@@ -20,10 +23,29 @@ from crypto_scanner_v2 import (
     _roundtrip_cost_pct,
     _taker_fee_pct,
 )
+from human_decision import evaluate_human_entry, five_minute_features
 from models import Candle, Decision
 
 
 class CryptoScannerTests(unittest.TestCase):
+    @staticmethod
+    def _five_minute_candles(*, gap: bool = False) -> list[Candle]:
+        result = []
+        for index in range(30):
+            timestamp = index * 300_000
+            if gap and index >= 20:
+                timestamp += 300_000
+            close = 100.0 + index * 0.10
+            result.append(Candle(
+                timestamp_ms=timestamp,
+                open=close - 0.06,
+                high=close + 0.30,
+                low=close - 0.30,
+                close=close,
+                volume=160.0 if index == 29 else 100.0,
+            ))
+        return result
+
     @staticmethod
     def _strong_metrics() -> dict[str, float]:
         return {
@@ -202,6 +224,150 @@ class CryptoScannerTests(unittest.TestCase):
         self.assertAlmostEqual(depth, 305.0)
         with self.assertRaisesRegex(RuntimeError, 'onvoldoende orderboekdiepte'):
             BitvavoPublic._depth_vwap([(100.0, 0.5)], 200.0)
+
+    def test_depth_book_reports_nearby_bid_ask_pressure(self):
+        api = BitvavoPublic('https://example.test')
+        api._get = lambda *args, **kwargs: {
+            'market': 'AAA-EUR',
+            'bids': [['99.9', '20'], ['99.0', '100']],
+            'asks': [['100.1', '5'], ['101.0', '100']],
+        }
+        depth = api.depth_book('AAA-EUR', 200.0)
+        self.assertGreater(depth['near_book_imbalance'], 0.0)
+        self.assertAlmostEqual(depth['near_book_band_pct'], 0.5)
+
+    def test_human_five_minute_layer_requires_continuous_closed_data(self):
+        valid = five_minute_features(self._five_minute_candles(), live_price=103.0)
+        self.assertTrue(valid['valid'])
+        self.assertTrue(valid['trend_up'])
+        self.assertTrue(valid['triggered'])
+        self.assertGreater(valid['volume_ratio'], 1.0)
+
+        invalid = five_minute_features(self._five_minute_candles(gap=True), live_price=103.0)
+        self.assertFalse(invalid['valid'])
+        self.assertEqual(invalid['reason'], 'gat_in_5m_candles')
+
+    def test_human_entry_combines_context_btc_volume_and_order_book(self):
+        five = five_minute_features(self._five_minute_candles(), live_price=103.0)
+        context = {
+            'market': 'AAA-EUR', 'base': 'AAA', 'side': 'LONG',
+            'action': 'LONG WATCH', 'decision_action': 'LONG',
+            'score': 80.0, 'cost_multiple': 4.0, 'roundtrip_cost_pct': 0.70,
+            'stop_hint': 99.0, 'target_hint': 112.0,
+        }
+        depth = {
+            'buy_vwap': 103.0, 'sell_vwap': 102.95,
+            'execution_spread_pct': 0.05, 'near_book_imbalance': 0.20,
+        }
+        decision = evaluate_human_entry(
+            context=context,
+            regime='BULL',
+            five_minute=five,
+            bitcoin_five_minute=five,
+            depth=depth,
+        )
+        self.assertTrue(decision['eligible'])
+        self.assertEqual(decision['action'], 'PAPER ENTRY')
+        self.assertGreaterEqual(decision['score'], 70.0)
+
+        bitcoin_shock = {**five, 'momentum_3_pct': -1.0, 'last_bar_pct': -1.2}
+        blocked = evaluate_human_entry(
+            context=context,
+            regime='BULL',
+            five_minute=five,
+            bitcoin_five_minute=bitcoin_shock,
+            depth=depth,
+        )
+        self.assertFalse(blocked['eligible'])
+        self.assertIn('bitcoin_geeft_marktschok_veto', blocked['blockers'])
+
+    def test_human_challenger_opens_and_trails_separate_paper_position(self):
+        class Api:
+            sell_price = 102.95
+
+            def closed_candles(self, market, interval, limit, now_ms=None):
+                return CryptoScannerTests._five_minute_candles()
+
+            def depth_book(self, market, notional):
+                return {
+                    'buy_vwap': 103.0,
+                    'sell_vwap': self.sell_price,
+                    'execution_spread_pct': 0.05,
+                    'near_book_imbalance': 0.20,
+                }
+
+            def sell_vwap_for_base(self, market, base_amount):
+                return {'sell_vwap': self.sell_price}
+
+        now_ms = 10_000_000
+        candidate = {
+            'market': 'AAA-EUR', 'base': 'AAA', 'side': 'LONG',
+            'action': 'LONG WATCH', 'decision_action': 'LONG',
+            'score': 80.0, 'cost_multiple': 4.0, 'three_x_cost_margin_pct': 2.0,
+            'roundtrip_cost_pct': 0.70, 'execution_spread_pct': 0.05,
+            'stop_hint': 99.0, 'target_hint': 112.0,
+            'shadow_notional_quote': 200.0,
+        }
+        settings = SimpleNamespace(
+            position_eur=200.0, paper_start_eur=5000.0,
+            eval_min_trades=40, eval_min_span_days=14.0,
+            eval_min_profit_factor=1.25, eval_max_drawdown_pct=10.0,
+        )
+        report = {
+            'generated_at_ms': now_ms - 1_000,
+            'regime': 'BULL',
+            'candidates': [candidate],
+        }
+        api = Api()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            stats = _monitor_human_entries(
+                settings, report, api=api, generated_ms=now_ms
+            )
+            self.assertTrue(stats['human_entry_opened'])
+            self.assertEqual(stats['human_open'], 1)
+            self.assertEqual(stats['human_total'], 1)
+            self.assertEqual(stats['human_decisions_24h'], 1)
+
+            api.sell_price = 106.0
+            stats = _monitor_human_positions(
+                settings, api=api, generated_ms=now_ms + 60_000
+            )
+            self.assertEqual(stats['human_open'], 1)
+            self.assertGreater(stats['human_open_positions'][0]['max_net_pct'], 1.0)
+
+            api.sell_price = 104.1
+            stats = _monitor_human_positions(
+                settings, api=api, generated_ms=now_ms + 120_000
+            )
+            self.assertEqual(stats['human_open'], 0)
+            self.assertEqual(stats['human_closed'], 1)
+            self.assertEqual(stats['human_wins'], 1)
+            self.assertEqual(stats['human_outcomes']['trail'], 1)
+            self.assertGreater(stats['human_pnl_eur'], 0.0)
+
+            con = sqlite3.connect(os.environ['SCANNER_V3_DB_PATH'])
+            human_rows = con.execute('SELECT COUNT(*) FROM human_signals').fetchone()[0]
+            practical_rows = con.execute('SELECT COUNT(*) FROM practical_signals').fetchone()[0]
+            con.close()
+            self.assertEqual(human_rows, 1)
+            self.assertEqual(practical_rows, 0)
+
+    def test_human_shortlist_uses_eur_route_to_keep_pnl_in_eur(self):
+        common = {
+            'base': 'AAA', 'side': 'LONG', 'action': 'LONG WATCH',
+            'decision_action': 'LONG', 'score': 80.0, 'cost_multiple': 4.0,
+            'three_x_cost_margin_pct': 2.0,
+        }
+        report = {
+            'all_pair_snapshots': [
+                {**common, 'market': 'AAA-USDC', 'quote': 'USDC', 'score': 90.0},
+                {**common, 'market': 'AAA-EUR', 'quote': 'EUR'},
+            ]
+        }
+        shortlist = _human_shortlist(report)
+        self.assertEqual([row['market'] for row in shortlist], ['AAA-EUR'])
 
     def test_sell_vwap_uses_exact_original_base_quantity(self):
         vwap, depth = BitvavoPublic._depth_vwap_by_base(

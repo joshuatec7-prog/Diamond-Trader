@@ -5,6 +5,7 @@ from pathlib import Path
 
 from supervisor import (
     Child,
+    HUMAN_TRIGGER_MAX_AGE_SECONDS,
     PRACTICAL_MONITOR_MAX_AGE_SECONDS,
     REPORT_MAX_AGE_SECONDS,
     _report_health_error,
@@ -64,6 +65,40 @@ class SupervisorHealthTests(unittest.TestCase):
                 'signal_research': {
                     'practical_open': 1,
                     'practical_monitor_attempted_ms': int((now - 30) * 1000),
+                },
+            }))
+            child = Child(['python3', '-u', 'worker.py'], False, str(path))
+            child.started_at = 1_000.0
+            self.assertIsNone(_report_health_error(child, now=now))
+
+    def test_stale_human_decision_layer_is_unhealthy_in_v35(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'report.json'
+            now = 10_000.0
+            path.write_text(json.dumps({
+                'version': '3.5',
+                'generated_at_ms': int((now - 60) * 1000),
+                'human_research': {
+                    'human_entry_attempted_ms': int(
+                        (now - HUMAN_TRIGGER_MAX_AGE_SECONDS - 1) * 1000
+                    ),
+                },
+            }))
+            child = Child(['python3', '-u', 'worker.py'], False, str(path))
+            child.started_at = 1_000.0
+            self.assertIn('beslislaag stilgevallen', _report_health_error(child, now=now) or '')
+
+    def test_fresh_human_layers_are_healthy_with_open_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'report.json'
+            now = 10_000.0
+            path.write_text(json.dumps({
+                'version': '3.5',
+                'generated_at_ms': int((now - 60) * 1000),
+                'human_research': {
+                    'human_entry_attempted_ms': int((now - 30) * 1000),
+                    'human_open': 1,
+                    'human_monitor_attempted_ms': int((now - 30) * 1000),
                 },
             }))
             child = Child(['python3', '-u', 'worker.py'], False, str(path))
