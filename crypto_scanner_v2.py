@@ -46,6 +46,7 @@ PRACTICAL_STOP_NET_PCT = -3.00
 PRACTICAL_TRAIL_ACTIVATE_NET_PCT = 1.00
 PRACTICAL_TRAIL_GIVEBACK_PCT = 1.00
 PRACTICAL_MIN_LOCK_NET_PCT = 0.25
+PRACTICAL_MONITOR_SECONDS = 30
 
 
 def _report_path() -> Path:
@@ -418,8 +419,8 @@ def scan_once(settings: Settings) -> dict[str, object]:
     trade_grade = [row for row in chosen if 'TRADE-GRADE' in str(row.get('action', ''))]
     generated_ms = int(time.time() * 1000)
     return {
-        'version': '3.2',
-        'mode': 'STRICT_L2_AUDIT_PRACTICAL_PAPER_SCANNER',
+        'version': '3.3',
+        'mode': 'STRICT_L2_AUDIT_30S_PRACTICAL_PAPER_SCANNER',
         'generated_at_ms': generated_ms,
         'generated_at_utc': datetime.fromtimestamp(generated_ms / 1000.0, tz=timezone.utc).isoformat(),
         'interval': settings.interval,
@@ -739,7 +740,10 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
                 outcome = 'STOP'
             elif trailing_floor is not None and net_return <= trailing_floor:
                 outcome = 'TRAIL'
-            elif generated_ms - int(practical_ms) >= PRACTICAL_MAX_HOLD_MS:
+            elif (
+                trailing_floor is None
+                and generated_ms - int(practical_ms) >= PRACTICAL_MAX_HOLD_MS
+            ):
                 outcome = 'TIME'
 
             if outcome:
@@ -891,16 +895,46 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
                FROM practical_signals'''
         ).fetchone()
         practical_open_net_sum = 0.0
-        for market, entry_price, non_book_cost in conn.execute(
-            '''SELECT market,entry_price,non_book_cost_pct
+        practical_open_positions: list[dict[str, object]] = []
+        for (
+            practical_ms,
+            market,
+            entry_price,
+            non_book_cost,
+            max_net_return,
+            trailing_floor,
+        ) in conn.execute(
+            '''SELECT generated_ms,market,entry_price,non_book_cost_pct,
+                      max_net_return_pct,trailing_floor_pct
                FROM practical_signals WHERE status='OPEN' '''
         ).fetchall():
             current = pair_by_market.get(str(market))
             if current is None:
+                practical_open_positions.append({
+                    'market': str(market),
+                    'age_hours': round((generated_ms - int(practical_ms)) / 3_600_000.0, 2),
+                    'current_net_pct': None,
+                    'current_pnl_eur': None,
+                    'max_net_pct': round(float(max_net_return), 3),
+                    'trailing_floor_pct': (
+                        None if trailing_floor is None else round(float(trailing_floor), 3)
+                    ),
+                })
                 continue
-            practical_open_net_sum += _practical_net_return(
+            current_net = _practical_net_return(
                 float(entry_price), float(current.get('sell_vwap', 0.0)), float(non_book_cost)
             )
+            practical_open_net_sum += current_net
+            practical_open_positions.append({
+                'market': str(market),
+                'age_hours': round((generated_ms - int(practical_ms)) / 3_600_000.0, 2),
+                'current_net_pct': round(current_net, 3),
+                'current_pnl_eur': round(current_net * shadow_notional_eur / 100.0, 2),
+                'max_net_pct': round(float(max_net_return), 3),
+                'trailing_floor_pct': (
+                    None if trailing_floor is None else round(float(trailing_floor), 3)
+                ),
+            })
         profit_factor = float(positive_sum) / float(negative_sum) if float(negative_sum) > 0 else 0.0
         practical_profit_factor = (
             float(practical_positive_sum) / float(practical_negative_sum)
@@ -946,6 +980,7 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
             'practical_open_pnl_eur': round(
                 float(practical_open_net_sum) * shadow_notional_eur / 100.0, 2
             ),
+            'practical_open_positions': practical_open_positions,
             'practical_profit_factor': round(practical_profit_factor, 3),
             'practical_outcomes': {
                 'stop': int(practical_stops or 0),
@@ -954,17 +989,75 @@ def _persist_signal_research(report: dict[str, object]) -> dict[str, object]:
             },
             'practical_rules': {
                 'entry': 'LONG WATCH, SIDEWAYS WATCH of zeldzame LONG tegen L2-buy-VWAP',
-                'exit': 'iedere 15 minuten tegen L2-sell-VWAP',
+                'exit': 'open posities iedere 30 seconden tegen L2-sell-VWAP',
                 'stop_net_pct': PRACTICAL_STOP_NET_PCT,
                 'trail_activate_net_pct': PRACTICAL_TRAIL_ACTIVATE_NET_PCT,
                 'trail_giveback_pct': PRACTICAL_TRAIL_GIVEBACK_PCT,
                 'minimum_locked_net_pct': PRACTICAL_MIN_LOCK_NET_PCT,
                 'max_hold_hours': PRACTICAL_MAX_HOLD_MS // (60 * 60 * 1000),
+                'max_hold_only_without_trailing': True,
                 'shadow_notional_eur': shadow_notional_eur,
             },
         }
     finally:
         conn.close()
+
+
+def _monitor_practical_positions(
+    settings: Settings,
+    *,
+    api: BitvavoPublic | None = None,
+    generated_ms: int | None = None,
+) -> dict[str, object]:
+    now_ms = int(time.time() * 1000) if generated_ms is None else int(generated_ms)
+    conn = _scanner_db_connect()
+    try:
+        markets = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT market FROM practical_signals WHERE status='OPEN' ORDER BY market"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    market_api = api or BitvavoPublic(
+        settings.api_base_url,
+        settings.request_timeout_seconds,
+        settings.request_retries,
+    )
+    current_rows: list[dict[str, object]] = []
+    errors: list[str] = []
+    for market in markets:
+        try:
+            depth = market_api.depth_book(market, settings.position_eur)
+            current_rows.append({
+                'market': market,
+                'sell_vwap': float(depth['sell_vwap']),
+            })
+        except Exception as exc:
+            errors.append(f'{market}: {type(exc).__name__}: {exc}')
+
+    research = _persist_signal_research({
+        'generated_at_ms': now_ms,
+        'regime': 'UNKNOWN',
+        'rules': {'shadow_notional_eur': settings.position_eur},
+        'candidates': [],
+        'all_pair_snapshots': current_rows,
+        'rare_opportunities': [],
+    })
+    research['practical_monitor_interval_seconds'] = PRACTICAL_MONITOR_SECONDS
+    research['practical_monitor_generated_ms'] = now_ms
+    research['practical_monitor_errors'] = errors
+    return research
+
+
+def _write_practical_monitor_to_report(research: dict[str, object]) -> None:
+    report = _load_report()
+    if report is None:
+        return
+    report['signal_research'] = research
+    _write_report(report)
 
 
 def _strip_internal_research_data(report: dict[str, object]) -> None:
@@ -979,7 +1072,7 @@ def _strip_internal_research_data(report: dict[str, object]) -> None:
 def print_report(report: dict[str, object]) -> None:
     age_seconds = _report_age_seconds(report)
     freshness = 'VEROUDERD' if age_seconds > REPORT_STALE_SECONDS else 'ACTUEEL'
-    print('=== CRYPTO SCANNER v3.2 | STRICT L2 + PRAKTISCHE PAPERTEST | READ ONLY ===')
+    print('=== CRYPTO SCANNER v3.3 | 15M ENTRY + 30S WINSTBEWAKING | READ ONLY ===')
     print(f"UTC             : {report.get('generated_at_utc', 'n/a')}")
     print(f"RAPPORTSTATUS   : {freshness} | leeftijd {age_seconds/60.0:.1f} min")
     print(f"REGIME          : {report.get('regime', 'UNKNOWN')}")
@@ -1103,8 +1196,42 @@ def print_report(report: dict[str, object]) -> None:
             )
         print(
             'regels: €200 per kans | alleen LONG/SIDEWAYS WATCH'
-            ' | stop netto -3,00% | winstbeveiliging vanaf +1,00% | max 48 uur'
+            ' | open positie iedere 30 sec via L2'
         )
+        print(
+            'stop netto -3,00% | winstbeveiliging vanaf +1,00%'
+            ' | max 48 uur vervalt zodra trailing actief is'
+        )
+        monitor_ms = int(research.get('practical_monitor_generated_ms', 0) or 0)
+        if monitor_ms > 0:
+            monitor_age = max(0.0, (time.time() * 1000.0 - monitor_ms) / 1000.0)
+            print(f'winstmonitor: laatste L2-meting {monitor_age:.0f} sec geleden')
+        else:
+            print('winstmonitor: wacht op eerste 30-secondenmeting')
+        practical_positions = research.get('practical_open_positions', [])
+        if isinstance(practical_positions, list):
+            for item in practical_positions:
+                if not isinstance(item, dict):
+                    continue
+                current_net = item.get('current_net_pct')
+                current_pnl = item.get('current_pnl_eur')
+                current_text = (
+                    'geen actuele L2-prijs'
+                    if current_net is None or current_pnl is None
+                    else f"netto {float(current_net):+.3f}% / €{float(current_pnl):+.2f}"
+                )
+                floor = item.get('trailing_floor_pct')
+                floor_text = 'uit' if floor is None else f'{float(floor):+.3f}%'
+                print(
+                    f"  {str(item.get('market','?')):12s} | {current_text}"
+                    f" | max {float(item.get('max_net_pct',0.0)):+.3f}%"
+                    f" | trailing {floor_text} | {float(item.get('age_hours',0.0)):.2f}u"
+                )
+        monitor_errors = research.get('practical_monitor_errors', [])
+        if isinstance(monitor_errors, list) and monitor_errors:
+            print(f'winstmonitor-waarschuwingen: {len(monitor_errors)}')
+            for monitor_error in monitor_errors[:3]:
+                print(f'  - {monitor_error}')
         print()
         print('=== PROSPECTIEVE ZELDZAME-SIGNAALCONTROLE ===')
         print(
@@ -1145,6 +1272,15 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     poll_seconds = max(60, int(os.getenv('SCANNER_V2_POLL_SECONDS', '900')))
+    monitor_seconds = max(
+        10,
+        int(os.getenv('SCANNER_PRACTICAL_MONITOR_SECONDS', str(PRACTICAL_MONITOR_SECONDS))),
+    )
+    try:
+        research = _monitor_practical_positions(settings)
+        _write_practical_monitor_to_report(research)
+    except Exception as exc:
+        logger.exception('eerste praktische 30s-monitor mislukt: %s', exc)
 
     while not STOP:
         try:
@@ -1159,9 +1295,17 @@ def main() -> int:
                 return 2
         if args.once:
             return 0
+        next_monitor_at = time.monotonic() + monitor_seconds
         for _ in range(poll_seconds):
             if STOP:
                 break
+            if time.monotonic() >= next_monitor_at:
+                try:
+                    research = _monitor_practical_positions(settings)
+                    _write_practical_monitor_to_report(research)
+                except Exception as exc:
+                    logger.exception('praktische 30s-monitor mislukt: %s', exc)
+                next_monitor_at = time.monotonic() + monitor_seconds
             time.sleep(1)
     return 0
 

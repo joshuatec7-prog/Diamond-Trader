@@ -11,6 +11,7 @@ from crypto_scanner_v2 import (
     _conversion_cost_pct,
     _grade_action,
     _net_reward_risk,
+    _monitor_practical_positions,
     _pair_snapshot,
     _persist_signal_research,
     _practical_net_return,
@@ -292,6 +293,14 @@ class CryptoScannerTests(unittest.TestCase):
             self.assertIn('reasons_json', columns)
 
     def test_practical_watch_tracker_uses_l2_prices_and_trailing_profit(self):
+        class Api:
+            sell_vwap = 99.9
+
+            def depth_book(self, market, notional):
+                return {'sell_vwap': self.sell_vwap}
+
+        api = Api()
+        settings = SimpleNamespace(position_eur=200.0)
         watch = {
             'market': 'WATCH-EUR', 'action': 'LONG WATCH', 'side': 'LONG',
             'decision_action': 'LONG', 'decision_reason': 'test_long',
@@ -316,22 +325,20 @@ class CryptoScannerTests(unittest.TestCase):
             self.assertEqual(stats['practical_total'], 1)
             self.assertEqual(stats['practical_open'], 1)
 
-            rising = {**watch, 'action': 'GEEN TRADE', 'sell_vwap': 102.0}
-            stats = _persist_signal_research({
-                **first,
-                'generated_at_ms': 901_000,
-                'candidates': [rising],
-                'all_pair_snapshots': [rising],
-            })
+            api.sell_vwap = 102.0
+            stats = _monitor_practical_positions(
+                settings, api=api, generated_ms=901_000
+            )
             self.assertEqual(stats['practical_open'], 1)
+            self.assertEqual(stats['practical_monitor_interval_seconds'], 30)
+            self.assertEqual(stats['practical_monitor_generated_ms'], 901_000)
+            self.assertEqual(stats['practical_open_positions'][0]['market'], 'WATCH-EUR')
+            self.assertGreater(stats['practical_open_positions'][0]['current_net_pct'], 1.0)
 
-            pullback = {**rising, 'sell_vwap': 100.99}
-            stats = _persist_signal_research({
-                **first,
-                'generated_at_ms': 1_801_000,
-                'candidates': [pullback],
-                'all_pair_snapshots': [pullback],
-            })
+            api.sell_vwap = 100.99
+            stats = _monitor_practical_positions(
+                settings, api=api, generated_ms=1_801_000
+            )
             self.assertEqual(stats['practical_open'], 0)
             self.assertEqual(stats['practical_closed'], 1)
             self.assertEqual(stats['practical_wins'], 1)
@@ -345,6 +352,71 @@ class CryptoScannerTests(unittest.TestCase):
             conn.close()
             self.assertEqual(outcome, 'TRAIL')
             self.assertAlmostEqual(net_return, _practical_net_return(100.0, 100.99, 0.66))
+
+    def test_active_trailing_runner_is_not_closed_by_48_hour_limit(self):
+        class Api:
+            sell_vwap = 102.0
+
+            def depth_book(self, market, notional):
+                return {'sell_vwap': self.sell_vwap}
+
+        api = Api()
+        settings = SimpleNamespace(position_eur=200.0)
+        watch = {
+            'market': 'RUNNER-EUR', 'base': 'RUNNER', 'action': 'LONG WATCH',
+            'side': 'LONG', 'buy_vwap': 100.0, 'sell_vwap': 99.9,
+            'roundtrip_cost_pct': 0.76, 'execution_spread_pct': 0.10,
+            'score': 75.0, 'net_reward_risk': 1.2, 'price_in_zone': False,
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            _persist_signal_research({
+                'generated_at_ms': 1_000, 'regime': 'BULL',
+                'candidates': [watch], 'all_pair_snapshots': [watch],
+                'rare_opportunities': [],
+            })
+            stats = _monitor_practical_positions(
+                settings, api=api, generated_ms=3_601_000
+            )
+            self.assertEqual(stats['practical_open'], 1)
+
+            api.sell_vwap = 103.0
+            stats = _monitor_practical_positions(
+                settings,
+                api=api,
+                generated_ms=1_000 + 49 * 60 * 60 * 1_000,
+            )
+            self.assertEqual(stats['practical_open'], 1)
+            self.assertEqual(stats['practical_outcomes']['time'], 0)
+
+    def test_48_hour_limit_closes_position_without_active_trailing(self):
+        class Api:
+            def depth_book(self, market, notional):
+                return {'sell_vwap': 100.0}
+
+        settings = SimpleNamespace(position_eur=200.0)
+        watch = {
+            'market': 'TIME-EUR', 'base': 'TIME', 'action': 'LONG WATCH',
+            'side': 'LONG', 'buy_vwap': 100.0, 'sell_vwap': 99.9,
+            'roundtrip_cost_pct': 0.76, 'execution_spread_pct': 0.10,
+            'score': 75.0, 'net_reward_risk': 1.2, 'price_in_zone': False,
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {'SCANNER_V3_DB_PATH': os.path.join(tmp, 'scanner.db')}, clear=False
+        ):
+            _persist_signal_research({
+                'generated_at_ms': 1_000, 'regime': 'BULL',
+                'candidates': [watch], 'all_pair_snapshots': [watch],
+                'rare_opportunities': [],
+            })
+            stats = _monitor_practical_positions(
+                settings,
+                api=Api(),
+                generated_ms=1_000 + 49 * 60 * 60 * 1_000,
+            )
+            self.assertEqual(stats['practical_open'], 0)
+            self.assertEqual(stats['practical_outcomes']['time'], 1)
 
     def test_practical_watch_tracker_opens_only_one_route_per_asset(self):
         eur = {
