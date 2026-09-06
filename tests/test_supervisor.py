@@ -8,6 +8,7 @@ from supervisor import (
     HUMAN_TRIGGER_MAX_AGE_SECONDS,
     PRACTICAL_MONITOR_MAX_AGE_SECONDS,
     REPORT_MAX_AGE_SECONDS,
+    V36_WORKER_MAX_AGE_SECONDS,
     _report_health_error,
 )
 
@@ -104,6 +105,32 @@ class SupervisorHealthTests(unittest.TestCase):
             child = Child(['python3', '-u', 'worker.py'], False, str(path))
             child.started_at = 1_000.0
             self.assertIsNone(_report_health_error(child, now=now))
+
+    def test_v36_requires_all_three_independent_heartbeats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'v36.json'
+            now = 10_000.0
+            path.write_text(json.dumps({
+                'version': '3.6',
+                'component': 'AUTONOMOUS_PAPERBOT',
+                'generated_at_ms': int((now - 10) * 1000),
+                'modes': {'live_orders': 'UIT / TECHNISCH ONMOGELIJK'},
+                'heartbeat': {
+                    'cycle_attempted_ms': int((now - 20) * 1000),
+                    'candidate_recheck_attempted_ms': int((now - 20) * 1000),
+                    'position_monitor_attempted_ms': int((now - 20) * 1000),
+                },
+            }))
+            child = Child(['python3', '-u', 'autonomous_v36.py'], False, str(path))
+            child.started_at = 1_000.0
+            self.assertIsNone(_report_health_error(child, now=now))
+
+            report = json.loads(path.read_text())
+            report['heartbeat']['cycle_attempted_ms'] = int(
+                (now - V36_WORKER_MAX_AGE_SECONDS - 1) * 1000
+            )
+            path.write_text(json.dumps(report))
+            self.assertIn('universumscan stilgevallen', _report_health_error(child, now=now) or '')
 
 
 if __name__ == '__main__':

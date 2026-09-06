@@ -15,6 +15,7 @@ REPORT_STARTUP_GRACE_SECONDS = 5 * 60
 REPORT_HEALTH_CHECK_SECONDS = 30
 PRACTICAL_MONITOR_MAX_AGE_SECONDS = 5 * 60
 HUMAN_TRIGGER_MAX_AGE_SECONDS = 5 * 60
+V36_WORKER_MAX_AGE_SECONDS = 5 * 60
 
 
 @dataclass
@@ -99,6 +100,24 @@ def _report_health_error(child: Child, now: float | None = None) -> str | None:
                 return 'menselijke 30s-winstmonitor heeft nog geen levenssignaal'
             if monitor_age > PRACTICAL_MONITOR_MAX_AGE_SECONDS:
                 return f'menselijke 30s-winstmonitor stilgevallen: {max(0.0, monitor_age):.0f} sec'
+    if str(report.get('component', '')) == 'AUTONOMOUS_PAPERBOT':
+        modes = report.get('modes', {})
+        if not isinstance(modes, dict) or str(modes.get('live_orders', '')) != 'UIT / TECHNISCH ONMOGELIJK':
+            return 'v3.6 PAPER-veiligheidsstatus ontbreekt of is ongeldig'
+        heartbeat = report.get('heartbeat', {})
+        if not isinstance(heartbeat, dict):
+            return 'v3.6 heartbeat ontbreekt'
+        for key, label in (
+            ('cycle_attempted_ms', 'volledige 5m-universumscan'),
+            ('candidate_recheck_attempted_ms', '60s-kandidaathercontrole'),
+            ('position_monitor_attempted_ms', '30s-positiebewaking'),
+        ):
+            attempted_ms = int(heartbeat.get(key, 0) or 0)
+            attempted_age = current - attempted_ms / 1000.0
+            if attempted_ms <= 0:
+                return f'v3.6 {label} heeft nog geen levenssignaal'
+            if attempted_age > V36_WORKER_MAX_AGE_SECONDS:
+                return f'v3.6 {label} stilgevallen: {max(0.0, attempted_age):.0f} sec'
     return None
 
 
@@ -142,6 +161,9 @@ def main() -> int:
     funding_report = os.getenv('FUNDING_MONITOR_REPORT_PATH') or _default_data_path(
         'cryptobot_funding_basis_v3.json'
     )
+    autonomous_report = os.getenv('V36_REPORT_PATH') or _default_data_path(
+        'cryptobot_autonomous_v36.json'
+    )
     CHILDREN = [
         Child(
             [sys.executable, '-u', 'crypto_scanner_v2.py'],
@@ -152,6 +174,11 @@ def main() -> int:
             [sys.executable, '-u', 'funding_basis_monitor.py'],
             critical=False,
             report_path=funding_report,
+        ),
+        Child(
+            [sys.executable, '-u', 'autonomous_v36.py'],
+            critical=False,
+            report_path=autonomous_report,
         ),
     ]
 

@@ -11,6 +11,17 @@ Clean-room crypto trading research project for Bitvavo public EUR market data.
 
 ## Nieuwe read-only onderzoekslaag
 
+`autonomous_v36.py` is de derde, volledig autonome PAPER-portefeuille. Zij beoordeelt bij iedere nieuw
+gesloten 5m-candle alle 20 EUR-markten, gebruikt 15m en 1h als context en laat acht zichtbare juryonderdelen
+stemmen over trend, timing, volume, Bitcoin, L2, netto risico/opbrengst, anti-pump en datakwaliteit.
+Actieve kandidaten krijgen iedere 60 seconden een nieuwe publieke L2-controle; open posities worden iedere
+30 seconden met exact de gekochte PAPER-muntomvang bewaakt. De portefeuille start afzonderlijk met €3.000,
+gebruikt €500 per positie, maximaal vijf posities en bewaart altijd minimaal €200 cash. Wekelijkse
+PAPER-stortingen van €50 staan apart in het kasboek en tellen nooit als handelswinst. Bestaande munten zijn
+uitgesloten: v3.6 simuleert uitsluitend nieuwe aankopen vanuit de eigen EUR-cash. Alle beslissingen,
+afwijzingen, PAPER-uitvoeringen, dataproblemen en bewegingen na een afwijzing staan in de eigen database
+`cryptobot_autonomous_v36.db`. Live-uitvoering is technisch niet aanwezig.
+
 `crypto_scanner_v2.py` bevat nu scanner v3.5. Een handmatig kanslabel vereist een uitvoerbare €200-L2-VWAP,
 een actuele uitvoerprijs binnen de besliszone en een netto risico/opbrengst van minimaal 1,50. Een USDC-route
 wordt inclusief EUR↔USDC-omwisseling beoordeeld. Alle kanslabels en hun latere stop/target/timeout-uitkomst
@@ -76,7 +87,7 @@ uitvoeringskostenniveau uit de volledige 72 uur. Orders blijven onmogelijk.
 - Positieomvang, maximaal aantal gelijktijdige posities en beschikbaar PAPER-geld worden afgedwongen.
 - Na een uitstap geldt per munt vier uur afkoeling om kunstmatige kostenchurn te voorkomen.
 - De status toont cash, equity, drawdown en of er genoeg trades en testdagen zijn voor beoordeling.
-- Alleen scanner v3.5 en fundingmonitor v4.1 draaien; de oude PAPER-strategieën blijven bewaard maar gestopt.
+- Scanner v3.5, fundingmonitor v4.1 en autonome PAPER-worker v3.6 draaien; oudere strategieën blijven bewaard maar gestopt.
 
 ## Strategy A — Mean Reversion
 
@@ -115,4 +126,10 @@ python3 trend_main.py --report
 
 Alle runtime-processen worden gestart en bewaakt door `supervisor.py` via `start.sh`. De supervisor bewaakt
 zowel het proces als de leeftijd en geldigheid van ieder rapport en herstart een ongezonde monitor.
+
+CryptoBot v3.6:
+
+```bash
+python3 autonomous_v36.py --status
+```
 
