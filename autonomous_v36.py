@@ -1126,7 +1126,7 @@ def evaluate_new_five_minute_cycle(
                 regime,
                 bull_breadth,
                 bear_breadth,
-                len(contexts),
+                len(trend_valid),
                 json.dumps(errors, ensure_ascii=False),
                 cycle_ms,
             ),
@@ -1173,7 +1173,7 @@ def evaluate_new_five_minute_cycle(
         'evaluated': True,
         'cycle_ms': cycle_ms,
         'universe_count': len(universe),
-        'valid_markets': len(contexts),
+        'valid_markets': len(trend_valid),
         'decisions': len(evaluated),
         'opened': opened,
         'errors': errors,
@@ -1559,7 +1559,10 @@ def print_status(report: dict[str, Any]) -> None:
         f" | regime {cycle.get('regime','UNKNOWN')}"
     )
     print(
-        f"markten               : {int(cycle.get('valid_markets',0))}/{len(universe)} geldig"
+        f"volledig beoordeeld   : {len(universe)}/{len(universe)} EUR-markten"
+    )
+    print(
+        f"betrouwbare context   : {int(cycle.get('valid_markets',0))}/{len(universe)} markten"
         f" | BULL {float(cycle.get('bull_breadth_pct',0)):.1f}%"
         f" | BEAR {float(cycle.get('bear_breadth_pct',0)):.1f}%"
     )

@@ -2,8 +2,10 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import date
+from io import StringIO
 from pathlib import Path
 
 import autonomous_v36 as v36
@@ -364,6 +366,31 @@ class AutonomousV36Tests(unittest.TestCase):
             self.assertEqual(action, 'AFWIJZEN')
             self.assertIn('test API-fout', json.loads(blockers)[0])
             self.assertEqual(events, 1)
+
+    def test_status_separates_full_universe_from_reliable_context_count(self):
+        report = {
+            'generated_at_ms': 0,
+            'portfolio': {},
+            'modes': {},
+            'jury': {},
+            'missed_moves': {},
+            'rules': {},
+            'latest_cycle': {
+                'cycle_ms': 1,
+                'status': 'COMPLETE',
+                'regime': 'SIDEWAYS',
+                'universe': [f'COIN{index}-EUR' for index in range(20)],
+                'valid_markets': 17,
+                'bull_breadth_pct': 41.2,
+                'bear_breadth_pct': 11.8,
+            },
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            v36.print_status(report)
+        text = output.getvalue()
+        self.assertIn('volledig beoordeeld   : 20/20 EUR-markten', text)
+        self.assertIn('betrouwbare context   : 17/20 markten', text)
 
 
 if __name__ == '__main__':
