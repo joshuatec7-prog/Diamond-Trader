@@ -231,6 +231,7 @@ def evaluate_jury(
     minimum_rr: float = 1.15,
     taker_fee_pct: float = 0.25,
     slippage_pct: float = 0.08,
+    stop_net_pct: float = -3.0,
     now_ms: int | None = None,
 ) -> dict[str, Any]:
     """Laat acht juryleden afzonderlijk stemmen; veiligheidsveto's blijven hard."""
@@ -350,11 +351,13 @@ def evaluate_jury(
     atr_pct = _finite(five.get('atr_pct'))
     non_book_cost_pct = 2.0 * taker_fee_pct + 2.0 * slippage_pct
     roundtrip_cost_pct = non_book_cost_pct + max(0.0, spread if spread < 999.0 else 0.0)
-    gross_risk_pct = min(2.75, max(0.75, 1.25 * atr_pct))
     gross_reward_pct = min(6.0, max(1.50, 3.0 * atr_pct))
     net_reward_pct = gross_reward_pct - roundtrip_cost_pct
-    total_risk_pct = gross_risk_pct + roundtrip_cost_pct
-    net_rr = net_reward_pct / total_risk_pct if net_reward_pct > 0.0 else 0.0
+    configured_stop_net_pct = _finite(stop_net_pct, -3.0)
+    if configured_stop_net_pct >= 0.0:
+        configured_stop_net_pct = -3.0
+    actual_net_risk_pct = abs(configured_stop_net_pct)
+    net_rr = net_reward_pct / actual_net_risk_pct if net_reward_pct > 0.0 else 0.0
     cost_multiple = gross_reward_pct / roundtrip_cost_pct if roundtrip_cost_pct > 0.0 else 0.0
     rr_score = 14.0 if net_rr >= 1.50 and cost_multiple >= 3.0 else 10.0 if net_rr >= minimum_rr and cost_multiple >= 2.0 else 2.0
     rr_hard = net_rr >= minimum_rr and cost_multiple >= 2.0
@@ -365,7 +368,7 @@ def evaluate_jury(
     jury['netto_risico_opbrengst'] = _vote(
         rr_score,
         14.0,
-        f'netto R/R {net_rr:.2f}; xkosten {cost_multiple:.2f}',
+        f'netto R/R {net_rr:.2f}; stop {actual_net_risk_pct:.2f}%; xkosten {cost_multiple:.2f}',
         hard_pass=rr_hard,
     )
 
@@ -436,9 +439,13 @@ def evaluate_jury(
         'near_book_imbalance': round(imbalance, 6),
         'non_book_cost_pct': round(non_book_cost_pct, 6),
         'roundtrip_cost_pct': round(roundtrip_cost_pct, 6),
+        'stop_net_pct': round(configured_stop_net_pct, 6),
         'net_reward_risk': round(net_rr, 4),
         'cost_multiple': round(cost_multiple, 4),
-        'technical_stop_hint': round(buy_vwap * (1.0 - gross_risk_pct / 100.0), 10),
+        'technical_stop_hint': round(
+            buy_vwap * (1.0 + (configured_stop_net_pct + non_book_cost_pct) / 100.0),
+            10,
+        ),
         'technical_reward_hint': round(buy_vwap * (1.0 + gross_reward_pct / 100.0), 10),
         'data_quality_status': str(qualities.get('five', {}).get('status', 'BLOCK')),
     }

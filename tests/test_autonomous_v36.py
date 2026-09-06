@@ -183,6 +183,44 @@ class AutonomousV36Tests(unittest.TestCase):
         self.assertGreaterEqual(decision['score'], 72.0)
         self.assertTrue(all('reason' in vote for vote in decision['jury'].values()))
 
+    def test_jury_reward_risk_uses_same_fixed_net_stop_as_position_monitor(self):
+        now_ms = 300_000_000
+        five_rows = candles_for(now_ms, FIVE_MINUTES_MS)
+        fifteen_rows = candles_for(now_ms, FIFTEEN_MINUTES_MS)
+        hour_rows = candles_for(now_ms, ONE_HOUR_MS)
+        five = timeframe_features(five_rows)
+        five['atr_pct'] = 1.0
+        context = {
+            'market': 'AAA-EUR',
+            'regime': 'BULL',
+            'five': five,
+            'fifteen': timeframe_features(fifteen_rows),
+            'hour': timeframe_features(hour_rows),
+            'bitcoin': timeframe_features(five_rows),
+            'quality': {
+                'five': candle_quality(five_rows, interval_ms=FIVE_MINUTES_MS, now_ms=now_ms, allow_one_small_gap=True),
+                'fifteen': candle_quality(fifteen_rows, interval_ms=FIFTEEN_MINUTES_MS, now_ms=now_ms),
+                'hour': candle_quality(hour_rows, interval_ms=ONE_HOUR_MS, now_ms=now_ms),
+                'bitcoin': candle_quality(five_rows, interval_ms=FIVE_MINUTES_MS, now_ms=now_ms, allow_one_small_gap=True),
+            },
+        }
+        decision = evaluate_jury(
+            context=context,
+            depth={
+                'buy_vwap': 100.0,
+                'sell_vwap': 99.94,
+                'execution_spread_pct': 0.06,
+                'near_book_imbalance': 0.20,
+                'captured_at_ms': float(now_ms),
+            },
+            stop_net_pct=v36.STOP_NET_PCT,
+            now_ms=now_ms,
+        )
+        self.assertEqual(decision['stop_net_pct'], -3.0)
+        self.assertAlmostEqual(decision['net_reward_risk'], 0.76, places=4)
+        self.assertAlmostEqual(decision['technical_stop_hint'], 97.66, places=6)
+        self.assertIn('actuele_netto_risico_opbrengst_te_laag', decision['blockers'])
+
     def test_live_mode_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.settings(tmp, mode='LIVE')

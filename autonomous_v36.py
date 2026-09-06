@@ -1096,6 +1096,7 @@ def evaluate_new_five_minute_cycle(
                 minimum_rr=settings.minimum_net_reward_risk,
                 taker_fee_pct=settings.taker_fee_pct,
                 slippage_pct=settings.slippage_pct,
+                stop_net_pct=STOP_NET_PCT,
                 now_ms=current_ms,
             )
             decision_id = _decision_upsert(
@@ -1242,6 +1243,7 @@ def recheck_active_candidates(
                 minimum_rr=settings.minimum_net_reward_risk,
                 taker_fee_pct=settings.taker_fee_pct,
                 slippage_pct=settings.slippage_pct,
+                stop_net_pct=STOP_NET_PCT,
                 now_ms=current_ms,
             )
         except Exception as exc:
