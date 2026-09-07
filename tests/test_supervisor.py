@@ -9,6 +9,7 @@ from supervisor import (
     PRACTICAL_MONITOR_MAX_AGE_SECONDS,
     REPORT_MAX_AGE_SECONDS,
     V36_WORKER_MAX_AGE_SECONDS,
+    V37_WORKER_MAX_AGE_SECONDS,
     _report_health_error,
 )
 
@@ -131,6 +132,40 @@ class SupervisorHealthTests(unittest.TestCase):
             )
             path.write_text(json.dumps(report))
             self.assertIn('universumscan stilgevallen', _report_health_error(child, now=now) or '')
+
+    def test_v37_requires_observe_only_and_two_independent_heartbeats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'v37.json'
+            now = 10_000.0
+            path.write_text(json.dumps({
+                'version': '3.7',
+                'component': 'HUMAN_OBSERVER_V37',
+                'generated_at_ms': int((now - 10) * 1000),
+                'modes': {
+                    'paper_execution': 'UIT',
+                    'live_orders': 'UIT / TECHNISCH ONMOGELIJK',
+                },
+                'safety': {'execution_enabled': False},
+                'heartbeat': {
+                    'cycle_attempted_ms': int((now - 20) * 1000),
+                    'candidate_recheck_attempted_ms': int((now - 20) * 1000),
+                },
+            }))
+            child = Child(['python3', '-u', 'autonomous_v37.py'], False, str(path))
+            child.started_at = 1_000.0
+            self.assertIsNone(_report_health_error(child, now=now))
+
+            report = json.loads(path.read_text())
+            report['heartbeat']['candidate_recheck_attempted_ms'] = int(
+                (now - V37_WORKER_MAX_AGE_SECONDS - 1) * 1000
+            )
+            path.write_text(json.dumps(report))
+            self.assertIn('L2-meetvenster stilgevallen', _report_health_error(child, now=now) or '')
+
+            report['heartbeat']['candidate_recheck_attempted_ms'] = int((now - 20) * 1000)
+            report['safety']['execution_enabled'] = True
+            path.write_text(json.dumps(report))
+            self.assertIn('uitvoering staat niet aantoonbaar uit', _report_health_error(child, now=now) or '')
 
 
 if __name__ == '__main__':

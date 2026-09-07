@@ -11,6 +11,23 @@ Clean-room crypto trading research project for Bitvavo public EUR market data.
 
 ## Nieuwe read-only onderzoekslaag
 
+`autonomous_v37.py` is de afzonderlijke v3.7-observatielaag. Fase 1 draait bewust uitsluitend in
+`OBSERVE_ONLY`: er bestaan geen positie- of ordertabellen en de laag kan dus geen PAPER- of live-transactie
+uitvoeren. v3.6 blijft ondertussen ongewijzigd als controlegroep draaien. v3.7 beoordeelt hetzelfde volledige
+EUR-universum via opeenvolgende harde poorten voor veiligheidsgrenzen, dataintegriteit, marktcontext,
+setup-specifieke regels, een L2-meetvenster, netto voordeel na kosten en portefeuillerisico. Een blokkade kan
+niet door punten uit een ander onderdeel worden gecompenseerd.
+
+Breakout, pullbackhervatting en volumehervatting hebben afzonderlijke voorwaarden. Bitcoin wordt op 5m,
+15m en 1h beoordeeld. Een regimewisseling krijgt eerst de zichtbare toestand `TRANSITION` en moet door een
+tweede 5m-cyclus worden bevestigd. Maximaal vijf technische kandidaten krijgen drie uitvoerbare
+€500-orderboekmetingen verspreid over minimaal 60 seconden; mediane én slechtste spread, orderboekdruk en
+VWAP-stabiliteit moeten slagen. Pas daarna kan `SCHADUW-KANS` worden geregistreerd. De eigen database is
+`cryptobot_autonomous_v37.db`; het kapitaalmodel blijft €3.000 start, €500 per positie, maximaal vijf en
+minimaal €200 reserve. Bestaande munten zijn uitgesloten. De risicogrenzen van €45 open gepland risico,
+maximaal twee posities per correlatiecluster, twee nieuwe posities per cyclus en €45 dagverlies zijn in deze
+fase alleen onderzoekshypothesen en worden nog niet toegepast op geld of PAPER-posities.
+
 `autonomous_v36.py` is de derde, volledig autonome PAPER-portefeuille. Zij beoordeelt bij iedere nieuw
 gesloten 5m-candle alle 20 EUR-markten, gebruikt 15m en 1h als context en laat acht zichtbare juryonderdelen
 stemmen over trend, timing, volume, Bitcoin, L2, netto risico/opbrengst, anti-pump en datakwaliteit.
@@ -87,7 +104,7 @@ uitvoeringskostenniveau uit de volledige 72 uur. Orders blijven onmogelijk.
 - Positieomvang, maximaal aantal gelijktijdige posities en beschikbaar PAPER-geld worden afgedwongen.
 - Na een uitstap geldt per munt vier uur afkoeling om kunstmatige kostenchurn te voorkomen.
 - De status toont cash, equity, drawdown en of er genoeg trades en testdagen zijn voor beoordeling.
-- Scanner v3.5, fundingmonitor v4.1 en autonome PAPER-worker v3.6 draaien; oudere strategieën blijven bewaard maar gestopt.
+- Scanner v3.5, fundingmonitor v4.1, autonome PAPER-worker v3.6 en v3.7 observe-only draaien; oudere strategieën blijven bewaard maar gestopt.
 
 ## Strategy A — Mean Reversion
 
@@ -131,5 +148,11 @@ CryptoBot v3.6:
 
 ```bash
 python3 autonomous_v36.py --status
+```
+
+CryptoBot v3.7 observe-only:
+
+```bash
+python3 autonomous_v37.py --status
 ```
 
