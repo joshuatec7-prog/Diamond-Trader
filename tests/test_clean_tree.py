@@ -18,7 +18,7 @@ class TreeTests(unittest.TestCase):
             'regime_strategy_lab.py','report.py','requirements.txt','research_report_publisher.py','signal_excursion_lab.py','staged_runner_trader.py',
             'start.sh','status.py','storage.py','strategy.py','supervisor.py','trend_main.py',
             'trend_strategy.py','trend_v3_main.py','trend_v4_main.py','trend_v5_main.py',
-            'trend_v6_main.py','trend_v7_main.py','v36_decision.py','v37_decision.py','v38_discovery.py','tests'
+            'trend_v6_main.py','trend_v7_main.py','v36_decision.py','v37_decision.py','v38_discovery.py','v38_audit.py','tests'
         }
         actual = {p.name for p in root.iterdir() if p.name not in {'__pycache__', '.git', '.venv'}}
         self.assertEqual(actual, allowed_top)
