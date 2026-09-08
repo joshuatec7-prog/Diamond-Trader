@@ -62,6 +62,24 @@ class CleanRoomTests(unittest.TestCase):
         api = BitvavoPublic('https://x', session=FakeSession([FakeResponse(market_payload), FakeResponse(ticker_payload)]))
         self.assertEqual(api.top_markets_by_quote_volume('EUR', 1), ['BBB-EUR'])
 
+    def test_broad_ticker_scan_keeps_every_valid_active_eur_market(self):
+        market_payload = [
+            {'market':'VET-EUR','status':'trading','quote':'EUR'},
+            {'market':'BTC-EUR','status':'trading','quote':'EUR'},
+            {'market':'OLD-EUR','status':'halted','quote':'EUR'},
+        ]
+        ticker_payload = [
+            {'market':'VET-EUR','last':'0.00645','volumeQuote':'2500000'},
+            {'market':'BTC-EUR','last':'100000','volumeQuote':'99999999'},
+            {'market':'OLD-EUR','last':'1','volumeQuote':'999999'},
+        ]
+        api = BitvavoPublic(
+            'https://x',
+            session=FakeSession([FakeResponse(market_payload), FakeResponse(ticker_payload)]),
+        )
+        rows = api.quote_market_tickers('EUR')
+        self.assertEqual([row['market'] for row in rows], ['BTC-EUR', 'VET-EUR'])
+
     def test_closed_candle_filter(self):
         payload = [[0,'10','11','9','10','2'],[3_600_000,'11','12','10','11','2']]
         api = BitvavoPublic('https://x', session=FakeSession([FakeResponse(payload)]))

@@ -7,7 +7,7 @@ class TreeTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         allowed_top = {
             '.env.example','.gitignore','.python-version','.github','CLEANROOM.md','README.md',
-            'adaptive_ls_main.py','adaptive_ls_strategy.py','adaptive_ls_trader.py','autonomous_v36.py','autonomous_v37.py',
+            'adaptive_ls_main.py','adaptive_ls_strategy.py','adaptive_ls_trader.py','autonomous_v36.py','autonomous_v37.py','autonomous_v38.py',
             'adaptive_ls_strict_main.py','adaptive_ls_strict_strategy.py','adaptive_ls_strict_replay.py',
             'adaptive_trend_main.py','adaptive_trend_strategy.py','adaptive_trend_trader.py',
             'audit_all.py','auto_research_controller.py','auto_research_controller_d2.py','backtest.py','bitvavo_public.py','config.py',
@@ -18,7 +18,7 @@ class TreeTests(unittest.TestCase):
             'regime_strategy_lab.py','report.py','requirements.txt','research_report_publisher.py','signal_excursion_lab.py','staged_runner_trader.py',
             'start.sh','status.py','storage.py','strategy.py','supervisor.py','trend_main.py',
             'trend_strategy.py','trend_v3_main.py','trend_v4_main.py','trend_v5_main.py',
-            'trend_v6_main.py','trend_v7_main.py','v36_decision.py','v37_decision.py','tests'
+            'trend_v6_main.py','trend_v7_main.py','v36_decision.py','v37_decision.py','v38_discovery.py','tests'
         }
         actual = {p.name for p in root.iterdir() if p.name not in {'__pycache__', '.git', '.venv'}}
         self.assertEqual(actual, allowed_top)

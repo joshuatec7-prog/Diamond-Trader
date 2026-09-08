@@ -192,6 +192,9 @@ def main() -> int:
     observer_v37_report = os.getenv('V37_REPORT_PATH') or _default_data_path(
         'cryptobot_autonomous_v37.json'
     )
+    observer_v38_report = os.getenv('V38_REPORT_PATH') or _default_data_path(
+        'cryptobot_autonomous_v38.json'
+    )
     CHILDREN = [
         Child(
             [sys.executable, '-u', 'crypto_scanner_v2.py'],
@@ -212,6 +215,11 @@ def main() -> int:
             [sys.executable, '-u', 'autonomous_v37.py'],
             critical=False,
             report_path=observer_v37_report,
+        ),
+        Child(
+            [sys.executable, '-u', 'autonomous_v38.py'],
+            critical=False,
+            report_path=observer_v38_report,
         ),
     ]
 

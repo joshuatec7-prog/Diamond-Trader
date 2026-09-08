@@ -1,5 +1,14 @@
 # CryptoBot Clean-Room
 
+## v3.8 brede menselijke ontdekking
+
+`autonomous_v38.py` volgt iedere minuut alle actieve Bitvavo EUR-markten met één
+lichte publieke marktscan. De observe-only laag bewaart 65 minuten prijshistorie,
+herkent bevestigde vroege bewegingen, blokkeert illiquide markten en achter een
+doorgeschoten pump aanlopen, en maakt maximaal tien kandidaten klaar voor latere
+beoordeling door de volledige v3.7-jury en L2-laag. De laag bevat geen positie- of
+ordercode en kan geen PAPER- of live-order uitvoeren.
+
 Clean-room crypto trading research project for Bitvavo public EUR market data.
 
 ## Safety

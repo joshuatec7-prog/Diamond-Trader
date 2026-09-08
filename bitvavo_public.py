@@ -142,6 +142,32 @@ class BitvavoPublic:
             raise RuntimeError(f'onvoldoende actieve {quote}-markten met 24h-volume')
         return selected
 
+    def quote_market_tickers(self, quote: str = 'EUR') -> List[Dict[str, float | str]]:
+        """Eén lichte brede scan van alle actieve markten voor een quotevaluta."""
+        allowed = set(self.trading_markets(quote))
+        payload = self._get('/ticker/24h')
+        if not isinstance(payload, list):
+            raise RuntimeError('ongeldig /ticker/24h antwoord')
+        result: List[Dict[str, float | str]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            market = str(item.get('market', '')).upper()
+            if market not in allowed:
+                continue
+            try:
+                last = float(item.get('last', 0) or 0)
+                volume_quote = float(item.get('volumeQuote', 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if all(math.isfinite(value) and value > 0 for value in (last, volume_quote)):
+                result.append({
+                    'market': market,
+                    'last': last,
+                    'volume_quote': volume_quote,
+                })
+        return sorted(result, key=lambda row: str(row['market']))
+
     def candles(self, market: str, interval: str, limit: int) -> List[Candle]:
         payload = self._get(f'/{market}/candles', {'interval': interval, 'limit': limit})
         if not isinstance(payload, list):
