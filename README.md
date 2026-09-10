@@ -1,5 +1,15 @@
 # CryptoBot Clean-Room
 
+## v3.9 volledige brede menselijke keten
+
+`autonomous_v39.py` koppelt de brede v3.8-ontdekking daadwerkelijk aan alle
+v3.7-veiligheids-, markt-, setup-, L2-, kosten- en portefeuillerisicopoorten.
+Alleen discovery-scores vanaf 65 en maximaal tien markten per cyclus worden
+doorgelaten. De laag blijft observe-only, meet prospectief na 15, 60 en 240
+minuten met uitvoerbare publieke L2-prijzen en heeft één vast beslismoment:
+72 uur verzamelen plus 4 uur voor de laatste 240m-uitkomsten. Daarna volgt
+`PAPER_GO` of `AFWIJZEN_GEEN_VERLENGING`; automatische activatie bestaat niet.
+
 ## v3.8 brede menselijke ontdekking
 
 `autonomous_v38.py` volgt iedere minuut alle actieve Bitvavo EUR-markten met één

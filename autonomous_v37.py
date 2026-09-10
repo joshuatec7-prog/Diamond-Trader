@@ -524,7 +524,7 @@ def _evaluate(
     snapshots: list[dict[str, Any]],
     now_ms: int,
 ) -> dict[str, Any]:
-    return evaluate_human_gates(
+    result = evaluate_human_gates(
         context=context,
         snapshots=snapshots,
         invariants=settings.invariants(),
@@ -541,6 +541,10 @@ def _evaluate(
         max_entries_per_cycle=settings.max_entries_per_cycle,
         daily_loss_limit_eur=settings.daily_loss_limit_eur,
     )
+    discovery = context.get('discovery')
+    if isinstance(discovery, dict):
+        result['discovery'] = discovery
+    return result
 
 
 def _insert_snapshot(
@@ -586,6 +590,9 @@ def evaluate_new_five_minute_cycle(
     *,
     api: BitvavoPublic | None = None,
     now_ms: int | None = None,
+    universe_override: list[str] | None = None,
+    regime_override: dict[str, Any] | None = None,
+    context_overlays: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     current_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
     market_api = api or BitvavoPublic(
@@ -598,7 +605,11 @@ def evaluate_new_five_minute_cycle(
     finally:
         conn.close()
     try:
-        universe = market_api.top_markets_by_quote_volume('EUR', settings.universe_size)
+        universe = (
+            market_api.top_markets_by_quote_volume('EUR', settings.universe_size)
+            if universe_override is None
+            else list(dict.fromkeys(str(market).upper() for market in universe_override))
+        )
         bitcoin, bitcoin_quality = _bitcoin_context(market_api, current_ms)
     except Exception as exc:
         conn = _connect(settings)
@@ -637,22 +648,39 @@ def evaluate_new_five_minute_cycle(
     raw, bull, bear, valid_markets = _raw_regime(
         contexts, universe_size=settings.universe_size
     )
-    conn = _connect(settings)
-    try:
-        previous = _meta(conn, 'stable_regime', 'UNKNOWN')
-        pending = _meta(conn, 'pending_regime', '')
-        pending_count = _meta_int(conn, 'pending_regime_count')
-    finally:
-        conn.close()
-    regime_state = resolve_regime(
-        previous_regime=previous,
-        raw_regime=raw,
-        pending_regime=pending,
-        pending_count=pending_count,
-    )
+    if regime_override is None:
+        conn = _connect(settings)
+        try:
+            previous = _meta(conn, 'stable_regime', 'UNKNOWN')
+            pending = _meta(conn, 'pending_regime', '')
+            pending_count = _meta_int(conn, 'pending_regime_count')
+        finally:
+            conn.close()
+        regime_state = resolve_regime(
+            previous_regime=previous,
+            raw_regime=raw,
+            pending_regime=pending,
+            pending_count=pending_count,
+        )
+    else:
+        raw = str(regime_override.get('raw_regime', 'DATA_UNCERTAIN')).upper()
+        regime = str(regime_override.get('regime', 'DATA_UNCERTAIN')).upper()
+        stable = str(regime_override.get('stable_regime', regime)).upper()
+        bull = float(regime_override.get('bull_breadth_pct', 0.0) or 0.0)
+        bear = float(regime_override.get('bear_breadth_pct', 0.0) or 0.0)
+        regime_state = {
+            'regime': regime,
+            'stable_regime': stable,
+            'pending_regime': '',
+            'pending_count': 0,
+            'transition': regime == 'TRANSITION',
+        }
 
     decisions: dict[str, dict[str, Any]] = {}
     for market, context in contexts.items():
+        overlay = (context_overlays or {}).get(market)
+        if isinstance(overlay, dict):
+            context.update(overlay)
         context['cycle_ms'] = cycle_ms
         context['regime'] = regime_state['regime']
         context['raw_regime'] = raw

@@ -17,6 +17,7 @@ PRACTICAL_MONITOR_MAX_AGE_SECONDS = 5 * 60
 HUMAN_TRIGGER_MAX_AGE_SECONDS = 5 * 60
 V36_WORKER_MAX_AGE_SECONDS = 5 * 60
 V37_WORKER_MAX_AGE_SECONDS = 5 * 60
+V39_WORKER_MAX_AGE_SECONDS = 5 * 60
 
 
 @dataclass
@@ -143,6 +144,29 @@ def _report_health_error(child: Child, now: float | None = None) -> str | None:
                 return f'v3.7 {label} heeft nog geen levenssignaal'
             if attempted_age > V37_WORKER_MAX_AGE_SECONDS:
                 return f'v3.7 {label} stilgevallen: {max(0.0, attempted_age):.0f} sec'
+    if str(report.get('component', '')) == 'FULL_EUR_HUMAN_PIPELINE_V39':
+        modes = report.get('modes', {})
+        safety = report.get('safety', {})
+        if not isinstance(modes, dict) or str(modes.get('paper_execution', '')) != 'UIT':
+            return 'v3.9 observe-only PAPER-veiligheidsstatus is ongeldig'
+        if str(modes.get('live_orders', '')) != 'UIT / TECHNISCH ONMOGELIJK':
+            return 'v3.9 live-veiligheidsstatus ontbreekt of is ongeldig'
+        if not isinstance(safety, dict) or bool(safety.get('execution_enabled', True)):
+            return 'v3.9 uitvoering staat niet aantoonbaar uit'
+        heartbeat = report.get('heartbeat', {})
+        if not isinstance(heartbeat, dict):
+            return 'v3.9 heartbeat ontbreekt'
+        for key, label in (
+            ('discovery_attempted_ms', 'brede discoveryketen'),
+            ('candidate_recheck_attempted_ms', 'L2-meetvenster'),
+            ('outcome_attempted_ms', 'prospectieve uitkomstmeting'),
+        ):
+            attempted_ms = int(heartbeat.get(key, 0) or 0)
+            attempted_age = current - attempted_ms / 1000.0
+            if attempted_ms <= 0:
+                return f'v3.9 {label} heeft nog geen levenssignaal'
+            if attempted_age > V39_WORKER_MAX_AGE_SECONDS:
+                return f'v3.9 {label} stilgevallen: {max(0.0, attempted_age):.0f} sec'
     return None
 
 
@@ -195,6 +219,9 @@ def main() -> int:
     observer_v38_report = os.getenv('V38_REPORT_PATH') or _default_data_path(
         'cryptobot_autonomous_v38.json'
     )
+    observer_v39_report = os.getenv('V39_REPORT_PATH') or _default_data_path(
+        'cryptobot_autonomous_v39.json'
+    )
     CHILDREN = [
         Child(
             [sys.executable, '-u', 'crypto_scanner_v2.py'],
@@ -220,6 +247,11 @@ def main() -> int:
             [sys.executable, '-u', 'autonomous_v38.py'],
             critical=False,
             report_path=observer_v38_report,
+        ),
+        Child(
+            [sys.executable, '-u', 'autonomous_v39.py'],
+            critical=False,
+            report_path=observer_v39_report,
         ),
     ]
 

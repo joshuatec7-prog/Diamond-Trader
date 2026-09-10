@@ -7,7 +7,7 @@ class TreeTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         allowed_top = {
             '.env.example','.gitignore','.python-version','.github','CLEANROOM.md','README.md',
-            'adaptive_ls_main.py','adaptive_ls_strategy.py','adaptive_ls_trader.py','autonomous_v36.py','autonomous_v37.py','autonomous_v38.py',
+            'adaptive_ls_main.py','adaptive_ls_strategy.py','adaptive_ls_trader.py','autonomous_v36.py','autonomous_v37.py','autonomous_v38.py','autonomous_v39.py',
             'adaptive_ls_strict_main.py','adaptive_ls_strict_strategy.py','adaptive_ls_strict_replay.py',
             'adaptive_trend_main.py','adaptive_trend_strategy.py','adaptive_trend_trader.py',
             'audit_all.py','auto_research_controller.py','auto_research_controller_d2.py','backtest.py','bitvavo_public.py','config.py',
