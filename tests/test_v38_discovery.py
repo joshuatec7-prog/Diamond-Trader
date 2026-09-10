@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+import sqlite3
 from pathlib import Path
 
 import autonomous_v38 as v38
@@ -52,6 +53,32 @@ class V38DiscoveryTests(unittest.TestCase):
                 self.assertFalse(report['execution_enabled'])
                 self.assertEqual(report['paper_execution'], 'UIT')
                 self.assertEqual(report['ready_for_human_jury'][0]['market'], 'VET-EUR')
+            finally:
+                v38.DB_PATH, v38.REPORT_PATH = old_db, old_report
+
+    def test_old_decisions_are_pruned_and_compact_copy_is_valid(self):
+        class Api:
+            def quote_market_tickers(self, quote):
+                self.quote = quote
+                return [{'market': 'VET-EUR', 'last': .0065, 'volume_quote': 2_000_000.0}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_db, old_report = v38.DB_PATH, v38.REPORT_PATH
+            v38.DB_PATH = str(root / 'v38.db')
+            v38.REPORT_PATH = str(root / 'v38.json')
+            try:
+                v38.scan_once(api=Api(), now_ms=1)
+                recent = v38.DECISION_RETENTION_MS + 120_000
+                v38.scan_once(api=Api(), now_ms=recent)
+                with sqlite3.connect(v38.DB_PATH) as conn:
+                    moments = [row[0] for row in conn.execute(
+                        'SELECT evaluated_ms FROM v38_decisions ORDER BY evaluated_ms'
+                    )]
+                self.assertEqual(moments, [recent])
+                result = v38.compact_copy(str(root / 'compact.db'))
+                self.assertEqual(result['integrity'], 'ok')
+                self.assertEqual(result['decisions'], 1)
             finally:
                 v38.DB_PATH, v38.REPORT_PATH = old_db, old_report
 

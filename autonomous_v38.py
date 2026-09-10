@@ -14,6 +14,9 @@ from v38_discovery import human_discovery_decision, movement_features, proposed_
 
 
 STOP = False
+MINUTE_MS = 60_000
+PRICE_RETENTION_MS = 65 * MINUTE_MS
+DECISION_RETENTION_MS = 6 * 60 * MINUTE_MS
 
 
 def _data_path(name: str) -> str:
@@ -57,7 +60,7 @@ def scan_once(api: BitvavoPublic | None = None, now_ms: int | None = None) -> di
                 'INSERT OR REPLACE INTO v38_prices VALUES (?,?,?,?)',
                 (current, ticker['market'], ticker['last'], ticker['volume_quote']),
             )
-        cutoff = current - 65 * 60_000
+        cutoff = current - PRICE_RETENTION_MS
         for ticker in tickers:
             rows = conn.execute(
                 'SELECT captured_ms,price FROM v38_prices WHERE market=? AND captured_ms>=? ORDER BY captured_ms',
@@ -75,6 +78,10 @@ def scan_once(api: BitvavoPublic | None = None, now_ms: int | None = None) -> di
                  decision['proposed_paper_eur'], json.dumps(decision, ensure_ascii=False)),
             )
         conn.execute('DELETE FROM v38_prices WHERE captured_ms<?', (cutoff,))
+        conn.execute(
+            'DELETE FROM v38_decisions WHERE evaluated_ms<?',
+            (current - DECISION_RETENTION_MS,),
+        )
         conn.execute('INSERT OR REPLACE INTO v38_meta VALUES (?,?)', ('last_scan_ms', str(current)))
         conn.commit()
     finally:
@@ -97,6 +104,78 @@ def scan_once(api: BitvavoPublic | None = None, now_ms: int | None = None) -> di
     tmp.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')
     os.replace(tmp, path)
     return report
+
+
+def compact_copy(target_path: str) -> dict[str, Any]:
+    """Maak buiten /var/data een kleine, gecontroleerde kopie met recente data."""
+    source = Path(DB_PATH)
+    target = Path(target_path)
+    if not source.exists():
+        raise RuntimeError(f'v3.8-database ontbreekt: {source}')
+    if target.exists():
+        raise RuntimeError(f'doelbestand bestaat al: {target}')
+    source_conn = sqlite3.connect(
+        f'file:{source}?mode=ro&immutable=1', uri=True, timeout=30
+    )
+    source_conn.row_factory = sqlite3.Row
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target_conn = sqlite3.connect(target, timeout=30)
+    try:
+        target_conn.executescript('''
+          PRAGMA journal_mode=DELETE;
+          CREATE TABLE v38_prices(
+            captured_ms INTEGER NOT NULL, market TEXT NOT NULL, price REAL NOT NULL,
+            volume_quote REAL NOT NULL, PRIMARY KEY(captured_ms,market));
+          CREATE TABLE v38_decisions(
+            evaluated_ms INTEGER NOT NULL, market TEXT NOT NULL, action TEXT NOT NULL,
+            score REAL NOT NULL, proposed_paper_eur REAL NOT NULL, details_json TEXT NOT NULL,
+            PRIMARY KEY(evaluated_ms,market));
+          CREATE TABLE v38_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        ''')
+        latest = int(source_conn.execute(
+            'SELECT COALESCE(MAX(evaluated_ms),0) FROM v38_decisions'
+        ).fetchone()[0])
+        if latest <= 0:
+            raise RuntimeError('v3.8-database bevat geen beslissingen')
+        price_cutoff = latest - PRICE_RETENTION_MS
+        decision_cutoff = latest - DECISION_RETENTION_MS
+        target_conn.executemany(
+            'INSERT INTO v38_prices VALUES (?,?,?,?)',
+            source_conn.execute(
+                '''SELECT captured_ms,market,price,volume_quote FROM v38_prices
+                   WHERE captured_ms>=? ORDER BY captured_ms,market''',
+                (price_cutoff,),
+            ),
+        )
+        target_conn.executemany(
+            'INSERT INTO v38_decisions VALUES (?,?,?,?,?,?)',
+            source_conn.execute(
+                '''SELECT evaluated_ms,market,action,score,proposed_paper_eur,details_json
+                   FROM v38_decisions WHERE evaluated_ms>=?
+                   ORDER BY evaluated_ms,market''',
+                (decision_cutoff,),
+            ),
+        )
+        target_conn.executemany(
+            'INSERT INTO v38_meta VALUES (?,?)',
+            source_conn.execute('SELECT key,value FROM v38_meta ORDER BY key'),
+        )
+        target_conn.commit()
+        integrity = str(target_conn.execute('PRAGMA integrity_check').fetchone()[0])
+        if integrity != 'ok':
+            raise RuntimeError(f'compacte database is ongeldig: {integrity}')
+        prices = int(target_conn.execute('SELECT COUNT(*) FROM v38_prices').fetchone()[0])
+        decisions = int(target_conn.execute('SELECT COUNT(*) FROM v38_decisions').fetchone()[0])
+    finally:
+        target_conn.close()
+        source_conn.close()
+    return {
+        'target': str(target),
+        'prices': prices,
+        'decisions': decisions,
+        'bytes': target.stat().st_size,
+        'integrity': 'ok',
+    }
 
 
 def print_status(report: dict[str, Any]) -> None:
@@ -122,7 +201,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--status', action='store_true')
+    parser.add_argument('--compact-copy', metavar='PAD')
     args = parser.parse_args()
+    if args.compact_copy:
+        print(json.dumps(compact_copy(args.compact_copy), indent=2))
+        return 0
     if args.status:
         path = Path(REPORT_PATH)
         report = json.loads(path.read_text(encoding='utf-8')) if path.exists() else scan_once()
