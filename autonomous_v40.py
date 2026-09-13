@@ -15,6 +15,7 @@ from statistics import mean, median
 from typing import Any
 
 from bitvavo_public import BitvavoPublic
+from v40_human_engine import evaluate_exit
 from v40_offline_scan import scan_all_eur
 from v40_replay import DEFAULT_HORIZONS_MINUTES
 
@@ -27,6 +28,7 @@ DAY_MS = 24 * HOUR_MS
 DECISION_RETENTION_MS = 48 * HOUR_MS
 CYCLE_RETENTION_MS = 14 * DAY_MS
 HISTORY_RETENTION_MS = 90 * DAY_MS
+PAPER_HISTORY_RETENTION_MS = 365 * DAY_MS
 CANDIDATE_COOLDOWN_MS = 4 * HOUR_MS
 CANDIDATE_MAX_AGE_MS = 7 * MINUTE_MS
 MINIMUM_L2_SAMPLES = 3
@@ -35,6 +37,7 @@ MAXIMUM_L2_SPREAD_PCT = 0.25
 MINIMUM_MEDIAN_IMBALANCE = -0.10
 MINIMUM_WORST_IMBALANCE = -0.35
 MAXIMUM_BUY_VWAP_DRIFT_PCT = 0.40
+PAPER_FEE_PCT = 0.25
 
 
 def _data_path(filename: str) -> str:
@@ -120,6 +123,22 @@ def _connect(settings: V40RuntimeSettings) -> sqlite3.Connection:
         sell_vwap REAL NOT NULL, gross_return_pct REAL NOT NULL, net_return_pct REAL NOT NULL,
         details_json TEXT NOT NULL, PRIMARY KEY(alert_id,horizon_minutes),
         FOREIGN KEY(alert_id) REFERENCES v40_alerts(id));
+      CREATE TABLE IF NOT EXISTS v40_paper_account(
+        id INTEGER PRIMARY KEY CHECK(id=1), cash_eur REAL NOT NULL,
+        realized_pnl_eur REAL NOT NULL, started_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS v40_paper_positions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER NOT NULL UNIQUE,
+        market TEXT NOT NULL, route TEXT NOT NULL, opened_ms INTEGER NOT NULL,
+        entry_vwap REAL NOT NULL, initial_base REAL NOT NULL, remaining_base REAL NOT NULL,
+        invested_eur REAL NOT NULL, highest_price REAL NOT NULL, protected_stop REAL NOT NULL,
+        partial_taken INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+        closed_ms INTEGER, realized_pnl_eur REAL NOT NULL DEFAULT 0,
+        FOREIGN KEY(alert_id) REFERENCES v40_alerts(id));
+      CREATE TABLE IF NOT EXISTS v40_paper_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, position_id INTEGER NOT NULL,
+        event_ms INTEGER NOT NULL, event_type TEXT NOT NULL, base_amount REAL NOT NULL,
+        price REAL NOT NULL, cash_change_eur REAL NOT NULL, reason TEXT NOT NULL,
+        FOREIGN KEY(position_id) REFERENCES v40_paper_positions(id));
       CREATE TABLE IF NOT EXISTS v40_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_v40_candidate_status ON v40_candidates(status,created_ms);
       CREATE INDEX IF NOT EXISTS idx_v40_alert_market_time ON v40_alerts(market,event_ms);
@@ -144,7 +163,12 @@ def _prune_history(conn: sqlite3.Connection, cutoff_ms: int) -> int:
     """Verwijder oude signaalketens in FK-veilige volgorde."""
     candidate_ids = [
         int(row[0]) for row in conn.execute(
-            'SELECT id FROM v40_candidates WHERE created_ms<?', (cutoff_ms,)
+            '''SELECT c.id FROM v40_candidates c
+               WHERE c.created_ms<? AND NOT EXISTS(
+                 SELECT 1 FROM v40_alerts a JOIN v40_paper_positions p ON p.alert_id=a.id
+                 WHERE a.candidate_id=c.id
+               )''',
+            (cutoff_ms,),
         )
     ]
     if not candidate_ids:
@@ -167,12 +191,29 @@ def _prune_history(conn: sqlite3.Connection, cutoff_ms: int) -> int:
     return len(candidate_ids)
 
 
+def _prune_paper_history(conn: sqlite3.Connection, cutoff_ms: int) -> int:
+    position_ids = [
+        int(row[0]) for row in conn.execute(
+            "SELECT id FROM v40_paper_positions WHERE status='GESLOTEN' AND closed_ms<?",
+            (cutoff_ms,),
+        )
+    ]
+    if not position_ids:
+        return 0
+    placeholders = ','.join('?' for _ in position_ids)
+    conn.execute(
+        f'DELETE FROM v40_paper_events WHERE position_id IN ({placeholders})', position_ids
+    )
+    conn.execute(f'DELETE FROM v40_paper_positions WHERE id IN ({placeholders})', position_ids)
+    return len(position_ids)
+
+
 def ensure_runtime(settings: V40RuntimeSettings, now_ms: int | None = None) -> None:
     settings.validate()
     current = int(time.time() * 1000) if now_ms is None else int(now_ms)
     conn = _connect(settings)
     try:
-        _set_meta(conn, 'version', '4.0-phase-3')
+        _set_meta(conn, 'version', '4.0-phase-4')
         _set_meta(conn, 'initialized_ms', _meta(conn, 'initialized_ms', str(current)))
         _set_meta(conn, 'mode', 'OBSERVE_ONLY')
         _set_meta(conn, 'execution_enabled', '0')
@@ -180,6 +221,11 @@ def ensure_runtime(settings: V40RuntimeSettings, now_ms: int | None = None) -> N
         _set_meta(conn, 'paper_start_eur', '3600')
         _set_meta(conn, 'reserve_eur', '200')
         _set_meta(conn, 'existing_assets_excluded', '1')
+        conn.execute(
+            '''INSERT OR IGNORE INTO v40_paper_account
+               (id,cash_eur,realized_pnl_eur,started_ms,updated_ms) VALUES (1,?,?,?,?)''',
+            (settings.paper_start_eur, 0.0, current, current),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -263,6 +309,7 @@ def ingest_scan(
             queued += 1
         conn.execute('DELETE FROM v40_decisions WHERE cycle_ms<?', (current - DECISION_RETENTION_MS,))
         conn.execute('DELETE FROM v40_cycles WHERE cycle_ms<?', (current - CYCLE_RETENTION_MS,))
+        removed_paper = _prune_paper_history(conn, current - PAPER_HISTORY_RETENTION_MS)
         removed_history = _prune_history(conn, current - HISTORY_RETENTION_MS)
         _set_meta(conn, 'scan_attempted_ms', current)
         _set_meta(conn, 'scan_generated_ms', current)
@@ -272,7 +319,7 @@ def ingest_scan(
         conn.close()
     return {
         'decisions': len(decisions), 'stored': len(kept), 'queued_l2': queued,
-        'removed_history': removed_history,
+        'removed_history': removed_history, 'removed_paper': removed_paper,
     }
 
 
@@ -490,6 +537,162 @@ def monitor_outcomes(
     return {'pending': len(pending), 'measured': measured, 'errors': errors}
 
 
+def _latest_features(conn: sqlite3.Connection, market: str) -> dict[str, Any]:
+    row = conn.execute(
+        'SELECT details_json FROM v40_decisions WHERE market=? ORDER BY cycle_ms DESC LIMIT 1',
+        (market,),
+    ).fetchone()
+    if not row:
+        return {}
+    try:
+        details = json.loads(str(row[0]))
+    except (TypeError, ValueError):
+        return {}
+    features = details.get('features', {})
+    return features if isinstance(features, dict) else {}
+
+
+def simulate_paper_portfolio(
+    settings: V40RuntimeSettings,
+    *,
+    api: BitvavoPublic | None = None,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Simuleer fills in een geïsoleerde portefeuille; verstuurt nooit een order."""
+    current = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    market_api = api or BitvavoPublic(
+        settings.api_base_url, settings.request_timeout_seconds, settings.request_retries
+    )
+    opened: list[str] = []
+    partial: list[str] = []
+    closed: list[str] = []
+    errors: list[str] = []
+    fee_ratio = PAPER_FEE_PCT / 100.0
+
+    conn = _connect(settings)
+    positions = conn.execute(
+        "SELECT * FROM v40_paper_positions WHERE status='OPEN' ORDER BY opened_ms,id"
+    ).fetchall()
+    conn.close()
+    for position in positions:
+        try:
+            book = market_api.sell_vwap_for_base(
+                str(position['market']), float(position['remaining_base'])
+            )
+            price = float(book['sell_vwap'])
+            highest = max(float(position['highest_price']), price)
+            conn = _connect(settings)
+            try:
+                features = _latest_features(conn, str(position['market']))
+                decision = evaluate_exit(
+                    entry_price=float(position['entry_vwap']), current_price=price,
+                    highest_price=highest, initial_stop_price=float(position['protected_stop']),
+                    held_hours=(current - int(position['opened_ms'])) / HOUR_MS,
+                    current_features=features,
+                )
+                protected = max(float(position['protected_stop']), float(decision['protected_stop_price']))
+                conn.execute(
+                    'UPDATE v40_paper_positions SET highest_price=?,protected_stop=? WHERE id=?',
+                    (highest, protected, int(position['id'])),
+                )
+                action = str(decision['action'])
+                if action == 'DEEL_VERKOPEN' and int(position['partial_taken']):
+                    action = 'VASTHOUDEN'
+                if action in {'DEEL_VERKOPEN', 'VERKOPEN'}:
+                    remaining = float(position['remaining_base'])
+                    quantity = remaining / 2.0 if action == 'DEEL_VERKOPEN' else remaining
+                    proceeds = quantity * price * (1.0 - fee_ratio)
+                    cost = float(position['invested_eur']) * quantity / float(position['initial_base'])
+                    pnl = proceeds - cost
+                    new_remaining = max(0.0, remaining - quantity)
+                    conn.execute(
+                        '''UPDATE v40_paper_account SET cash_eur=cash_eur+?,
+                           realized_pnl_eur=realized_pnl_eur+?,updated_ms=? WHERE id=1''',
+                        (proceeds, pnl, current),
+                    )
+                    conn.execute(
+                        '''UPDATE v40_paper_positions SET remaining_base=?,partial_taken=?,
+                           status=?,closed_ms=?,realized_pnl_eur=realized_pnl_eur+? WHERE id=?''',
+                        (
+                            new_remaining, 1 if action == 'DEEL_VERKOPEN' else int(position['partial_taken']),
+                            'OPEN' if action == 'DEEL_VERKOPEN' else 'GESLOTEN',
+                            None if action == 'DEEL_VERKOPEN' else current, pnl, int(position['id']),
+                        ),
+                    )
+                    conn.execute(
+                        '''INSERT INTO v40_paper_events
+                           (position_id,event_ms,event_type,base_amount,price,cash_change_eur,reason)
+                           VALUES (?,?,?,?,?,?,?)''',
+                        (
+                            int(position['id']), current, action, quantity, price, proceeds,
+                            str(decision['reason']),
+                        ),
+                    )
+                    (partial if action == 'DEEL_VERKOPEN' else closed).append(str(position['market']))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:
+            errors.append(f"{position['market']} positie: {type(exc).__name__}: {exc}")
+
+    conn = _connect(settings)
+    try:
+        account = conn.execute('SELECT * FROM v40_paper_account WHERE id=1').fetchone()
+        open_count = int(conn.execute(
+            "SELECT COUNT(*) FROM v40_paper_positions WHERE status='OPEN'"
+        ).fetchone()[0])
+        alerts = conn.execute(
+            '''SELECT a.* FROM v40_alerts a
+               LEFT JOIN v40_paper_positions p ON p.alert_id=a.id
+               WHERE p.id IS NULL ORDER BY a.score DESC,a.event_ms,a.id'''
+        ).fetchall()
+        for alert in alerts:
+            if open_count >= settings.max_open_positions:
+                break
+            same_market = conn.execute(
+                "SELECT 1 FROM v40_paper_positions WHERE market=? AND status='OPEN' LIMIT 1",
+                (str(alert['market']),),
+            ).fetchone()
+            if same_market:
+                continue
+            amount = float(alert['proposed_paper_eur'])
+            cash = float(account['cash_eur'])
+            if amount <= 0.0 or cash - amount < settings.reserve_eur:
+                continue
+            price = float(alert['buy_vwap'])
+            base = amount * (1.0 - fee_ratio) / price
+            cursor = conn.execute(
+                '''INSERT INTO v40_paper_positions
+                   (alert_id,market,route,opened_ms,entry_vwap,initial_base,remaining_base,
+                    invested_eur,highest_price,protected_stop,status)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                (
+                    int(alert['id']), str(alert['market']), str(alert['route']), current,
+                    price, base, base, amount, price, float(alert['stop_reference']), 'OPEN',
+                ),
+            )
+            position_id = int(cursor.lastrowid)
+            conn.execute(
+                'UPDATE v40_paper_account SET cash_eur=cash_eur-?,updated_ms=? WHERE id=1',
+                (amount, current),
+            )
+            conn.execute(
+                '''INSERT INTO v40_paper_events
+                   (position_id,event_ms,event_type,base_amount,price,cash_change_eur,reason)
+                   VALUES (?,?,?,?,?,?,?)''',
+                (position_id, current, 'KOPEN', base, price, -amount, 'bevestigde_l2_koopkans'),
+            )
+            account = conn.execute('SELECT * FROM v40_paper_account WHERE id=1').fetchone()
+            open_count += 1
+            opened.append(str(alert['market']))
+        _set_meta(conn, 'paper_attempted_ms', current)
+        _set_meta(conn, 'paper_errors', json.dumps(errors, ensure_ascii=False))
+        conn.commit()
+    finally:
+        conn.close()
+    return {'opened': opened, 'partial': partial, 'closed': closed, 'errors': errors}
+
+
 def _outcome_summary(conn: sqlite3.Connection, horizon: int) -> dict[str, Any]:
     values = [
         float(row[0]) for row in conn.execute(
@@ -526,7 +729,12 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
             'scan_attempted_ms': int(_meta(conn, 'scan_attempted_ms', '0') or 0),
             'l2_attempted_ms': int(_meta(conn, 'l2_attempted_ms', '0') or 0),
             'outcome_attempted_ms': int(_meta(conn, 'outcome_attempted_ms', '0') or 0),
+            'paper_attempted_ms': int(_meta(conn, 'paper_attempted_ms', '0') or 0),
         }
+        account = conn.execute('SELECT * FROM v40_paper_account WHERE id=1').fetchone()
+        paper_positions = [dict(row) for row in conn.execute(
+            "SELECT * FROM v40_paper_positions WHERE status='OPEN' ORDER BY opened_ms,id"
+        )]
     finally:
         conn.close()
     for alert in alerts:
@@ -541,8 +749,8 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
         'counts': json.loads(str(cycle['counts_json'])),
     } if cycle else {}
     return {
-        'version': '4.0-phase-3',
-        'component': 'FULL_EUR_HUMAN_OBSERVER_V40',
+        'version': '4.0-phase-4',
+        'component': 'FULL_EUR_HUMAN_PAPER_V40',
         'generated_at_ms': current,
         'generated_at_utc': datetime.fromtimestamp(current / 1000, timezone.utc).isoformat(),
         'mode': 'OBSERVE_ONLY',
@@ -550,6 +758,7 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
             'execution_enabled': False,
             'live_orders_possible': False,
             'existing_assets_excluded': True,
+            'paper_simulation_enabled': True,
         },
         'paper_portfolio': {
             'start_eur': settings.paper_start_eur,
@@ -558,6 +767,13 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
             'variable_sizes_eur': [250, 400, 500],
             'maximum_simultaneous_allocation_eur': 2500,
             'buffer_at_maximum_allocation_eur': 1100,
+            'cash_eur': round(float(account['cash_eur']), 8),
+            'realized_pnl_eur': round(float(account['realized_pnl_eur']), 8),
+            'open_positions': len(paper_positions),
+            'committed_cost_eur': round(sum(
+                float(position['invested_eur']) * float(position['remaining_base'])
+                / float(position['initial_base']) for position in paper_positions
+            ), 8),
         },
         'latest_cycle': latest_cycle,
         'l2': {'pending_candidates': pending, 'minimum_samples': MINIMUM_L2_SAMPLES},
@@ -569,6 +785,7 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
             'decision_retention_hours': DECISION_RETENTION_MS // HOUR_MS,
             'cycle_retention_days': CYCLE_RETENTION_MS // DAY_MS,
             'signal_history_retention_days': HISTORY_RETENTION_MS // DAY_MS,
+            'paper_history_retention_days': PAPER_HISTORY_RETENTION_MS // DAY_MS,
         },
     }
 
@@ -592,13 +809,18 @@ def load_report(settings: V40RuntimeSettings) -> dict[str, Any]:
 def print_status(report: dict[str, Any]) -> None:
     cycle = report.get('latest_cycle', {})
     portfolio = report.get('paper_portfolio', {})
-    print('=== CRYPTOBOT v4.0 FASE 3 | MENSELIJKE OBSERVER ===')
+    print('=== CRYPTOBOT v4.0 FASE 4 | MENSELIJKE PAPERBOT ===')
     print('MODUS                 : OBSERVE-ONLY')
-    print('PAPER-UITVOERING      : UIT')
+    print('PAPER-SIMULATIE       : AAN (ALLEEN REKENWERK)')
     print('LIVE ORDERS           : UIT / TECHNISCH ONMOGELIJK')
     print(
         f"PAPER-KAPITAAL        : €{float(portfolio.get('start_eur', 0)):.0f}"
         f" | reserve €{float(portfolio.get('reserve_eur', 0)):.0f}"
+    )
+    print(
+        f"PAPER-STAND           : cash €{float(portfolio.get('cash_eur', 0)):.2f}"
+        f" | open {int(portfolio.get('open_positions', 0))}"
+        f" | gerealiseerd €{float(portfolio.get('realized_pnl_eur', 0)):.2f}"
     )
     print(
         f"LAATSTE SCAN          : {int(cycle.get('markets_evaluated', 0))}/"
@@ -641,6 +863,7 @@ def main() -> int:
     if args.once:
         scan_once(settings, api=api)
         recheck_candidates(settings, api=api)
+        simulate_paper_portfolio(settings, api=api)
         monitor_outcomes(settings, api=api)
         report = build_report(settings)
         write_report(settings, report)
@@ -656,6 +879,11 @@ def main() -> int:
             result = recheck_candidates(settings, api=api)
             for market in result['confirmed']:
                 logger.warning('V4 KOOPKANS BEVESTIGD: %s', market)
+            paper = simulate_paper_portfolio(settings, api=api)
+            for market in paper['opened']:
+                logger.warning('V4 PAPER-POSITIE GEOPEND: %s', market)
+            for market in paper['closed']:
+                logger.warning('V4 PAPER-POSITIE GESLOTEN: %s', market)
             next_l2 = now + settings.l2_seconds
         if now >= next_outcome:
             monitor_outcomes(settings, api=api)

@@ -39,6 +39,8 @@ def buy_scan(cycle_ms=NOW_MS):
 
 
 class StablePublicApi:
+    sell_price = 102.0
+
     def depth_book(self, market, notional):
         self.last_depth = (market, notional)
         return {
@@ -49,7 +51,7 @@ class StablePublicApi:
 
     def sell_vwap_for_base(self, market, base_amount):
         self.last_sell = (market, base_amount)
-        return {'sell_vwap': 102.0, 'base_amount': base_amount}
+        return {'sell_vwap': self.sell_price, 'base_amount': base_amount}
 
 
 class AutonomousV40Tests(unittest.TestCase):
@@ -147,6 +149,40 @@ class AutonomousV40Tests(unittest.TestCase):
             self.assertEqual(len(report['alerts_last_24h']), 1)
             self.assertEqual(report['prospective_outcomes']['15']['samples'], 1)
             self.assertAlmostEqual(report['prospective_outcomes']['15']['average_net_pct'], 1.34)
+
+    def test_isolated_paper_position_opens_and_closes_without_live_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self.settings(Path(temporary))
+            v40.ensure_runtime(settings, NOW_MS)
+            v40.ingest_scan(settings, buy_scan(), now_ms=NOW_MS)
+            api = StablePublicApi()
+            for offset in (0, 30_000, 60_000):
+                v40.recheck_candidates(settings, api=api, now_ms=NOW_MS + offset)
+            opened = v40.simulate_paper_portfolio(
+                settings, api=api, now_ms=NOW_MS + 61_000,
+            )
+            self.assertEqual(opened['opened'], ['TEST-EUR'])
+            with sqlite3.connect(settings.db_path) as conn:
+                cash = conn.execute('SELECT cash_eur FROM v40_paper_account').fetchone()[0]
+                remaining = conn.execute(
+                    "SELECT remaining_base FROM v40_paper_positions WHERE status='OPEN'"
+                ).fetchone()[0]
+            self.assertEqual(cash, 3200.0)
+            self.assertAlmostEqual(remaining, 3.99)
+
+            api.sell_price = 96.0
+            exited = v40.simulate_paper_portfolio(
+                settings, api=api, now_ms=NOW_MS + 62_000,
+            )
+            self.assertEqual(exited['closed'], ['TEST-EUR'])
+            report = v40.build_report(settings, NOW_MS + 62_000)
+            self.assertEqual(report['paper_portfolio']['open_positions'], 0)
+            self.assertLess(report['paper_portfolio']['realized_pnl_eur'], 0.0)
+            with sqlite3.connect(settings.db_path) as conn:
+                events = [row[0] for row in conn.execute(
+                    'SELECT event_type FROM v40_paper_events ORDER BY id'
+                )]
+            self.assertEqual(events, ['KOPEN', 'VERKOPEN'])
 
 
 if __name__ == '__main__':
