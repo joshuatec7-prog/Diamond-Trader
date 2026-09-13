@@ -6,7 +6,12 @@ from statistics import mean, median
 from typing import Any, Sequence
 
 from models import Candle
-from v40_human_engine import ROUNDTRIP_FIXED_COST_PCT, evaluate_entry
+from v40_human_engine import (
+    ROUNDTRIP_FIXED_COST_PCT,
+    candle_features,
+    evaluate_entry,
+    evaluate_exit,
+)
 
 
 FIVE_MINUTE_MS = 300_000
@@ -14,6 +19,7 @@ DAY_MS = 86_400_000
 DEFAULT_HORIZONS_MINUTES = (15, 60, 240, 480, 720, 1440, 2160, 2880)
 SIGNAL_COOLDOWN_MS = 4 * 60 * 60_000
 ROLLING_DAY_BARS = 24 * 12
+PAPER_FEE_PCT = 0.25
 
 
 def rolling_quote_volume(candles: Sequence[Candle], end_index: int) -> float:
@@ -96,6 +102,8 @@ def replay_market(
             'route': decision['route'],
             'score': decision['score'],
             'proposed_paper_eur': decision['proposed_paper_eur'],
+            'stop_reference': decision['stop_reference'],
+            'target_reference': decision['target_reference'],
             'outcomes': forward_outcomes(
                 rows, index, spread_pct=assumed_spread_pct,
                 horizons_minutes=horizons_minutes,
@@ -114,6 +122,92 @@ def replay_market(
         'roundtrip_fixed_cost_pct': ROUNDTRIP_FIXED_COST_PCT,
         'horizons_minutes': list(horizons_minutes),
         'future_data_used_for_decisions': False,
+    }
+
+
+def simulate_signal_trade(
+    candles: Sequence[Candle],
+    signal: dict[str, Any],
+    *,
+    fee_pct: float = PAPER_FEE_PCT,
+) -> dict[str, Any]:
+    """Speel één signaal chronologisch af met dezelfde menselijke uitstapregels."""
+    rows = sorted((c for c in candles if c.is_valid), key=lambda c: c.timestamp_ms)
+    signal_ms = int(signal['signal_ms'])
+    start = next((index for index, row in enumerate(rows) if row.timestamp_ms == signal_ms), None)
+    if start is None:
+        raise ValueError('signaalmoment ontbreekt in candles')
+    entry = float(signal.get('entry_reference', rows[start].close))
+    notional = float(signal.get('proposed_paper_eur', 0.0))
+    if entry <= 0.0 or notional <= 0.0:
+        raise ValueError('ongeldige PAPER-instap')
+    fee_ratio = max(0.0, float(fee_pct)) / 100.0
+    initial_base = notional * (1.0 - fee_ratio) / entry
+    remaining = initial_base
+    highest = entry
+    protected_stop = float(signal.get('stop_reference', entry * .97))
+    partial_taken = False
+    proceeds = 0.0
+    events: list[dict[str, Any]] = [{
+        'event_ms': signal_ms, 'action': 'KOPEN', 'price': entry,
+        'base_amount': initial_base, 'cash_change_eur': -notional,
+        'reason': str(signal.get('route', 'KOOPKANS')),
+    }]
+
+    for index in range(start + 1, len(rows)):
+        candle = rows[index]
+        highest = max(highest, candle.high)
+        if candle.low <= protected_stop:
+            exit_price = min(candle.open, protected_stop) if candle.open < protected_stop else protected_stop
+            decision = {'action': 'VERKOPEN', 'reason': 'beschermde_stop_bereikt'}
+        else:
+            exit_price = candle.close
+            decision = evaluate_exit(
+                entry_price=entry, current_price=exit_price, highest_price=highest,
+                initial_stop_price=protected_stop,
+                held_hours=(candle.timestamp_ms - signal_ms) / 3_600_000,
+                current_features=candle_features(rows[max(0, index - 119):index + 1]),
+            )
+            protected_stop = max(protected_stop, float(decision['protected_stop_price']))
+        action = str(decision['action'])
+        if action == 'DEEL_VERKOPEN' and partial_taken:
+            continue
+        if action not in {'DEEL_VERKOPEN', 'VERKOPEN'}:
+            continue
+        quantity = remaining / 2.0 if action == 'DEEL_VERKOPEN' else remaining
+        cash_change = quantity * exit_price * (1.0 - fee_ratio)
+        proceeds += cash_change
+        remaining = max(0.0, remaining - quantity)
+        partial_taken = partial_taken or action == 'DEEL_VERKOPEN'
+        events.append({
+            'event_ms': candle.timestamp_ms, 'action': action, 'price': exit_price,
+            'base_amount': quantity, 'cash_change_eur': cash_change,
+            'reason': str(decision['reason']),
+        })
+        if action == 'VERKOPEN':
+            break
+
+    last = rows[-1].close
+    open_value = remaining * last * (1.0 - fee_ratio)
+    closed = remaining <= initial_base * 1e-12
+    total_value = proceeds + open_value
+    return {
+        'market': str(signal.get('market', '')),
+        'signal_ms': signal_ms,
+        'route': str(signal.get('route', '')),
+        'score': float(signal.get('score', 0.0)),
+        'position_eur': notional,
+        'entry_price': entry,
+        'initial_base': initial_base,
+        'status': 'GESLOTEN' if closed else 'OPEN',
+        'remaining_base': remaining,
+        'events': events,
+        'realized_proceeds_eur': round(proceeds, 8),
+        'open_value_eur': round(open_value, 8),
+        'result_eur': round(total_value - notional, 8),
+        'result_pct': round((total_value / notional - 1.0) * 100.0, 6),
+        'fee_pct_per_side': fee_pct,
+        'future_data_used_for_entry': False,
     }
 
 

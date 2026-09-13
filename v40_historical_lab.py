@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from bitvavo_public import BitvavoPublic
-from v40_replay import DAY_MS, audit_large_moves, replay_market, summarize_replays
+from v40_replay import (
+    DAY_MS,
+    audit_large_moves,
+    replay_market,
+    simulate_signal_trade,
+    summarize_replays,
+)
 
 
 FIVE_MINUTE_MS = 300_000
@@ -58,6 +64,9 @@ def run_historical_lab(
                 market, rows, btc, assumed_spread_pct=.12,
                 signal_start_ms=signal_start,
             )
+            replay['paper_trades'] = [
+                simulate_signal_trade(rows, signal) for signal in replay['signals']
+            ]
             replays.append(replay)
             audits.append(audit_large_moves(
                 market,
@@ -68,6 +77,16 @@ def run_historical_lab(
             errors.append(f'{market}: {type(exc).__name__}: {exc}')
 
     summary = summarize_replays(replays)
+    paper_trades = [trade for replay in replays for trade in replay['paper_trades']]
+    paper_results = [float(trade['result_eur']) for trade in paper_trades]
+    paper_summary = {
+        'trades': len(paper_trades),
+        'wins': sum(1 for value in paper_results if value > 0.0),
+        'losses': sum(1 for value in paper_results if value <= 0.0),
+        'total_result_eur': round(sum(paper_results), 8),
+        'average_result_eur': round(sum(paper_results) / len(paper_results), 8)
+        if paper_results else None,
+    }
     events = [event for audit in audits for event in audit['events']]
     events.sort(key=lambda event: (-float(event['gain_to_peak_pct']), str(event['market'])))
     large_move_summary = {
@@ -86,11 +105,14 @@ def run_historical_lab(
             'large_moves': next(
                 (audit['events'] for audit in audits if audit['market'] == market), []
             ),
+            'paper_trades': next(
+                (replay['paper_trades'] for replay in replays if replay['market'] == market), []
+            ),
         }
         for market in ('VTHO-EUR', 'LSK-EUR')
     }
     report = {
-        'version': '4.0-phase-2',
+        'version': '4.0-phase-5',
         'component': 'FULL_EUR_HISTORICAL_REPLAY',
         'generated_at_utc': datetime.now(timezone.utc).isoformat(),
         'period': {
@@ -108,6 +130,7 @@ def run_historical_lab(
         'markets_completed': len(replays),
         'errors': errors,
         'signal_summary': summary,
+        'paper_trade_summary': paper_summary,
         'large_move_audit': large_move_summary,
         'control_cases': controls,
         'notes': [
@@ -123,12 +146,17 @@ def run_historical_lab(
 
 def print_status(report: dict[str, Any]) -> None:
     signals = report['signal_summary']
+    paper = report['paper_trade_summary']
     moves = report['large_move_audit']
     print('=== CRYPTOBOT v4.0 FASE 2 | BREDE HISTORISCHE REPLAY ===')
     print('UITVOERING             : UIT / TECHNISCH ONMOGELIJK')
     print(f"PERIODE                : {report['period']['days']} dagen + 1 dag opwarming")
     print(f"MARKTEN                : {report['markets_completed']}/{report['markets_requested']}")
     print(f"SIGNALEN               : {signals['signals']} op {signals['markets_with_signals']} markten")
+    print(
+        f"PAPER-TRADES           : {paper['trades']} | winst {paper['wins']}"
+        f" | verlies {paper['losses']} | totaal €{paper['total_result_eur']:.2f}"
+    )
     print(
         f"GROTE STIJGINGEN       : {moves['events']} | vroeg gezien {moves['caught_early']}"
         f" | gemist {moves['missed']}"
@@ -138,6 +166,18 @@ def print_status(report: dict[str, Any]) -> None:
             f"{market:<22}: {len(control['signals'])} signalen"
             f" | {len(control['large_moves'])} grote bewegingen"
         )
+        for trade in control['paper_trades']:
+            moment = datetime.fromtimestamp(int(trade['signal_ms']) / 1000, timezone.utc)
+            print(
+                f"  KOOP {moment.isoformat()} | €{trade['entry_price']:.8f}"
+                f" | positie €{trade['position_eur']:.0f} | resultaat €{trade['result_eur']:.2f}"
+            )
+            for event in trade['events'][1:]:
+                event_time = datetime.fromtimestamp(int(event['event_ms']) / 1000, timezone.utc)
+                print(
+                    f"    {event['action']} {event_time.isoformat()}"
+                    f" | €{event['price']:.8f} | {event['reason']}"
+                )
     if report['errors']:
         print(f"DATAPROBLEMEN          : {len(report['errors'])}")
 
@@ -145,10 +185,14 @@ def print_status(report: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description='CryptoBot v4.0 brede historische replay')
     parser.add_argument('--days', type=int, default=30)
+    parser.add_argument('--markets', default='', help='optioneel: komma-gescheiden EUR-markten')
     parser.add_argument('--output', default='data/cryptobot_v40_historical_lab.json')
     args = parser.parse_args()
     api = BitvavoPublic('https://api.bitvavo.com/v2', timeout_seconds=20, retries=4)
-    report = run_historical_lab(api, days=args.days, output_path=args.output)
+    markets = [item.strip().upper() for item in args.markets.split(',') if item.strip()] or None
+    report = run_historical_lab(
+        api, days=args.days, markets=markets, output_path=args.output,
+    )
     print_status(report)
     return 0
 

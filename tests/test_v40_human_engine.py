@@ -13,6 +13,7 @@ from v40_replay import (
     audit_large_moves,
     forward_outcomes,
     rolling_quote_volume,
+    simulate_signal_trade,
     summarize_replays,
 )
 
@@ -90,6 +91,27 @@ class V40HumanEngineTests(unittest.TestCase):
         self.assertEqual(result['action'], 'VERKOPEN')
         self.assertEqual(result['reason'], 'grote_winst_beschermen')
         self.assertGreater(result['protected_stop_price'], 120.0)
+
+    def test_signal_trade_takes_partial_profit_and_protects_remainder(self):
+        closes = [0.90 + index * .0015 for index in range(61)] + [1.16, 1.24]
+        volumes = [100.0] * 60 + [1000.0, 1000.0, 1000.0]
+        rows = candles_from_closes(closes, volumes=volumes)
+        rows[-1] = Candle(
+            timestamp_ms=rows[-1].timestamp_ms, open=1.29, high=1.30,
+            low=1.23, close=1.24, volume=1000.0,
+        )
+        signal = {
+            'market': 'TEST-EUR', 'signal_ms': rows[60].timestamp_ms,
+            'entry_reference': 0.99, 'stop_reference': 0.96,
+            'route': 'VROEG_MOMENTUM', 'score': 92.0,
+            'proposed_paper_eur': 500.0,
+        }
+        trade = simulate_signal_trade(rows, signal)
+        self.assertEqual(trade['status'], 'GESLOTEN')
+        self.assertEqual([event['action'] for event in trade['events']], [
+            'KOPEN', 'DEEL_VERKOPEN', 'VERKOPEN',
+        ])
+        self.assertGreater(trade['result_eur'], 0.0)
 
     def test_accelerating_profit_can_be_partially_sold(self):
         result = evaluate_exit(
@@ -210,6 +232,8 @@ class V40HumanEngineTests(unittest.TestCase):
         self.assertIn('VTHO-EUR', report['control_cases'])
         self.assertIn('LSK-EUR', report['control_cases'])
         self.assertFalse(report['raw_candles_saved'])
+        self.assertEqual(report['version'], '4.0-phase-5')
+        self.assertEqual(report['control_cases']['LSK-EUR']['paper_trades'], [])
         self.assertFalse(report['execution_enabled'])
 
     def test_historical_lab_rejects_unbounded_period(self):
