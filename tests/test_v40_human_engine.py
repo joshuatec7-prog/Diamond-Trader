@@ -10,6 +10,7 @@ from v40_human_engine import (
 from v40_offline_scan import scan_all_eur
 from v40_historical_lab import run_historical_lab
 from v40_replay import (
+    SIGNAL_COOLDOWN_MS,
     audit_large_moves,
     forward_outcomes,
     rolling_quote_volume,
@@ -42,6 +43,9 @@ class V40HumanEngineTests(unittest.TestCase):
     def test_requires_closed_history(self):
         result = candle_features(candles_from_closes([100.0] * 59))
         self.assertFalse(result['valid'])
+
+    def test_reentry_cooldown_is_three_hours(self):
+        self.assertEqual(SIGNAL_COOLDOWN_MS, 3 * 60 * 60_000)
 
     def test_early_momentum_can_become_buy_opportunity(self):
         closes = [100.0 + index * .025 for index in range(114)]
@@ -232,7 +236,7 @@ class V40HumanEngineTests(unittest.TestCase):
         self.assertIn('VTHO-EUR', report['control_cases'])
         self.assertIn('LSK-EUR', report['control_cases'])
         self.assertFalse(report['raw_candles_saved'])
-        self.assertEqual(report['version'], '4.0-phase-5')
+        self.assertEqual(report['version'], '4.0-phase-6')
         self.assertEqual(report['control_cases']['LSK-EUR']['paper_trades'], [])
         self.assertFalse(report['execution_enabled'])
 

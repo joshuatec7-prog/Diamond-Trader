@@ -17,7 +17,9 @@ from v40_human_engine import (
 FIVE_MINUTE_MS = 300_000
 DAY_MS = 86_400_000
 DEFAULT_HORIZONS_MINUTES = (15, 60, 240, 480, 720, 1440, 2160, 2880)
-SIGNAL_COOLDOWN_MS = 4 * 60 * 60_000
+# Drie uur voorkomt dubbel najagen, maar laat een aantoonbaar nieuwe opbouw
+# opnieuw toe. De regel geldt identiek voor alle markten.
+SIGNAL_COOLDOWN_MS = 3 * 60 * 60_000
 ROLLING_DAY_BARS = 24 * 12
 PAPER_FEE_PCT = 0.25
 

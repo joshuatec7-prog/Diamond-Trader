@@ -30,7 +30,10 @@ CYCLE_RETENTION_MS = 14 * DAY_MS
 HISTORY_RETENTION_MS = 90 * DAY_MS
 PAPER_HISTORY_RETENTION_MS = 365 * DAY_MS
 NOTIFICATION_RETENTION_MS = 30 * DAY_MS
-CANDIDATE_COOLDOWN_MS = 4 * HOUR_MS
+# Een bevestigde nieuwe opbouw mag na drie uur opnieuw worden beoordeeld.
+# De L2-hercontrole en de blokkade op een reeds open positie blijven leidend.
+CANDIDATE_COOLDOWN_MS = 3 * HOUR_MS
+FOLLOW_NOTIFICATION_COOLDOWN_MS = 4 * HOUR_MS
 CANDIDATE_MAX_AGE_MS = 7 * MINUTE_MS
 MINIMUM_L2_SAMPLES = 3
 MINIMUM_L2_SPAN_MS = 60_000
@@ -245,7 +248,7 @@ def ensure_runtime(settings: V40RuntimeSettings, now_ms: int | None = None) -> N
     current = int(time.time() * 1000) if now_ms is None else int(now_ms)
     conn = _connect(settings)
     try:
-        _set_meta(conn, 'version', '4.0-phase-5')
+        _set_meta(conn, 'version', '4.0-phase-6')
         _set_meta(conn, 'initialized_ms', _meta(conn, 'initialized_ms', str(current)))
         _set_meta(conn, 'mode', 'OBSERVE_ONLY')
         _set_meta(conn, 'execution_enabled', '0')
@@ -327,7 +330,7 @@ def ingest_scan(
                     '''SELECT 1 FROM v40_notifications
                        WHERE market=? AND notification_type='VOLGEN' AND event_ms>?
                        LIMIT 1''',
-                    (market, current - CANDIDATE_COOLDOWN_MS),
+                    (market, current - FOLLOW_NOTIFICATION_COOLDOWN_MS),
                 ).fetchone()
                 if not recent_notice:
                     score = float(decision.get('score', 0.0))
@@ -343,7 +346,8 @@ def ingest_scan(
             if action != 'KOOPKANS':
                 continue
             recent = conn.execute(
-                'SELECT 1 FROM v40_candidates WHERE market=? AND created_ms>? LIMIT 1',
+                '''SELECT 1 FROM v40_candidates
+                   WHERE market=? AND (status='WACHT_OP_L2' OR created_ms>?) LIMIT 1''',
                 (market, current - CANDIDATE_COOLDOWN_MS),
             ).fetchone()
             if recent:
@@ -868,7 +872,7 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
         'counts': json.loads(str(cycle['counts_json'])),
     } if cycle else {}
     return {
-        'version': '4.0-phase-5',
+        'version': '4.0-phase-6',
         'component': 'FULL_EUR_HUMAN_PAPER_V40',
         'generated_at_ms': current,
         'generated_at_utc': datetime.fromtimestamp(current / 1000, timezone.utc).isoformat(),
@@ -936,7 +940,7 @@ def write_notification_feed(
     finally:
         conn.close()
     feed = {
-        'version': '4.0-phase-5',
+        'version': '4.0-phase-6',
         'generated_at_ms': current,
         'generated_at_utc': datetime.fromtimestamp(current / 1000, timezone.utc).isoformat(),
         'delivery': 'LOKALE_FEED; EXTERN_KANAAL_NOG_NIET_GEKOZEN',
@@ -971,7 +975,7 @@ def load_report(settings: V40RuntimeSettings) -> dict[str, Any]:
 def print_status(report: dict[str, Any]) -> None:
     cycle = report.get('latest_cycle', {})
     portfolio = report.get('paper_portfolio', {})
-    print('=== CRYPTOBOT v4.0 FASE 5 | PAPERBOT + MELDINGENFEED ===')
+    print('=== CRYPTOBOT v4.0 FASE 6 | ADAPTIEVE HERINSTAP + MELDINGENFEED ===')
     print('MODUS                 : OBSERVE-ONLY')
     print('PAPER-SIMULATIE       : AAN (ALLEEN REKENWERK)')
     print('LIVE ORDERS           : UIT / TECHNISCH ONMOGELIJK')

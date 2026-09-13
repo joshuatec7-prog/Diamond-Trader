@@ -112,7 +112,7 @@ def run_historical_lab(
         for market in ('VTHO-EUR', 'LSK-EUR')
     }
     report = {
-        'version': '4.0-phase-5',
+        'version': '4.0-phase-6',
         'component': 'FULL_EUR_HISTORICAL_REPLAY',
         'generated_at_utc': datetime.now(timezone.utc).isoformat(),
         'period': {

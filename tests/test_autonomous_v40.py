@@ -109,6 +109,33 @@ class AutonomousV40Tests(unittest.TestCase):
                 count = conn.execute('SELECT COUNT(*) FROM v40_candidates').fetchone()[0]
             self.assertEqual(count, 1)
 
+    def test_market_can_be_reconsidered_after_three_hours(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self.settings(Path(temporary))
+            v40.ensure_runtime(settings, NOW_MS)
+            first = v40.ingest_scan(settings, buy_scan(), now_ms=NOW_MS)
+            self.assertEqual(first['queued_l2'], 1)
+            with sqlite3.connect(settings.db_path) as conn:
+                conn.execute("UPDATE v40_candidates SET status='BEVESTIGD'")
+                conn.commit()
+            second = v40.ingest_scan(
+                settings, buy_scan(), now_ms=NOW_MS + v40.CANDIDATE_COOLDOWN_MS + 1,
+            )
+            self.assertEqual(second['queued_l2'], 1)
+            with sqlite3.connect(settings.db_path) as conn:
+                count = conn.execute('SELECT COUNT(*) FROM v40_candidates').fetchone()[0]
+            self.assertEqual(count, 2)
+
+    def test_unresolved_candidate_remains_blocked_after_three_hours(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self.settings(Path(temporary))
+            v40.ensure_runtime(settings, NOW_MS)
+            v40.ingest_scan(settings, buy_scan(), now_ms=NOW_MS)
+            second = v40.ingest_scan(
+                settings, buy_scan(), now_ms=NOW_MS + v40.CANDIDATE_COOLDOWN_MS + 1,
+            )
+            self.assertEqual(second['queued_l2'], 0)
+
     def test_old_signal_chain_is_removed_after_ninety_days(self):
         with tempfile.TemporaryDirectory() as temporary:
             settings = self.settings(Path(temporary))
