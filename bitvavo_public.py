@@ -280,6 +280,26 @@ class BitvavoPublic:
             raise RuntimeError(f'ongeldige bid/ask voor {market}')
         return book
 
+    def market_books(self, markets: List[str] | None = None) -> Dict[str, Book]:
+        """Haal alle top-of-book prijzen met één publieke request op."""
+        allowed = {str(market).upper() for market in markets} if markets is not None else None
+        payload = self._get('/ticker/book')
+        rows = payload if isinstance(payload, list) else [payload]
+        result: Dict[str, Book] = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            market = str(item.get('market', '')).upper()
+            if not market or (allowed is not None and market not in allowed):
+                continue
+            try:
+                book = Book(bid=float(item['bid']), ask=float(item['ask']))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if book.is_valid:
+                result[market] = book
+        return result
+
     @staticmethod
     def _depth_levels(value: Any, *, reverse: bool) -> List[tuple[float, float]]:
         if not isinstance(value, list):

@@ -15,6 +15,7 @@ def scan_all_eur(api: BitvavoPublic, *, output_path: str | None = None) -> dict:
     tickers = {
         str(item['market']): item for item in api.quote_market_tickers('EUR')
     }
+    books = api.market_books(active_markets)
     btc = api.closed_candles('BTC-EUR', '5m', 120)
     decisions = []
     errors = []
@@ -39,7 +40,10 @@ def scan_all_eur(api: BitvavoPublic, *, output_path: str | None = None) -> dict:
                 spread_pct = 0.0
             else:
                 candles = api.closed_candles(market, '5m', 120)
-                spread_pct = api.book(market).spread_pct
+                book = books.get(market)
+                if book is None:
+                    raise RuntimeError('bruikbaar orderboek ontbreekt')
+                spread_pct = book.spread_pct
             decisions.append(evaluate_entry(
                 market,
                 candles,

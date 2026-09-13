@@ -119,14 +119,14 @@ class V40HumanEngineTests(unittest.TestCase):
                     {'market': 'THIN-EUR', 'last': 1.0, 'volume_quote': 10_000.0},
                 ]
 
+            def market_books(self, markets):
+                self.book_markets = markets
+                return {'BTC-EUR': Book()}
+
             def closed_candles(self, market, interval, limit):
                 del interval, limit
                 self.candle_markets.append(market)
                 return candles
-
-            def book(self, market):
-                self.book_market = market
-                return Book()
 
         api = Api()
         report = scan_all_eur(api)

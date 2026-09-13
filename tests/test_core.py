@@ -120,6 +120,17 @@ class CleanRoomTests(unittest.TestCase):
         )
         self.assertEqual([c.timestamp_ms for c in result], [0])
 
+    def test_bulk_market_books_filters_invalid_and_unrequested_markets(self):
+        payload = [
+            {'market':'AAA-EUR','bid':'9.9','ask':'10.0'},
+            {'market':'BAD-EUR','bid':'10.1','ask':'10.0'},
+            {'market':'OTHER-EUR','bid':'4.9','ask':'5.0'},
+        ]
+        api = BitvavoPublic('https://x', session=FakeSession([FakeResponse(payload)]))
+        books = api.market_books(['AAA-EUR','BAD-EUR'])
+        self.assertEqual(list(books), ['AAA-EUR'])
+        self.assertAlmostEqual(books['AAA-EUR'].spread_pct, 1.005025, places=5)
+
     def test_permanent_4xx_not_retried(self):
         sess = FakeSession([FakeResponse({},403)])
         api = BitvavoPublic('https://x', retries=3, session=sess)
