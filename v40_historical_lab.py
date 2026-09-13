@@ -11,7 +11,9 @@ from bitvavo_public import BitvavoPublic
 from v40_replay import (
     DAY_MS,
     audit_large_moves,
+    build_runner_validation,
     replay_market,
+    simulate_broad_runner_trade,
     simulate_signal_trade,
     summarize_replays,
 )
@@ -67,6 +69,9 @@ def run_historical_lab(
             replay['paper_trades'] = [
                 simulate_signal_trade(rows, signal) for signal in replay['signals']
             ]
+            replay['runner_trades'] = [
+                simulate_broad_runner_trade(rows, signal) for signal in replay['signals']
+            ]
             replays.append(replay)
             audits.append(audit_large_moves(
                 market,
@@ -78,6 +83,7 @@ def run_historical_lab(
 
     summary = summarize_replays(replays)
     paper_trades = [trade for replay in replays for trade in replay['paper_trades']]
+    runner_trades = [trade for replay in replays for trade in replay['runner_trades']]
     paper_results = [float(trade['result_eur']) for trade in paper_trades]
     paper_summary = {
         'trades': len(paper_trades),
@@ -108,6 +114,9 @@ def run_historical_lab(
             'paper_trades': next(
                 (replay['paper_trades'] for replay in replays if replay['market'] == market), []
             ),
+            'runner_trades': next(
+                (replay['runner_trades'] for replay in replays if replay['market'] == market), []
+            ),
         }
         for market in ('VTHO-EUR', 'LSK-EUR')
     }
@@ -131,12 +140,15 @@ def run_historical_lab(
         'errors': errors,
         'signal_summary': summary,
         'paper_trade_summary': paper_summary,
+        'runner_validation': build_runner_validation(paper_trades, runner_trades),
         'large_move_audit': large_move_summary,
         'control_cases': controls,
         'notes': [
             'Iedere beslissing gebruikt uitsluitend gesloten candles tot dat moment.',
             'VTHO en LSK zijn controles; de regels zijn voor alle markten identiek.',
             'Resultaten zijn inclusief 0,66% vaste roundtripkosten en 0,12% aangenomen spread.',
+            'De runner is uitsluitend offline vergeleken en wijzigt de actieve PAPER-bot niet.',
+            'De runner moet ook zonder LSK positief zijn en de normale route verslaan.',
         ],
     }
     if output_path:
@@ -148,6 +160,7 @@ def print_status(report: dict[str, Any]) -> None:
     signals = report['signal_summary']
     paper = report['paper_trade_summary']
     moves = report['large_move_audit']
+    runner = report['runner_validation']
     print('=== CRYPTOBOT v4.0 FASE 2 | BREDE HISTORISCHE REPLAY ===')
     print('UITVOERING             : UIT / TECHNISCH ONMOGELIJK')
     print(f"PERIODE                : {report['period']['days']} dagen + 1 dag opwarming")
@@ -161,6 +174,13 @@ def print_status(report: dict[str, Any]) -> None:
         f"GROTE STIJGINGEN       : {moves['events']} | vroeg gezien {moves['caught_early']}"
         f" | gemist {moves['missed']}"
     )
+    without_lsk = runner['without_lsk']
+    print(
+        f"RUNNER ZONDER LSK      : {without_lsk['runner']['trades']} trades"
+        f" | totaal €{without_lsk['runner']['total_result_eur']:.2f}"
+        f" | verschil €{without_lsk['runner_minus_baseline_eur']:.2f}"
+    )
+    print(f"RUNNERBESLUIT          : {runner['decision']}")
     for market, control in report['control_cases'].items():
         print(
             f"{market:<22}: {len(control['signals'])} signalen"

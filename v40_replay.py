@@ -22,6 +22,15 @@ DEFAULT_HORIZONS_MINUTES = (15, 60, 240, 480, 720, 1440, 2160, 2880)
 SIGNAL_COOLDOWN_MS = 3 * 60 * 60_000
 ROLLING_DAY_BARS = 24 * 12
 PAPER_FEE_PCT = 0.25
+PAPER_SLIPPAGE_PCT = 0.08
+PAPER_ASSUMED_SPREAD_PCT = 0.12
+HISTORICAL_COST_PER_SIDE_PCT = (
+    PAPER_FEE_PCT + PAPER_SLIPPAGE_PCT + PAPER_ASSUMED_SPREAD_PCT / 2.0
+)
+RUNNER_PARTIAL_TRIGGER_PCT = 25.0
+RUNNER_TRAIL_FROM_PEAK_PCT = 30.0
+RUNNER_MINIMUM_TRADES = 50
+RUNNER_MAX_DRAWDOWN_EUR = 360.0
 
 
 def rolling_quote_volume(candles: Sequence[Candle], end_index: int) -> float:
@@ -131,7 +140,7 @@ def simulate_signal_trade(
     candles: Sequence[Candle],
     signal: dict[str, Any],
     *,
-    fee_pct: float = PAPER_FEE_PCT,
+    execution_cost_per_side_pct: float = HISTORICAL_COST_PER_SIDE_PCT,
 ) -> dict[str, Any]:
     """Speel één signaal chronologisch af met dezelfde menselijke uitstapregels."""
     rows = sorted((c for c in candles if c.is_valid), key=lambda c: c.timestamp_ms)
@@ -143,8 +152,8 @@ def simulate_signal_trade(
     notional = float(signal.get('proposed_paper_eur', 0.0))
     if entry <= 0.0 or notional <= 0.0:
         raise ValueError('ongeldige PAPER-instap')
-    fee_ratio = max(0.0, float(fee_pct)) / 100.0
-    initial_base = notional * (1.0 - fee_ratio) / entry
+    cost_ratio = max(0.0, float(execution_cost_per_side_pct)) / 100.0
+    initial_base = notional * (1.0 - cost_ratio) / entry
     remaining = initial_base
     highest = entry
     protected_stop = float(signal.get('stop_reference', entry * .97))
@@ -177,7 +186,7 @@ def simulate_signal_trade(
         if action not in {'DEEL_VERKOPEN', 'VERKOPEN'}:
             continue
         quantity = remaining / 2.0 if action == 'DEEL_VERKOPEN' else remaining
-        cash_change = quantity * exit_price * (1.0 - fee_ratio)
+        cash_change = quantity * exit_price * (1.0 - cost_ratio)
         proceeds += cash_change
         remaining = max(0.0, remaining - quantity)
         partial_taken = partial_taken or action == 'DEEL_VERKOPEN'
@@ -190,7 +199,7 @@ def simulate_signal_trade(
             break
 
     last = rows[-1].close
-    open_value = remaining * last * (1.0 - fee_ratio)
+    open_value = remaining * last * (1.0 - cost_ratio)
     closed = remaining <= initial_base * 1e-12
     total_value = proceeds + open_value
     return {
@@ -208,8 +217,228 @@ def simulate_signal_trade(
         'open_value_eur': round(open_value, 8),
         'result_eur': round(total_value - notional, 8),
         'result_pct': round((total_value / notional - 1.0) * 100.0, 6),
-        'fee_pct_per_side': fee_pct,
+        'execution_cost_pct_per_side': execution_cost_per_side_pct,
+        'assumed_roundtrip_cost_pct': execution_cost_per_side_pct * 2.0,
         'future_data_used_for_entry': False,
+    }
+
+
+def simulate_broad_runner_trade(
+    candles: Sequence[Candle],
+    signal: dict[str, Any],
+    *,
+    execution_cost_per_side_pct: float = HISTORICAL_COST_PER_SIDE_PCT,
+    partial_trigger_pct: float = RUNNER_PARTIAL_TRIGGER_PCT,
+    trail_from_peak_pct: float = RUNNER_TRAIL_FROM_PEAK_PCT,
+) -> dict[str, Any]:
+    """Test een brede runner zonder de actieve v4.0-uitstapregels te wijzigen.
+
+    De helft wordt bij +25% verkocht. Het restant krijgt daarna een ruime stop
+    van 30% onder de hoogste koers. Bij onduidelijke volgorde binnen één 5m-candle
+    wordt defensief aangenomen dat een geraakte stop ook werkelijk wordt gevuld.
+    """
+    if not 0.0 < partial_trigger_pct < 1000.0:
+        raise ValueError('runner partial-trigger is ongeldig')
+    if not 0.0 < trail_from_peak_pct < 100.0:
+        raise ValueError('runner trailing afstand is ongeldig')
+    rows = sorted((c for c in candles if c.is_valid), key=lambda c: c.timestamp_ms)
+    signal_ms = int(signal['signal_ms'])
+    start = next((index for index, row in enumerate(rows) if row.timestamp_ms == signal_ms), None)
+    if start is None:
+        raise ValueError('signaalmoment ontbreekt in candles')
+    entry = float(signal.get('entry_reference', rows[start].close))
+    notional = float(signal.get('proposed_paper_eur', 0.0))
+    if entry <= 0.0 or notional <= 0.0:
+        raise ValueError('ongeldige PAPER-instap')
+
+    cost_ratio = max(0.0, float(execution_cost_per_side_pct)) / 100.0
+    initial_base = notional * (1.0 - cost_ratio) / entry
+    remaining = initial_base
+    partial_price = entry * (1.0 + partial_trigger_pct / 100.0)
+    protected_stop = float(signal.get('stop_reference', entry * .97))
+    highest = entry
+    partial_taken = False
+    proceeds = 0.0
+    events: list[dict[str, Any]] = [{
+        'event_ms': signal_ms, 'action': 'KOPEN', 'price': entry,
+        'base_amount': initial_base, 'cash_change_eur': -notional,
+        'reason': str(signal.get('route', 'KOOPKANS')),
+    }]
+
+    def sell(event_ms: int, action: str, price: float, quantity: float, reason: str) -> None:
+        nonlocal proceeds, remaining
+        cash_change = quantity * price * (1.0 - cost_ratio)
+        proceeds += cash_change
+        remaining = max(0.0, remaining - quantity)
+        events.append({
+            'event_ms': event_ms, 'action': action, 'price': price,
+            'base_amount': quantity, 'cash_change_eur': cash_change, 'reason': reason,
+        })
+
+    for candle in rows[start + 1:]:
+        # Reeds geldende stop gaat altijd vóór nieuwe intrabar winstinformatie.
+        if candle.low <= protected_stop:
+            stop_fill = min(candle.open, protected_stop) if candle.open < protected_stop else protected_stop
+            sell(candle.timestamp_ms, 'VERKOPEN', stop_fill, remaining, 'runner_beschermingsstop')
+            break
+
+        highest = max(highest, candle.high)
+        if not partial_taken and candle.high >= partial_price:
+            sell(
+                candle.timestamp_ms, 'DEEL_VERKOPEN', partial_price, remaining / 2.0,
+                'runner_25pct_halve_winstname',
+            )
+            partial_taken = True
+
+        if partial_taken:
+            new_stop = max(
+                protected_stop,
+                highest * (1.0 - trail_from_peak_pct / 100.0),
+            )
+            # De exacte high/low-volgorde binnen een 5m-candle is onbekend.
+            # Een nieuwe stop die dezelfde candle raakt, wordt defensief uitgevoerd.
+            if new_stop > protected_stop and candle.low <= new_stop:
+                protected_stop = new_stop
+                sell(
+                    candle.timestamp_ms, 'VERKOPEN', protected_stop, remaining,
+                    'runner_30pct_topstop',
+                )
+                break
+            protected_stop = new_stop
+
+    last = rows[-1].close
+    open_value = remaining * last * (1.0 - cost_ratio)
+    closed = remaining <= initial_base * 1e-12
+    total_value = proceeds + open_value
+    return {
+        'market': str(signal.get('market', '')),
+        'signal_ms': signal_ms,
+        'route': str(signal.get('route', '')),
+        'score': float(signal.get('score', 0.0)),
+        'position_eur': notional,
+        'entry_price': entry,
+        'initial_base': initial_base,
+        'status': 'GESLOTEN' if closed else 'OPEN',
+        'remaining_base': remaining,
+        'events': events,
+        'realized_proceeds_eur': round(proceeds, 8),
+        'open_value_eur': round(open_value, 8),
+        'result_eur': round(total_value - notional, 8),
+        'result_pct': round((total_value / notional - 1.0) * 100.0, 6),
+        'highest_price': round(highest, 12),
+        'protected_stop_price': round(protected_stop, 12),
+        'partial_taken': partial_taken,
+        'partial_trigger_pct': partial_trigger_pct,
+        'trail_from_peak_pct': trail_from_peak_pct,
+        'execution_cost_pct_per_side': execution_cost_per_side_pct,
+        'assumed_roundtrip_cost_pct': execution_cost_per_side_pct * 2.0,
+        'future_data_used_for_entry': False,
+        'intrabar_assumption': 'STOP_DEFENSIEF',
+    }
+
+
+def summarize_strategy_trades(
+    trades: Sequence[dict[str, Any]],
+    *,
+    starting_capital_eur: float = 3600.0,
+) -> dict[str, Any]:
+    """Vat onafhankelijke signaaltrades samen, inclusief volgorde-drawdown."""
+    ordered = sorted(
+        trades,
+        key=lambda trade: (int(trade.get('signal_ms', 0)), str(trade.get('market', ''))),
+    )
+    values = [float(trade.get('result_eur', 0.0)) for trade in ordered]
+    wins = [value for value in values if value > 0.0]
+    losses = [-value for value in values if value < 0.0]
+    cumulative = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for value in values:
+        cumulative += value
+        peak = max(peak, cumulative)
+        max_drawdown = max(max_drawdown, peak - cumulative)
+    return {
+        'trades': len(ordered),
+        'markets': len({str(trade.get('market', '')) for trade in ordered}),
+        'wins': len(wins),
+        'losses': len(losses),
+        'flat': len(values) - len(wins) - len(losses),
+        'open_at_period_end': sum(1 for trade in ordered if trade.get('status') == 'OPEN'),
+        'total_result_eur': round(sum(values), 8),
+        'average_result_eur': round(mean(values), 8) if values else None,
+        'median_result_eur': round(median(values), 8) if values else None,
+        'win_rate_pct': round(len(wins) / len(values) * 100.0, 3) if values else None,
+        'profit_factor': round(sum(wins) / sum(losses), 4) if losses else None,
+        'worst_trade_eur': round(min(values), 8) if values else None,
+        'maximum_signal_sequence_drawdown_eur': round(max_drawdown, 8),
+        'maximum_signal_sequence_drawdown_pct_of_3600': round(
+            max_drawdown / starting_capital_eur * 100.0, 4,
+        ) if starting_capital_eur > 0.0 else None,
+    }
+
+
+def build_runner_validation(
+    baseline_trades: Sequence[dict[str, Any]],
+    runner_trades: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Vergelijk runner en normale route, zowel met als zonder LSK."""
+    baseline_all = summarize_strategy_trades(baseline_trades)
+    runner_all = summarize_strategy_trades(runner_trades)
+    baseline_without_lsk = summarize_strategy_trades([
+        trade for trade in baseline_trades if str(trade.get('market')) != 'LSK-EUR'
+    ])
+    runner_without_lsk = summarize_strategy_trades([
+        trade for trade in runner_trades if str(trade.get('market')) != 'LSK-EUR'
+    ])
+    enough = runner_without_lsk['trades'] >= RUNNER_MINIMUM_TRADES
+    positive = runner_without_lsk['total_result_eur'] > 0.0
+    beats_baseline = (
+        runner_without_lsk['total_result_eur']
+        > baseline_without_lsk['total_result_eur']
+    )
+    controlled = (
+        runner_without_lsk['maximum_signal_sequence_drawdown_eur']
+        <= RUNNER_MAX_DRAWDOWN_EUR
+    )
+    candidate = enough and positive and beats_baseline and controlled
+    return {
+        'policy': {
+            'partial_sale_pct': 50.0,
+            'partial_trigger_profit_pct': RUNNER_PARTIAL_TRIGGER_PCT,
+            'remaining_trail_from_peak_pct': RUNNER_TRAIL_FROM_PEAK_PCT,
+            'minimum_trades_without_lsk': RUNNER_MINIMUM_TRADES,
+            'maximum_signal_sequence_drawdown_eur': RUNNER_MAX_DRAWDOWN_EUR,
+            'intrabar_assumption': 'STOP_DEFENSIEF',
+        },
+        'all_markets': {
+            'baseline': baseline_all,
+            'runner': runner_all,
+            'runner_minus_baseline_eur': round(
+                runner_all['total_result_eur'] - baseline_all['total_result_eur'], 8,
+            ),
+        },
+        'without_lsk': {
+            'baseline': baseline_without_lsk,
+            'runner': runner_without_lsk,
+            'runner_minus_baseline_eur': round(
+                runner_without_lsk['total_result_eur']
+                - baseline_without_lsk['total_result_eur'], 8,
+            ),
+        },
+        'criteria': {
+            'enough_trades_without_lsk': enough,
+            'positive_without_lsk': positive,
+            'beats_baseline_without_lsk': beats_baseline,
+            'drawdown_within_limit_without_lsk': controlled,
+        },
+        'decision': (
+            'KANDIDAAT_VOOR_APARTE_PAPERTEST' if candidate
+            else 'ONVOLDOENDE_DATA' if not enough
+            else 'AFWIJZEN'
+        ),
+        'active_bot_changed': False,
+        'execution_enabled': False,
+        'live_orders_possible': False,
     }
 
 

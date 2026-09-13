@@ -12,9 +12,12 @@ from v40_historical_lab import run_historical_lab
 from v40_replay import (
     SIGNAL_COOLDOWN_MS,
     audit_large_moves,
+    build_runner_validation,
     forward_outcomes,
     rolling_quote_volume,
+    simulate_broad_runner_trade,
     simulate_signal_trade,
+    summarize_strategy_trades,
     summarize_replays,
 )
 
@@ -116,6 +119,59 @@ class V40HumanEngineTests(unittest.TestCase):
             'KOPEN', 'DEEL_VERKOPEN', 'VERKOPEN',
         ])
         self.assertGreater(trade['result_eur'], 0.0)
+        self.assertAlmostEqual(trade['assumed_roundtrip_cost_pct'], .78)
+
+    def test_broad_runner_sells_half_then_protects_the_remainder(self):
+        rows = candles_from_closes([100.0] * 61 + [126.0, 180.0, 120.0])
+        rows[62] = Candle(
+            timestamp_ms=rows[62].timestamp_ms, open=126.0, high=200.0,
+            low=125.0, close=180.0, volume=100.0,
+        )
+        signal = {
+            'market': 'RUNNER-EUR', 'signal_ms': rows[60].timestamp_ms,
+            'entry_reference': 100.0, 'stop_reference': 97.0,
+            'route': 'VROEG_MOMENTUM', 'score': 90.0,
+            'proposed_paper_eur': 500.0,
+        }
+        trade = simulate_broad_runner_trade(rows, signal)
+        self.assertEqual(trade['status'], 'GESLOTEN')
+        self.assertTrue(trade['partial_taken'])
+        self.assertEqual([event['action'] for event in trade['events']], [
+            'KOPEN', 'DEEL_VERKOPEN', 'VERKOPEN',
+        ])
+        self.assertEqual(trade['events'][1]['price'], 125.0)
+        self.assertEqual(trade['events'][2]['price'], 140.0)
+        self.assertGreater(trade['result_eur'], 0.0)
+
+    def test_runner_validation_is_not_approved_by_lsk_alone(self):
+        baseline = []
+        runner = []
+        for index in range(50):
+            market = 'LSK-EUR' if index == 0 else f'M{index}-EUR'
+            common = {
+                'market': market, 'signal_ms': index,
+                'status': 'GESLOTEN', 'events': [{'event_ms': index}],
+            }
+            baseline.append({**common, 'result_eur': 0.0})
+            runner.append({
+                **common,
+                'result_eur': 1000.0 if market == 'LSK-EUR' else -1.0,
+            })
+        report = build_runner_validation(baseline, runner)
+        self.assertGreater(report['all_markets']['runner']['total_result_eur'], 0.0)
+        self.assertLess(report['without_lsk']['runner']['total_result_eur'], 0.0)
+        self.assertNotEqual(report['decision'], 'KANDIDAAT_VOOR_APARTE_PAPERTEST')
+        self.assertFalse(report['active_bot_changed'])
+
+    def test_strategy_summary_calculates_signal_sequence_drawdown(self):
+        trades = [
+            {'market': 'A-EUR', 'result_eur': 10.0, 'events': [{'event_ms': 1}]},
+            {'market': 'B-EUR', 'result_eur': -25.0, 'events': [{'event_ms': 2}]},
+            {'market': 'C-EUR', 'result_eur': 5.0, 'events': [{'event_ms': 3}]},
+        ]
+        summary = summarize_strategy_trades(trades)
+        self.assertEqual(summary['maximum_signal_sequence_drawdown_eur'], 25.0)
+        self.assertEqual(summary['worst_trade_eur'], -25.0)
 
     def test_accelerating_profit_can_be_partially_sold(self):
         result = evaluate_exit(
@@ -238,6 +294,8 @@ class V40HumanEngineTests(unittest.TestCase):
         self.assertFalse(report['raw_candles_saved'])
         self.assertEqual(report['version'], '4.0-phase-6')
         self.assertEqual(report['control_cases']['LSK-EUR']['paper_trades'], [])
+        self.assertEqual(report['control_cases']['LSK-EUR']['runner_trades'], [])
+        self.assertEqual(report['runner_validation']['decision'], 'ONVOLDOENDE_DATA')
         self.assertFalse(report['execution_enabled'])
 
     def test_historical_lab_rejects_unbounded_period(self):
