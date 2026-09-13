@@ -15,6 +15,7 @@ from v40_replay import (
     build_runner_validation,
     forward_outcomes,
     rolling_quote_volume,
+    rolling_quote_volume_series,
     simulate_broad_runner_trade,
     simulate_signal_trade,
     summarize_strategy_trades,
@@ -49,6 +50,15 @@ class V40HumanEngineTests(unittest.TestCase):
 
     def test_reentry_cooldown_is_three_hours(self):
         self.assertEqual(SIGNAL_COOLDOWN_MS, 3 * 60 * 60_000)
+
+    def test_rolling_volume_series_matches_direct_calculation(self):
+        rows = candles_from_closes(
+            [1.0 + index * .01 for index in range(320)],
+            volumes=[100.0 + index for index in range(320)],
+        )
+        optimized = rolling_quote_volume_series(rows)
+        for index in (0, 50, 287, 288, 319):
+            self.assertAlmostEqual(optimized[index], rolling_quote_volume(rows, index), places=7)
 
     def test_early_momentum_can_become_buy_opportunity(self):
         closes = [100.0 + index * .025 for index in range(114)]

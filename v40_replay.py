@@ -39,6 +39,19 @@ def rolling_quote_volume(candles: Sequence[Candle], end_index: int) -> float:
     return sum(c.volume * c.close for c in candles[start:end_index + 1])
 
 
+def rolling_quote_volume_series(candles: Sequence[Candle]) -> list[float]:
+    """Bereken alle 24u-volumes in één doorloop voor grote historische replays."""
+    values: list[float] = []
+    running = 0.0
+    for index, candle in enumerate(candles):
+        running += candle.volume * candle.close
+        if index >= ROLLING_DAY_BARS:
+            expired = candles[index - ROLLING_DAY_BARS]
+            running -= expired.volume * expired.close
+        values.append(running)
+    return values
+
+
 def forward_outcomes(
     candles: Sequence[Candle],
     entry_index: int,
@@ -78,6 +91,7 @@ def replay_market(
     rows = sorted((c for c in candles if c.is_valid), key=lambda c: c.timestamp_ms)
     btc_rows = sorted((c for c in btc_candles if c.is_valid), key=lambda c: c.timestamp_ms)
     btc_by_time = {c.timestamp_ms: index for index, c in enumerate(btc_rows)}
+    rolling_volumes = rolling_quote_volume_series(rows)
     decisions: Counter[str] = Counter()
     routes: Counter[str] = Counter()
     signals: list[dict[str, Any]] = []
@@ -90,7 +104,7 @@ def replay_market(
         btc_index = btc_by_time.get(candle.timestamp_ms)
         if btc_index is None or btc_index < 59:
             continue
-        volume_quote = rolling_quote_volume(rows, index)
+        volume_quote = rolling_volumes[index]
         decision = evaluate_entry(
             market,
             rows[max(0, index - 119):index + 1],
