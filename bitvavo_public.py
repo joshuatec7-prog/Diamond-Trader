@@ -170,6 +170,10 @@ class BitvavoPublic:
 
     def candles(self, market: str, interval: str, limit: int) -> List[Candle]:
         payload = self._get(f'/{market}/candles', {'interval': interval, 'limit': limit})
+        return self._parse_candles(payload, market)
+
+    @staticmethod
+    def _parse_candles(payload: Any, market: str) -> List[Candle]:
         if not isinstance(payload, list):
             raise RuntimeError(f'ongeldig candles-antwoord voor {market}')
         parsed: Dict[int, Candle] = {}
@@ -186,6 +190,74 @@ class BitvavoPublic:
             if candle.is_valid:
                 parsed[candle.timestamp_ms] = candle
         return [parsed[key] for key in sorted(parsed)]
+
+    def candles_between(
+        self,
+        market: str,
+        interval: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        page_limit: int = 1440,
+        max_pages: int = 100,
+    ) -> List[Candle]:
+        """Haal een tijdvak achterwaarts op en verwijder overlap tussen API-pagina's."""
+        if interval not in INTERVAL_MS:
+            raise ValueError(f'interval niet ondersteund: {interval}')
+        if start_ms < 0 or end_ms <= start_ms:
+            raise ValueError('ongeldig candle-tijdvak')
+        if not 1 <= page_limit <= 1440:
+            raise ValueError('page_limit moet tussen 1 en 1440 liggen')
+        if not 1 <= max_pages <= 1000:
+            raise ValueError('max_pages moet tussen 1 en 1000 liggen')
+
+        collected: Dict[int, Candle] = {}
+        cursor_end = int(end_ms) - 1
+        previous_earliest: int | None = None
+        for _ in range(max_pages):
+            payload = self._get(f'/{market}/candles', {
+                'interval': interval,
+                'limit': page_limit,
+                'start': int(start_ms),
+                'end': cursor_end,
+            })
+            batch = self._parse_candles(payload, market)
+            if not batch:
+                break
+            for candle in batch:
+                if start_ms <= candle.timestamp_ms < end_ms:
+                    collected[candle.timestamp_ms] = candle
+            earliest = min(candle.timestamp_ms for candle in batch)
+            if earliest <= start_ms:
+                break
+            if previous_earliest is not None and earliest >= previous_earliest:
+                raise RuntimeError(f'candle-paginering maakt geen voortgang voor {market}')
+            previous_earliest = earliest
+            cursor_end = earliest - 1
+        else:
+            raise RuntimeError(f'maximaal aantal candle-pagina\'s bereikt voor {market}')
+        return [collected[key] for key in sorted(collected)]
+
+    def closed_candles_between(
+        self,
+        market: str,
+        interval: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        now_ms: int | None = None,
+        page_limit: int = 1440,
+        max_pages: int = 100,
+    ) -> List[Candle]:
+        now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        duration = INTERVAL_MS.get(interval)
+        if duration is None:
+            raise ValueError(f'interval niet ondersteund: {interval}')
+        rows = self.candles_between(
+            market, interval, start_ms, end_ms,
+            page_limit=page_limit, max_pages=max_pages,
+        )
+        return [candle for candle in rows if candle.timestamp_ms + duration <= now]
 
     def closed_candles(self, market: str, interval: str, limit: int,
                        now_ms: int | None = None) -> List[Candle]:

@@ -10,6 +10,7 @@ from v40_human_engine import ROUNDTRIP_FIXED_COST_PCT, evaluate_entry
 
 
 FIVE_MINUTE_MS = 300_000
+DAY_MS = 86_400_000
 DEFAULT_HORIZONS_MINUTES = (15, 60, 240, 480, 720, 1440, 2160, 2880)
 SIGNAL_COOLDOWN_MS = 4 * 60 * 60_000
 ROLLING_DAY_BARS = 24 * 12
@@ -54,6 +55,7 @@ def replay_market(
     *,
     assumed_spread_pct: float = 0.12,
     horizons_minutes: Sequence[int] = DEFAULT_HORIZONS_MINUTES,
+    signal_start_ms: int | None = None,
 ) -> dict[str, Any]:
     """Prospectieve replay: iedere beslissing ziet alleen data van dat moment en daarvoor."""
     rows = sorted((c for c in candles if c.is_valid), key=lambda c: c.timestamp_ms)
@@ -66,6 +68,8 @@ def replay_market(
 
     for index in range(ROLLING_DAY_BARS - 1, len(rows)):
         candle = rows[index]
+        if signal_start_ms is not None and candle.timestamp_ms < signal_start_ms:
+            continue
         btc_index = btc_by_time.get(candle.timestamp_ms)
         if btc_index is None or btc_index < 59:
             continue
@@ -110,6 +114,62 @@ def replay_market(
         'roundtrip_fixed_cost_pct': ROUNDTRIP_FIXED_COST_PCT,
         'horizons_minutes': list(horizons_minutes),
         'future_data_used_for_decisions': False,
+    }
+
+
+def audit_large_moves(
+    market: str,
+    candles: Sequence[Candle],
+    signals: Sequence[dict[str, Any]],
+    *,
+    minimum_gain_pct: float = 15.0,
+) -> dict[str, Any]:
+    """Controleer per UTC-dag of een grote stijging vroeg door een signaal is gezien."""
+    days: dict[int, list[Candle]] = {}
+    for candle in sorted((c for c in candles if c.is_valid), key=lambda c: c.timestamp_ms):
+        days.setdefault(candle.timestamp_ms // DAY_MS, []).append(candle)
+    events = []
+    for day, rows in sorted(days.items()):
+        if len(rows) < 144:  # Een halve dag ontbrekende data is geen betrouwbare auditdag.
+            continue
+        opening = rows[0].open
+        peak = max(rows, key=lambda candle: candle.high)
+        gain = (peak.high / opening - 1.0) * 100.0
+        if gain < minimum_gain_pct:
+            continue
+        eligible = sorted(
+            (
+                signal for signal in signals
+                if rows[0].timestamp_ms <= int(signal.get('signal_ms', -1)) <= peak.timestamp_ms
+            ),
+            key=lambda signal: int(signal.get('signal_ms', 0)),
+        )
+        first = eligible[0] if eligible else None
+        signal_gain = None
+        if first is not None:
+            signal_gain = (
+                float(first.get('entry_reference', opening)) / opening - 1.0
+            ) * 100.0
+        events.append({
+            'market': market,
+            'utc_day': day,
+            'day_start_ms': rows[0].timestamp_ms,
+            'peak_ms': peak.timestamp_ms,
+            'gain_to_peak_pct': round(gain, 4),
+            'caught': first is not None,
+            'caught_early': signal_gain is not None and signal_gain <= 5.0,
+            'first_signal_ms': int(first['signal_ms']) if first is not None else None,
+            'signal_gain_from_day_open_pct': round(signal_gain, 4) if signal_gain is not None else None,
+            'signal_route': str(first.get('route')) if first is not None else None,
+        })
+    return {
+        'market': market,
+        'minimum_gain_pct': minimum_gain_pct,
+        'large_moves': len(events),
+        'caught': sum(1 for event in events if event['caught']),
+        'caught_early': sum(1 for event in events if event['caught_early']),
+        'missed': sum(1 for event in events if not event['caught']),
+        'events': events,
     }
 
 

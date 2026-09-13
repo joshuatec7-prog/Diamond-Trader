@@ -8,7 +8,13 @@ from v40_human_engine import (
     proposed_position_eur,
 )
 from v40_offline_scan import scan_all_eur
-from v40_replay import forward_outcomes, rolling_quote_volume, summarize_replays
+from v40_historical_lab import run_historical_lab
+from v40_replay import (
+    audit_large_moves,
+    forward_outcomes,
+    rolling_quote_volume,
+    summarize_replays,
+)
 
 
 def candles_from_closes(closes, *, volumes=None, start_ms=0):
@@ -167,6 +173,48 @@ class V40HumanEngineTests(unittest.TestCase):
         self.assertEqual(summary['outcomes']['2880']['samples'], 1)
         self.assertEqual(summary['outcomes']['2880']['average_net_pct'], 12.5)
         self.assertFalse(summary['execution_enabled'])
+
+    def test_large_move_audit_separates_early_detection_from_miss(self):
+        closes = [100.0 + index * (20.0 / 287.0) for index in range(288)]
+        candles = candles_from_closes(closes)
+        early = [{
+            'signal_ms': candles[10].timestamp_ms,
+            'entry_reference': candles[10].close,
+            'route': 'VROEG_MOMENTUM',
+        }]
+        caught = audit_large_moves('TEST-EUR', candles, early)
+        missed = audit_large_moves('TEST-EUR', candles, [])
+        self.assertEqual(caught['large_moves'], 1)
+        self.assertEqual(caught['caught_early'], 1)
+        self.assertEqual(missed['missed'], 1)
+
+    def test_historical_lab_keeps_control_markets_and_saves_no_raw_candles(self):
+        day_ms = 86_400_000
+        end_ms = 40 * day_ms
+        fetch_start = end_ms - 8 * day_ms
+        closes = [100.0] * (8 * 288)
+        rows = candles_from_closes(closes, start_ms=fetch_start)
+
+        class Api:
+            def closed_candles_between(self, market, interval, start_ms, stop_ms, now_ms):
+                del market, interval
+                self.bounds = (start_ms, stop_ms, now_ms)
+                return rows
+
+        report = run_historical_lab(
+            Api(), days=7, end_ms=end_ms,
+            markets=['VTHO-EUR', 'LSK-EUR'],
+        )
+        self.assertEqual(report['markets_requested'], 3)
+        self.assertEqual(report['markets_completed'], 3)
+        self.assertIn('VTHO-EUR', report['control_cases'])
+        self.assertIn('LSK-EUR', report['control_cases'])
+        self.assertFalse(report['raw_candles_saved'])
+        self.assertFalse(report['execution_enabled'])
+
+    def test_historical_lab_rejects_unbounded_period(self):
+        with self.assertRaises(ValueError):
+            run_historical_lab(object(), days=91)
 
 
 if __name__ == '__main__':

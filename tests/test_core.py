@@ -30,8 +30,10 @@ class FakeSession:
         self.responses = list(responses)
         self.headers = {}
         self.calls = 0
+        self.requests = []
     def get(self, *args, **kwargs):
         self.calls += 1
+        self.requests.append((args, kwargs))
         return self.responses.pop(0)
 
 
@@ -91,6 +93,32 @@ class CleanRoomTests(unittest.TestCase):
         api = BitvavoPublic('https://x', session=FakeSession([FakeResponse(payload)]))
         result = api.candles('AAA-EUR','1h',10)
         self.assertEqual([c.timestamp_ms for c in result],[3_600_000])
+
+    def test_candle_time_window_paginates_backwards_without_duplicates(self):
+        first = [
+            [900,'10','11','9','10','2'], [800,'10','11','9','10','2'],
+        ]
+        second = [
+            [700,'10','11','9','10','2'], [600,'10','11','9','10','2'],
+        ]
+        session = FakeSession([FakeResponse(first), FakeResponse(second)])
+        api = BitvavoPublic('https://x', session=session)
+        result = api.candles_between(
+            'AAA-EUR', '5m', 600, 1000, page_limit=2, max_pages=3,
+        )
+        self.assertEqual([c.timestamp_ms for c in result], [600,700,800,900])
+        self.assertEqual(session.requests[0][1]['params']['end'], 999)
+        self.assertEqual(session.requests[1][1]['params']['end'], 799)
+
+    def test_closed_candle_time_window_removes_unfinished_candle(self):
+        payload = [
+            [0,'10','11','9','10','2'], [300_000,'10','11','9','10','2'],
+        ]
+        api = BitvavoPublic('https://x', session=FakeSession([FakeResponse(payload)]))
+        result = api.closed_candles_between(
+            'AAA-EUR', '5m', 0, 600_000, now_ms=500_000,
+        )
+        self.assertEqual([c.timestamp_ms for c in result], [0])
 
     def test_permanent_4xx_not_retried(self):
         sess = FakeSession([FakeResponse({},403)])
