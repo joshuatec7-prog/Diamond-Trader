@@ -129,6 +129,23 @@ class AutonomousV40Tests(unittest.TestCase):
                 ]
             self.assertEqual(counts, [0, 0, 0, 0])
 
+    def test_notifications_are_removed_after_thirty_days(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self.settings(Path(temporary))
+            old_ms = NOW_MS
+            current = old_ms + v40.NOTIFICATION_RETENTION_MS + 1
+            v40.ensure_runtime(settings, old_ms)
+            scan = buy_scan()
+            follow = dict(scan['decisions'][0])
+            follow.update({'market': 'WATCH-EUR', 'action': 'VOLGEN', 'score': 72.0})
+            scan['decisions'].append(follow)
+            v40.ingest_scan(settings, scan, now_ms=old_ms)
+            stored = v40.ingest_scan(settings, {'decisions': []}, now_ms=current)
+            self.assertEqual(stored['removed_notifications'], 1)
+            with sqlite3.connect(settings.db_path) as conn:
+                count = conn.execute('SELECT COUNT(*) FROM v40_notifications').fetchone()[0]
+            self.assertEqual(count, 0)
+
     def test_outcome_and_report_remain_observe_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             settings = self.settings(Path(temporary))
@@ -183,6 +200,29 @@ class AutonomousV40Tests(unittest.TestCase):
                     'SELECT event_type FROM v40_paper_events ORDER BY id'
                 )]
             self.assertEqual(events, ['KOPEN', 'VERKOPEN'])
+
+    def test_notification_feed_contains_follow_buy_and_sell_events_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self.settings(Path(temporary))
+            settings = replace(settings, notification_path=str(Path(temporary) / 'notices.json'))
+            v40.ensure_runtime(settings, NOW_MS)
+            scan = buy_scan()
+            follow = dict(scan['decisions'][0])
+            follow.update({'market': 'WATCH-EUR', 'action': 'VOLGEN', 'score': 72.0})
+            scan['decisions'].append(follow)
+            v40.ingest_scan(settings, scan, now_ms=NOW_MS)
+            api = StablePublicApi()
+            for offset in (0, 30_000, 60_000):
+                v40.recheck_candidates(settings, api=api, now_ms=NOW_MS + offset)
+            v40.simulate_paper_portfolio(settings, api=api, now_ms=NOW_MS + 61_000)
+            api.sell_price = 96.0
+            v40.simulate_paper_portfolio(settings, api=api, now_ms=NOW_MS + 62_000)
+            feed = v40.write_notification_feed(settings, now_ms=NOW_MS + 63_000)
+            kinds = [item['notification_type'] for item in reversed(feed['notifications'])]
+            self.assertEqual(kinds, ['VOLGEN', 'KOOPKANS', 'KOPEN', 'VERKOPEN'])
+            self.assertFalse(feed['execution_enabled'])
+            self.assertFalse(feed['live_orders_possible'])
+            self.assertTrue(Path(settings.notification_path).exists())
 
 
 if __name__ == '__main__':

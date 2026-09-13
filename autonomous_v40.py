@@ -29,6 +29,7 @@ DECISION_RETENTION_MS = 48 * HOUR_MS
 CYCLE_RETENTION_MS = 14 * DAY_MS
 HISTORY_RETENTION_MS = 90 * DAY_MS
 PAPER_HISTORY_RETENTION_MS = 365 * DAY_MS
+NOTIFICATION_RETENTION_MS = 30 * DAY_MS
 CANDIDATE_COOLDOWN_MS = 4 * HOUR_MS
 CANDIDATE_MAX_AGE_MS = 7 * MINUTE_MS
 MINIMUM_L2_SAMPLES = 3
@@ -62,12 +63,16 @@ class V40RuntimeSettings:
     report_seconds: int = 60
     db_path: str = ''
     report_path: str = ''
+    notification_path: str = ''
 
     @classmethod
     def from_env(cls) -> 'V40RuntimeSettings':
         return cls(
             db_path=os.getenv('V40_DB_PATH', _data_path('cryptobot_autonomous_v40.db')),
             report_path=os.getenv('V40_REPORT_PATH', _data_path('cryptobot_autonomous_v40.json')),
+            notification_path=os.getenv(
+                'V40_NOTIFICATION_PATH', _data_path('cryptobot_autonomous_v40_notifications.json')
+            ),
         )
 
     def validate(self) -> None:
@@ -139,9 +144,14 @@ def _connect(settings: V40RuntimeSettings) -> sqlite3.Connection:
         event_ms INTEGER NOT NULL, event_type TEXT NOT NULL, base_amount REAL NOT NULL,
         price REAL NOT NULL, cash_change_eur REAL NOT NULL, reason TEXT NOT NULL,
         FOREIGN KEY(position_id) REFERENCES v40_paper_positions(id));
+      CREATE TABLE IF NOT EXISTS v40_notifications(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT NOT NULL UNIQUE,
+        event_ms INTEGER NOT NULL, notification_type TEXT NOT NULL, market TEXT NOT NULL,
+        message TEXT NOT NULL, payload_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS v40_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_v40_candidate_status ON v40_candidates(status,created_ms);
       CREATE INDEX IF NOT EXISTS idx_v40_alert_market_time ON v40_alerts(market,event_ms);
+      CREATE INDEX IF NOT EXISTS idx_v40_notification_time ON v40_notifications(event_ms);
     ''')
     return conn
 
@@ -157,6 +167,28 @@ def _set_meta(conn: sqlite3.Connection, key: str, value: object) -> None:
 def _meta(conn: sqlite3.Connection, key: str, default: str = '') -> str:
     row = conn.execute('SELECT value FROM v40_meta WHERE key=?', (key,)).fetchone()
     return str(row[0]) if row else default
+
+
+def _enqueue_notification(
+    conn: sqlite3.Connection,
+    *,
+    event_key: str,
+    event_ms: int,
+    notification_type: str,
+    market: str,
+    message: str,
+    payload: dict[str, Any],
+) -> bool:
+    cursor = conn.execute(
+        '''INSERT OR IGNORE INTO v40_notifications
+           (event_key,event_ms,notification_type,market,message,payload_json)
+           VALUES (?,?,?,?,?,?)''',
+        (
+            event_key, event_ms, notification_type, market, message,
+            json.dumps(payload, ensure_ascii=False),
+        ),
+    )
+    return cursor.rowcount == 1
 
 
 def _prune_history(conn: sqlite3.Connection, cutoff_ms: int) -> int:
@@ -213,7 +245,7 @@ def ensure_runtime(settings: V40RuntimeSettings, now_ms: int | None = None) -> N
     current = int(time.time() * 1000) if now_ms is None else int(now_ms)
     conn = _connect(settings)
     try:
-        _set_meta(conn, 'version', '4.0-phase-4')
+        _set_meta(conn, 'version', '4.0-phase-5')
         _set_meta(conn, 'initialized_ms', _meta(conn, 'initialized_ms', str(current)))
         _set_meta(conn, 'mode', 'OBSERVE_ONLY')
         _set_meta(conn, 'execution_enabled', '0')
@@ -275,18 +307,41 @@ def ingest_scan(
         )
         for decision in kept:
             compact = _compact_decision(decision)
+            market = str(decision.get('market'))
+            action = str(decision.get('action'))
             conn.execute(
                 'INSERT OR REPLACE INTO v40_decisions VALUES (?,?,?,?,?,?,?)',
                 (
-                    current, str(decision.get('market')), str(decision.get('action')),
+                    current, market, action,
                     str(decision.get('route')), float(decision.get('score', 0.0)),
                     float(decision.get('proposed_paper_eur', 0.0)),
                     json.dumps(compact, ensure_ascii=False),
                 ),
             )
-            if str(decision.get('action')) != 'KOOPKANS':
+            if (
+                action == 'VOLGEN'
+                and str(decision.get('route')) != 'GEEN_SETUP'
+                and float(decision.get('score', 0.0)) >= 65.0
+            ):
+                recent_notice = conn.execute(
+                    '''SELECT 1 FROM v40_notifications
+                       WHERE market=? AND notification_type='VOLGEN' AND event_ms>?
+                       LIMIT 1''',
+                    (market, current - CANDIDATE_COOLDOWN_MS),
+                ).fetchone()
+                if not recent_notice:
+                    score = float(decision.get('score', 0.0))
+                    _enqueue_notification(
+                        conn,
+                        event_key=f'VOLGEN:{market}:{current}',
+                        event_ms=current,
+                        notification_type='VOLGEN',
+                        market=market,
+                        message=f'VOLGEN {market} | score {score:.1f} | nog geen koop',
+                        payload=compact,
+                    )
+            if action != 'KOOPKANS':
                 continue
-            market = str(decision.get('market'))
             recent = conn.execute(
                 'SELECT 1 FROM v40_candidates WHERE market=? AND created_ms>? LIMIT 1',
                 (market, current - CANDIDATE_COOLDOWN_MS),
@@ -309,6 +364,10 @@ def ingest_scan(
             queued += 1
         conn.execute('DELETE FROM v40_decisions WHERE cycle_ms<?', (current - DECISION_RETENTION_MS,))
         conn.execute('DELETE FROM v40_cycles WHERE cycle_ms<?', (current - CYCLE_RETENTION_MS,))
+        removed_notifications = conn.execute(
+            'DELETE FROM v40_notifications WHERE event_ms<?',
+            (current - NOTIFICATION_RETENTION_MS,),
+        ).rowcount
         removed_paper = _prune_paper_history(conn, current - PAPER_HISTORY_RETENTION_MS)
         removed_history = _prune_history(conn, current - HISTORY_RETENTION_MS)
         _set_meta(conn, 'scan_attempted_ms', current)
@@ -320,6 +379,7 @@ def ingest_scan(
     return {
         'decisions': len(decisions), 'stored': len(kept), 'queued_l2': queued,
         'removed_history': removed_history, 'removed_paper': removed_paper,
+        'removed_notifications': removed_notifications,
     }
 
 
@@ -463,6 +523,24 @@ def recheck_candidates(
                             buy * stop_ratio, buy * target_ratio,
                             json.dumps({'l2': summary, 'entry': details}, ensure_ascii=False),
                         ),
+                    )
+                    _enqueue_notification(
+                        conn,
+                        event_key=f'KOOPKANS:{candidate_id}',
+                        event_ms=current,
+                        notification_type='KOOPKANS',
+                        market=str(candidate['market']),
+                        message=(
+                            f"KOOPKANS {candidate['market']} | score {float(candidate['score']):.1f}"
+                            f" | PAPER €{float(candidate['proposed_paper_eur']):.0f}"
+                            f" | instap {buy:.10g}"
+                        ),
+                        payload={
+                            'route': str(candidate['route']), 'score': float(candidate['score']),
+                            'paper_eur': float(candidate['proposed_paper_eur']),
+                            'entry': buy, 'stop': buy * stop_ratio, 'target': buy * target_ratio,
+                            'execution_enabled': False, 'live_orders_possible': False,
+                        },
                     )
                     confirmed.append(str(candidate['market']))
                 conn.commit()
@@ -628,6 +706,23 @@ def simulate_paper_portfolio(
                             str(decision['reason']),
                         ),
                     )
+                    _enqueue_notification(
+                        conn,
+                        event_key=f'PAPER:{int(position["id"])}:{action}',
+                        event_ms=current,
+                        notification_type=action,
+                        market=str(position['market']),
+                        message=(
+                            f'{action.replace("_", " ")} {position["market"]}'
+                            f' | PAPER {quantity:.8g} stuks | prijs {price:.10g}'
+                            f' | resultaat €{pnl:.2f}'
+                        ),
+                        payload={
+                            'position_id': int(position['id']), 'base_amount': quantity,
+                            'price': price, 'pnl_eur': pnl, 'reason': str(decision['reason']),
+                            'execution_enabled': False, 'live_orders_possible': False,
+                        },
+                    )
                     (partial if action == 'DEEL_VERKOPEN' else closed).append(str(position['market']))
                 conn.commit()
             finally:
@@ -682,6 +777,23 @@ def simulate_paper_portfolio(
                    VALUES (?,?,?,?,?,?,?)''',
                 (position_id, current, 'KOPEN', base, price, -amount, 'bevestigde_l2_koopkans'),
             )
+            _enqueue_notification(
+                conn,
+                event_key=f'PAPER:{position_id}:KOPEN',
+                event_ms=current,
+                notification_type='KOPEN',
+                market=str(alert['market']),
+                message=(
+                    f'KOPEN {alert["market"]} | PAPER €{amount:.0f}'
+                    f' | instap {price:.10g} | stop {float(alert["stop_reference"]):.10g}'
+                ),
+                payload={
+                    'position_id': position_id, 'paper_eur': amount, 'entry': price,
+                    'stop': float(alert['stop_reference']),
+                    'target': float(alert['target_reference']),
+                    'execution_enabled': False, 'live_orders_possible': False,
+                },
+            )
             account = conn.execute('SELECT * FROM v40_paper_account WHERE id=1').fetchone()
             open_count += 1
             opened.append(str(alert['market']))
@@ -730,15 +842,22 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
             'l2_attempted_ms': int(_meta(conn, 'l2_attempted_ms', '0') or 0),
             'outcome_attempted_ms': int(_meta(conn, 'outcome_attempted_ms', '0') or 0),
             'paper_attempted_ms': int(_meta(conn, 'paper_attempted_ms', '0') or 0),
+            'notification_written_ms': int(_meta(conn, 'notification_written_ms', '0') or 0),
         }
         account = conn.execute('SELECT * FROM v40_paper_account WHERE id=1').fetchone()
         paper_positions = [dict(row) for row in conn.execute(
             "SELECT * FROM v40_paper_positions WHERE status='OPEN' ORDER BY opened_ms,id"
         )]
+        notifications = [dict(row) for row in conn.execute(
+            'SELECT * FROM v40_notifications WHERE event_ms>=? ORDER BY event_ms DESC,id DESC LIMIT 100',
+            (current - DAY_MS,),
+        )]
     finally:
         conn.close()
     for alert in alerts:
         alert.pop('details_json', None)
+    for notice in notifications:
+        notice.pop('payload_json', None)
     db_bytes = Path(settings.db_path).stat().st_size if Path(settings.db_path).exists() else 0
     latest_cycle = {
         'cycle_ms': int(cycle['cycle_ms']),
@@ -749,7 +868,7 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
         'counts': json.loads(str(cycle['counts_json'])),
     } if cycle else {}
     return {
-        'version': '4.0-phase-4',
+        'version': '4.0-phase-5',
         'component': 'FULL_EUR_HUMAN_PAPER_V40',
         'generated_at_ms': current,
         'generated_at_utc': datetime.fromtimestamp(current / 1000, timezone.utc).isoformat(),
@@ -778,6 +897,7 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
         'latest_cycle': latest_cycle,
         'l2': {'pending_candidates': pending, 'minimum_samples': MINIMUM_L2_SAMPLES},
         'alerts_last_24h': alerts,
+        'notifications_last_24h': notifications,
         'prospective_outcomes': outcomes,
         'heartbeat': heartbeat,
         'storage': {
@@ -786,8 +906,50 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
             'cycle_retention_days': CYCLE_RETENTION_MS // DAY_MS,
             'signal_history_retention_days': HISTORY_RETENTION_MS // DAY_MS,
             'paper_history_retention_days': PAPER_HISTORY_RETENTION_MS // DAY_MS,
+            'notification_retention_days': NOTIFICATION_RETENTION_MS // DAY_MS,
         },
     }
+
+
+def write_notification_feed(
+    settings: V40RuntimeSettings,
+    *,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Schrijf een lokale, kanaalonafhankelijke feed; verstuurt zelf geen berichten."""
+    current = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    conn = _connect(settings)
+    try:
+        rows = conn.execute(
+            '''SELECT id,event_ms,notification_type,market,message,payload_json
+               FROM v40_notifications WHERE event_ms>=?
+               ORDER BY event_ms DESC,id DESC LIMIT 100''',
+            (current - 7 * DAY_MS,),
+        ).fetchall()
+        notices = []
+        for row in rows:
+            item = dict(row)
+            item['payload'] = json.loads(item.pop('payload_json'))
+            notices.append(item)
+        _set_meta(conn, 'notification_written_ms', current)
+        conn.commit()
+    finally:
+        conn.close()
+    feed = {
+        'version': '4.0-phase-5',
+        'generated_at_ms': current,
+        'generated_at_utc': datetime.fromtimestamp(current / 1000, timezone.utc).isoformat(),
+        'delivery': 'LOKALE_FEED; EXTERN_KANAAL_NOG_NIET_GEKOZEN',
+        'execution_enabled': False,
+        'live_orders_possible': False,
+        'notifications': notices,
+    }
+    path = Path(settings.notification_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.write_text(json.dumps(feed, ensure_ascii=False, indent=2), encoding='utf-8')
+    temporary.replace(path)
+    return feed
 
 
 def write_report(settings: V40RuntimeSettings, report: dict[str, Any]) -> None:
@@ -809,7 +971,7 @@ def load_report(settings: V40RuntimeSettings) -> dict[str, Any]:
 def print_status(report: dict[str, Any]) -> None:
     cycle = report.get('latest_cycle', {})
     portfolio = report.get('paper_portfolio', {})
-    print('=== CRYPTOBOT v4.0 FASE 4 | MENSELIJKE PAPERBOT ===')
+    print('=== CRYPTOBOT v4.0 FASE 5 | PAPERBOT + MELDINGENFEED ===')
     print('MODUS                 : OBSERVE-ONLY')
     print('PAPER-SIMULATIE       : AAN (ALLEEN REKENWERK)')
     print('LIVE ORDERS           : UIT / TECHNISCH ONMOGELIJK')
@@ -836,6 +998,8 @@ def print_status(report: dict[str, Any]) -> None:
             f" | voorstel €{float(alert['proposed_paper_eur']):.0f}"
         )
     print(f"DATABASE              : {int(report.get('storage', {}).get('database_bytes', 0))/1_048_576:.1f} MB")
+    print(f"MELDINGEN 24U         : {len(report.get('notifications_last_24h', []))}")
+    print('EXTERN MELDKANAAL     : NOG NIET GEKOZEN')
 
 
 def _stop(*_: object) -> None:
@@ -865,6 +1029,7 @@ def main() -> int:
         recheck_candidates(settings, api=api)
         simulate_paper_portfolio(settings, api=api)
         monitor_outcomes(settings, api=api)
+        write_notification_feed(settings)
         report = build_report(settings)
         write_report(settings, report)
         print_status(report)
@@ -889,6 +1054,7 @@ def main() -> int:
             monitor_outcomes(settings, api=api)
             next_outcome = now + settings.outcome_seconds
         if now >= next_report:
+            write_notification_feed(settings)
             write_report(settings, build_report(settings))
             next_report = now + settings.report_seconds
         time.sleep(1.0)

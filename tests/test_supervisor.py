@@ -11,11 +11,21 @@ from supervisor import (
     V36_WORKER_MAX_AGE_SECONDS,
     V37_WORKER_MAX_AGE_SECONDS,
     V39_WORKER_MAX_AGE_SECONDS,
+    V40_WORKER_MAX_AGE_SECONDS,
     _report_health_error,
+    _v40_start_allowed,
 )
 
 
 class SupervisorHealthTests(unittest.TestCase):
+    def test_v40_start_requires_enable_and_finished_v39_decision(self):
+        self.assertFalse(_v40_start_allowed({}))
+        self.assertFalse(_v40_start_allowed({'V40_ENABLED': '1'}))
+        self.assertFalse(_v40_start_allowed({'V39_FINAL_DECISION': 'AFGEROND'}))
+        self.assertTrue(_v40_start_allowed({
+            'V40_ENABLED': '1', 'V39_FINAL_DECISION': 'AFGEROND',
+        }))
+
     def test_missing_report_is_unhealthy_after_startup_grace(self):
         with tempfile.TemporaryDirectory() as tmp:
             child = Child(['python3', '-u', 'worker.py'], False, str(Path(tmp) / 'missing.json'))
@@ -199,6 +209,33 @@ class SupervisorHealthTests(unittest.TestCase):
             self.assertIn(
                 'uitkomstmeting stilgevallen', _report_health_error(child, now=now) or ''
             )
+
+    def test_v40_requires_safe_mode_and_all_worker_heartbeats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'v40.json'
+            now = 10_000.0
+            path.write_text(json.dumps({
+                'version': '4.0-phase-6',
+                'component': 'FULL_EUR_HUMAN_PAPER_V40',
+                'generated_at_ms': int((now - 10) * 1000),
+                'safety': {'execution_enabled': False, 'live_orders_possible': False},
+                'heartbeat': {
+                    key: int((now - 20) * 1000) for key in (
+                        'scan_attempted_ms', 'l2_attempted_ms', 'outcome_attempted_ms',
+                        'paper_attempted_ms', 'notification_written_ms',
+                    )
+                },
+            }))
+            child = Child(['python3', '-u', 'autonomous_v40.py'], False, str(path))
+            child.started_at = 1_000.0
+            self.assertIsNone(_report_health_error(child, now=now))
+
+            report = json.loads(path.read_text())
+            report['heartbeat']['scan_attempted_ms'] = int(
+                (now - V40_WORKER_MAX_AGE_SECONDS - 1) * 1000
+            )
+            path.write_text(json.dumps(report))
+            self.assertIn('universumscan stilgevallen', _report_health_error(child, now=now) or '')
 
 
 if __name__ == '__main__':

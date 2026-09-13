@@ -18,6 +18,7 @@ HUMAN_TRIGGER_MAX_AGE_SECONDS = 5 * 60
 V36_WORKER_MAX_AGE_SECONDS = 5 * 60
 V37_WORKER_MAX_AGE_SECONDS = 5 * 60
 V39_WORKER_MAX_AGE_SECONDS = 5 * 60
+V40_WORKER_MAX_AGE_SECONDS = 7 * 60
 
 
 @dataclass
@@ -33,6 +34,15 @@ class Child:
 
 
 CHILDREN: list[Child] = []
+
+
+def _v40_start_allowed(environ: dict[str, str] | os._Environ[str] | None = None) -> bool:
+    """V4.0 start alleen na twee bewuste, onafhankelijke Render-instellingen."""
+    values = os.environ if environ is None else environ
+    return (
+        values.get('V40_ENABLED', '0').strip() == '1'
+        and values.get('V39_FINAL_DECISION', '').strip().upper() == 'AFGEROND'
+    )
 
 
 def _stop(signum: int, frame: object) -> None:
@@ -167,6 +177,28 @@ def _report_health_error(child: Child, now: float | None = None) -> str | None:
                 return f'v3.9 {label} heeft nog geen levenssignaal'
             if attempted_age > V39_WORKER_MAX_AGE_SECONDS:
                 return f'v3.9 {label} stilgevallen: {max(0.0, attempted_age):.0f} sec'
+    if str(report.get('component', '')) == 'FULL_EUR_HUMAN_PAPER_V40':
+        safety = report.get('safety', {})
+        if not isinstance(safety, dict) or bool(safety.get('execution_enabled', True)):
+            return 'v4.0 uitvoering staat niet aantoonbaar uit'
+        if bool(safety.get('live_orders_possible', True)):
+            return 'v4.0 live-orders zijn niet aantoonbaar onmogelijk'
+        heartbeat = report.get('heartbeat', {})
+        if not isinstance(heartbeat, dict):
+            return 'v4.0 heartbeat ontbreekt'
+        for key, label in (
+            ('scan_attempted_ms', 'volledige 5m-universumscan'),
+            ('l2_attempted_ms', 'L2-meetvenster'),
+            ('outcome_attempted_ms', 'uitkomstmeting'),
+            ('paper_attempted_ms', 'PAPER-portefeuille'),
+            ('notification_written_ms', 'meldingenfeed'),
+        ):
+            attempted_ms = int(heartbeat.get(key, 0) or 0)
+            attempted_age = current - attempted_ms / 1000.0
+            if attempted_ms <= 0:
+                return f'v4.0 {label} heeft nog geen levenssignaal'
+            if attempted_age > V40_WORKER_MAX_AGE_SECONDS:
+                return f'v4.0 {label} stilgevallen: {max(0.0, attempted_age):.0f} sec'
     return None
 
 
@@ -222,6 +254,9 @@ def main() -> int:
     observer_v39_report = os.getenv('V39_REPORT_PATH') or _default_data_path(
         'cryptobot_autonomous_v39.json'
     )
+    observer_v40_report = os.getenv('V40_REPORT_PATH') or _default_data_path(
+        'cryptobot_autonomous_v40.json'
+    )
     CHILDREN = [
         Child(
             [sys.executable, '-u', 'crypto_scanner_v2.py'],
@@ -254,6 +289,17 @@ def main() -> int:
             report_path=observer_v39_report,
         ),
     ]
+    if _v40_start_allowed():
+        CHILDREN.append(Child(
+            [sys.executable, '-u', 'autonomous_v40.py'],
+            critical=False,
+            report_path=observer_v40_report,
+        ))
+    elif os.getenv('V40_ENABLED', '0').strip() == '1':
+        print(
+            '[SUPERVISOR] v4.0 geblokkeerd: V39_FINAL_DECISION moet AFGEROND zijn',
+            flush=True,
+        )
 
     for child in CHILDREN:
         _start_child(child)

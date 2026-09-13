@@ -11,6 +11,9 @@ echo "[START] v3.7 phase 1: separate database + hard gates + multi-snapshot L2 |
 echo "[START] v3.7 execution: OFF | at least 24h observation | no automatic activation"
 echo "[START] v3.8: all active EUR markets | human discovery funnel | observe only"
 echo "[START] v3.9: v3.8 score 65/top 10 -> full v3.7 jury/L2 | fixed 72h | observe only"
+echo "[START] v4.0: voorbereid | PAPER EUR 3600 | standaard UIT tot v3.9-eindbesluit"
+echo "[START] v4.0 worker: ${V40_ENABLED:-0} | v3.9 besluit: ${V39_FINAL_DECISION:-NIET_AFGEROND}"
+echo "[START] v4.0 start alleen bij V40_ENABLED=1 + V39_FINAL_DECISION=AFGEROND"
 echo "[START] Existing coins excluded; live orders technically impossible"
 echo "[START] Funding v4.1: strict 72h history + L2 costs; cross labels blocked (read only)"
 exec python3 supervisor.py
