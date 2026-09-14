@@ -2,8 +2,9 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
-from bitvavo_public import BitvavoPublic, PermanentHTTPError
+from bitvavo_public import BitvavoPublic, PermanentHTTPError, rate_limit_wait_seconds
 from config import Settings
 from models import Book, Candle, Position
 from paper_trader import PaperTrader
@@ -38,6 +39,34 @@ class FakeSession:
 
 
 class CleanRoomTests(unittest.TestCase):
+    def test_rate_limit_wait_uses_exchange_reset_timestamp(self):
+        wait = rate_limit_wait_seconds(
+            {'bitvavo-ratelimit-resetat': '13000'}, now_ms=10_000,
+        )
+        self.assertEqual(wait, 60.0)  # Kleine waarden gelden als seconden en worden begrensd.
+
+        wait = rate_limit_wait_seconds(
+            {'bitvavo-ratelimit-resetat': '1700000003000'},
+            now_ms=1_700_000_000_000,
+        )
+        self.assertAlmostEqual(wait, 3.25)
+
+    def test_rate_limit_wait_has_safe_fallback(self):
+        self.assertEqual(rate_limit_wait_seconds({}, fallback=7.0), 7.0)
+        self.assertEqual(
+            rate_limit_wait_seconds({'bitvavo-ratelimit-resetat': 'ongeldig'}), 5.0,
+        )
+
+    def test_rate_limit_response_waits_and_retries(self):
+        limited = FakeResponse({}, 429)
+        limited.headers = {'bitvavo-ratelimit-resetat': 'ongeldig'}
+        session = FakeSession([limited, FakeResponse([])])
+        api = BitvavoPublic('https://x', retries=2, session=session)
+        with patch('bitvavo_public.time.sleep') as sleeper:
+            self.assertEqual(api.trading_markets('EUR'), [])
+        sleeper.assert_called_once_with(5.0)
+        self.assertEqual(session.calls, 2)
+
     def test_market_ranking_is_dynamic(self):
         market_payload = [
             {'market':'AAA-EUR','status':'trading','quote':'EUR'},
