@@ -176,6 +176,184 @@ def proposed_position_eur(score: float, settings: V40Settings | None = None) -> 
     return 0.0
 
 
+def resolve_market_regime(
+    decisions: Sequence[dict[str, Any]],
+    *,
+    previous_regime: str = '',
+    pending_regime: str = '',
+    pending_count: int = 0,
+    confirmations: int = 2,
+) -> dict[str, Any]:
+    """Bepaal een breed marktregime en voorkom omslaan op een enkele scan."""
+    returns = [
+        _finite(item.get('features', {}).get('return_60m_pct'))
+        for item in decisions
+        if isinstance(item.get('features'), dict) and item.get('features', {}).get('valid', True)
+    ]
+    btc_item = next(
+        (item for item in decisions if str(item.get('market')).upper() == 'BTC-EUR'), None
+    )
+    btc_return = _finite(
+        btc_item.get('features', {}).get('return_60m_pct') if btc_item else None
+    )
+    breadth = sum(value > 0.0 for value in returns) / len(returns) * 100.0 if returns else 0.0
+    if len(returns) < 20 or btc_item is None:
+        raw = 'DATA_UNCERTAIN'
+    elif btc_return <= -2.0 or breadth < 35.0:
+        raw = 'BEAR'
+    elif btc_return > 0.0 and breadth >= 60.0:
+        raw = 'BULL'
+    else:
+        raw = 'SIDEWAYS'
+
+    previous = str(previous_regime).upper()
+    pending = str(pending_regime).upper()
+    stable_values = {'BULL', 'SIDEWAYS', 'BEAR', 'DATA_UNCERTAIN'}
+    if previous not in stable_values:
+        stable, visible, next_pending, next_count = raw, raw, '', 0
+    elif raw == previous:
+        stable, visible, next_pending, next_count = previous, previous, '', 0
+    else:
+        count = int(pending_count) + 1 if pending == raw else 1
+        if count >= max(1, int(confirmations)):
+            stable, visible, next_pending, next_count = raw, raw, '', 0
+        else:
+            stable, visible, next_pending, next_count = previous, 'TRANSITION', raw, count
+    return {
+        'regime': visible,
+        'stable_regime': stable,
+        'raw_regime': raw,
+        'pending_regime': next_pending,
+        'pending_count': next_count,
+        'breadth_positive_1h_pct': round(breadth, 3),
+        'btc_return_1h_pct': round(btc_return, 4),
+        'markets_used': len(returns),
+    }
+
+
+def evaluate_human_challenger(
+    decision: dict[str, Any],
+    *,
+    regime_state: dict[str, Any],
+    consecutive_losses: int = 0,
+    pause_active: bool = False,
+    daily_realized_pnl_eur: float = 0.0,
+) -> dict[str, Any]:
+    """Tweede, observationele beoordeling; wijzigt de actieve PAPER-route nooit."""
+    action = str(decision.get('action', 'AFWIJZEN'))
+    route = str(decision.get('route', 'GEEN_SETUP'))
+    score = _finite(decision.get('score'))
+    net_rr = _finite(decision.get('net_reward_risk'))
+    relative = _finite(decision.get('relative_strength_vs_btc_1h_pct'))
+    features = decision.get('features', {}) if isinstance(decision.get('features'), dict) else {}
+    volume_ratio = _finite(features.get('volume_ratio'))
+    regime = str(regime_state.get('regime', 'DATA_UNCERTAIN')).upper()
+
+    confidence = min(40.0, score * 0.40)
+    confidence += min(25.0, max(0.0, net_rr - 1.0) * 25.0)
+    confidence += min(20.0, max(0.0, relative) * 10.0)
+    confidence += min(15.0, max(0.0, volume_ratio - 0.75) * 15.0)
+    confidence = round(min(100.0, max(0.0, confidence)), 3)
+    evidence = 'STERK' if confidence >= 75.0 else 'REDELIJK' if confidence >= 60.0 else 'ZWAK'
+
+    vetoes: list[str] = []
+    uncertainty: list[str] = []
+    if pause_active:
+        vetoes.append('pauze_na_verliesreeks_of_dagverlies')
+    if regime in {'BEAR', 'DATA_UNCERTAIN', 'TRANSITION'}:
+        vetoes.append(f'marktregime_{regime.lower()}')
+    if score < 75.0:
+        uncertainty.append('score_te_dicht_bij_ondergrens')
+    if net_rr < 1.65:
+        uncertainty.append('netto_rr_te_dicht_bij_ondergrens')
+    if relative < 0.50:
+        uncertainty.append('relatieve_sterkte_nauwelijks_bevestigd')
+    if evidence == 'ZWAK':
+        vetoes.append('bewijssterkte_zwak')
+    if len(uncertainty) >= 2:
+        vetoes.append('meerdere_onzekere_randgevallen')
+
+    if action == 'KOOPKANS':
+        review_action = 'AFZIEN' if vetoes else 'PAPER_KANDIDAAT'
+    elif action == 'VOLGEN' and route != 'GEEN_SETUP':
+        review_action = 'BLIJVEN_VOLGEN'
+    else:
+        review_action = 'GEEN_ACTIE'
+    return {
+        'review_action': review_action,
+        'evidence_strength': evidence,
+        'confidence_score': confidence,
+        'regime': regime,
+        'vetoes': list(dict.fromkeys(vetoes)),
+        'uncertainty': list(dict.fromkeys(uncertainty)),
+        'performance_context': {
+            'consecutive_losses': int(consecutive_losses),
+            'pause_active': bool(pause_active),
+            'daily_realized_pnl_eur': round(float(daily_realized_pnl_eur), 2),
+        },
+        'thesis': {
+            'setup': route,
+            'why_now': 'trend_volume_relatieve_sterkte_en_kostenrand',
+            'expected_horizon_hours': float(decision.get('maximum_hold_hours', 48.0)),
+            'invalidation_price': _finite(decision.get('stop_reference')),
+            'target_reference': _finite(decision.get('target_reference')),
+        },
+        'calibrated_probability': False,
+        'active_paper_changed': False,
+        'execution_enabled': False,
+        'live_orders_possible': False,
+    }
+
+
+def evaluate_dynamic_l2_challenger(
+    snapshots: Sequence[dict[str, Any]],
+    *,
+    atr_pct: float,
+) -> dict[str, Any]:
+    """Beoordeel stabiliteit en richting van L2; uitsluitend als shadow-veto."""
+    clean: list[dict[str, float]] = []
+    for item in snapshots:
+        try:
+            spread = _finite(item['spread_pct'], 999.0)
+            imbalance = _finite(item['imbalance'], -999.0)
+            buy = _finite(item['buy_vwap'])
+        except (KeyError, TypeError):
+            continue
+        if spread >= 0.0 and buy > 0.0:
+            clean.append({'spread': spread, 'imbalance': imbalance, 'buy': buy})
+    if len(clean) < 3:
+        return {
+            'status': 'WACHTEN', 'vetoes': ['minimaal_drie_l2_metingen_nodig'],
+            'active_paper_changed': False,
+        }
+    spreads = [item['spread'] for item in clean]
+    imbalances = [item['imbalance'] for item in clean]
+    buys = [item['buy'] for item in clean]
+    drift_pct = (max(buys) / min(buys) - 1.0) * 100.0
+    dynamic_drift_limit = min(0.40, max(0.15, max(0.0, float(atr_pct)) * 0.25))
+    pressure_change = imbalances[-1] - imbalances[0]
+    vetoes: list[str] = []
+    if max(spreads) - min(spreads) > 0.10:
+        vetoes.append('l2_spread_wordt_instabiel')
+    if min(imbalances) < -0.35:
+        vetoes.append('l2_tijdelijke_verkooppiek')
+    if pressure_change < -0.30:
+        vetoes.append('l2_koopdruk_verzwakt_snel')
+    if drift_pct > dynamic_drift_limit:
+        vetoes.append('l2_prijsdrift_te_groot_voor_volatiliteit')
+    return {
+        'status': 'AFZIEN' if vetoes else 'BEVESTIGD',
+        'vetoes': vetoes,
+        'samples': len(clean),
+        'spread_range_pct': round(max(spreads) - min(spreads), 6),
+        'median_imbalance': round(float(sorted(imbalances)[len(imbalances) // 2]), 6),
+        'pressure_change': round(pressure_change, 6),
+        'buy_vwap_drift_pct': round(drift_pct, 6),
+        'dynamic_drift_limit_pct': round(dynamic_drift_limit, 6),
+        'active_paper_changed': False,
+    }
+
+
 def evaluate_entry(
     market: str,
     candles: Sequence[Candle],
