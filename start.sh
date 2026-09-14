@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-echo "[START] CryptoBot Clean-Room v3.6 + v3.7 + v3.8 + v3.9 - PAPER / READ ONLY"
+echo "[START] CryptoBot Clean-Room - actuele PAPER / READ ONLY"
 export UNIVERSE_SIZE=20
 echo "[START] Universe size: ${UNIVERSE_SIZE}"
 echo "[START] Scanner v3.5: v3.4 baseline + human 5m/L2/BTC challenger (paper only)"
@@ -14,6 +14,7 @@ echo "[START] v3.9: v3.8 score 65/top 10 -> full v3.7 jury/L2 | fixed 72h | obse
 echo "[START] v4.0: voorbereid | PAPER EUR 3600 | standaard UIT tot v3.9-eindbesluit"
 echo "[START] v4.0 worker: ${V40_ENABLED:-0} | v3.9 besluit: ${V39_FINAL_DECISION:-NIET_AFGEROND}"
 echo "[START] v4.0 start alleen bij V40_ENABLED=1 + V39_FINAL_DECISION=AFGEROND"
+echo "[START] v3.6-v3.9 legacy workers: ${LEGACY_RESEARCH_WORKERS_ENABLED:-0} (standaard uit om API-limieten te sparen)"
 echo "[START] Existing coins excluded; live orders technically impossible"
 echo "[START] Funding v4.1: strict 72h history + L2 costs; cross labels blocked (read only)"
 exec python3 supervisor.py

@@ -45,6 +45,16 @@ def _v40_start_allowed(environ: dict[str, str] | os._Environ[str] | None = None)
     )
 
 
+def _legacy_research_start_allowed(
+    environ: dict[str, str] | os._Environ[str] | None = None,
+) -> bool:
+    """Oude onderzoeksworkers alleen bewust starten; standaard sparen we API-capaciteit."""
+    values = os.environ if environ is None else environ
+    return values.get('LEGACY_RESEARCH_WORKERS_ENABLED', '0').strip().lower() in {
+        '1', 'true', 'yes', 'on',
+    }
+
+
 def _stop(signum: int, frame: object) -> None:
     global STOP
     STOP = True
@@ -268,27 +278,35 @@ def main() -> int:
             critical=False,
             report_path=funding_report,
         ),
-        Child(
-            [sys.executable, '-u', 'autonomous_v36.py'],
-            critical=False,
-            report_path=autonomous_report,
-        ),
-        Child(
-            [sys.executable, '-u', 'autonomous_v37.py'],
-            critical=False,
-            report_path=observer_v37_report,
-        ),
-        Child(
-            [sys.executable, '-u', 'autonomous_v38.py'],
-            critical=False,
-            report_path=observer_v38_report,
-        ),
-        Child(
-            [sys.executable, '-u', 'autonomous_v39.py'],
-            critical=False,
-            report_path=observer_v39_report,
-        ),
     ]
+    if _legacy_research_start_allowed():
+        CHILDREN.extend([
+            Child(
+                [sys.executable, '-u', 'autonomous_v36.py'],
+                critical=False,
+                report_path=autonomous_report,
+            ),
+            Child(
+                [sys.executable, '-u', 'autonomous_v37.py'],
+                critical=False,
+                report_path=observer_v37_report,
+            ),
+            Child(
+                [sys.executable, '-u', 'autonomous_v38.py'],
+                critical=False,
+                report_path=observer_v38_report,
+            ),
+            Child(
+                [sys.executable, '-u', 'autonomous_v39.py'],
+                critical=False,
+                report_path=observer_v39_report,
+            ),
+        ])
+    else:
+        print(
+            '[SUPERVISOR] v3.6-v3.9 onderzoeksworkers uit; broncode en data blijven bewaard',
+            flush=True,
+        )
     if _v40_start_allowed():
         CHILDREN.append(Child(
             [sys.executable, '-u', 'autonomous_v40.py'],

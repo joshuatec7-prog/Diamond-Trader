@@ -23,6 +23,22 @@ INTERVAL_MS = {
 logger = logging.getLogger(__name__)
 
 
+def rate_limit_wait_seconds(
+    headers: Dict[str, Any], *, now_ms: int | None = None, fallback: float = 5.0,
+) -> float:
+    """Wacht tot Bitvavo's opgegeven resetmoment, met een veilige bovengrens."""
+    raw = headers.get('bitvavo-ratelimit-resetat')
+    if raw is None:
+        return fallback
+    try:
+        reset = float(raw)
+        current = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        delay = (reset - current) / 1000.0 if reset > 10_000_000_000 else reset
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    return min(60.0, max(1.0, delay + 0.25))
+
+
 class PermanentHTTPError(RuntimeError):
     pass
 
@@ -45,7 +61,16 @@ class BitvavoPublic:
                 )
                 if response.status_code == 429:
                     reset_at = response.headers.get('bitvavo-ratelimit-resetat')
-                    raise RuntimeError(f'rate limit bereikt; reset={reset_at}')
+                    last_error = RuntimeError(f'rate limit bereikt; reset={reset_at}')
+                    if attempt < self.retries:
+                        wait_seconds = rate_limit_wait_seconds(response.headers)
+                        logger.warning(
+                            'Publieke Bitvavo-limiet bereikt; %.2fs wachten (%s/%s)',
+                            wait_seconds, attempt, self.retries,
+                        )
+                        time.sleep(wait_seconds)
+                        continue
+                    break
                 if 400 <= response.status_code < 500:
                     raise PermanentHTTPError(f'HTTP {response.status_code} voor {path}')
                 response.raise_for_status()

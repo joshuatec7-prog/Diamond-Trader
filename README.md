@@ -123,7 +123,7 @@ uitvoeringskostenniveau uit de volledige 72 uur. Orders blijven onmogelijk.
 - Positieomvang, maximaal aantal gelijktijdige posities en beschikbaar PAPER-geld worden afgedwongen.
 - Na een uitstap geldt per munt vier uur afkoeling om kunstmatige kostenchurn te voorkomen.
 - De status toont cash, equity, drawdown en of er genoeg trades en testdagen zijn voor beoordeling.
-- Scanner v3.5, fundingmonitor v4.1, autonome PAPER-worker v3.6 en v3.7 observe-only draaien; oudere strategieën blijven bewaard maar gestopt.
+- Scanner v3.5, fundingmonitor v4.1 en v4.0 PAPER/observe draaien. De v3.6-v3.9 onderzoeksworkers blijven als broncode en database bewaard, maar zijn standaard uit om de gezamenlijke publieke Bitvavo-API-limiet niet te belasten (`LEGACY_RESEARCH_WORKERS_ENABLED=0`).
 
 ## Strategy A — Mean Reversion
 
