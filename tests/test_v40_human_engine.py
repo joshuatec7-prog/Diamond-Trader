@@ -4,8 +4,11 @@ from models import Candle
 from v40_human_engine import (
     candle_features,
     evaluate_entry,
+    evaluate_dynamic_l2_challenger,
     evaluate_exit,
+    evaluate_human_challenger,
     proposed_position_eur,
+    resolve_market_regime,
 )
 from v40_offline_scan import scan_all_eur
 from v40_historical_lab import run_historical_lab
@@ -43,6 +46,84 @@ def candles_from_closes(closes, *, volumes=None, start_ms=0):
 class V40HumanEngineTests(unittest.TestCase):
     def btc(self):
         return candles_from_closes([100.0 + index * .02 for index in range(120)])
+
+    def test_regime_change_requires_two_confirming_scans(self):
+        bullish = [
+            {
+                'market': 'BTC-EUR' if index == 0 else f'M{index}-EUR',
+                'features': {'valid': True, 'return_60m_pct': 1.0},
+            }
+            for index in range(25)
+        ]
+        bearish = [
+            {
+                'market': 'BTC-EUR' if index == 0 else f'M{index}-EUR',
+                'features': {'valid': True, 'return_60m_pct': -2.5},
+            }
+            for index in range(25)
+        ]
+        first = resolve_market_regime(bullish)
+        transition = resolve_market_regime(bearish, previous_regime=first['stable_regime'])
+        confirmed = resolve_market_regime(
+            bearish,
+            previous_regime=transition['stable_regime'],
+            pending_regime=transition['pending_regime'],
+            pending_count=transition['pending_count'],
+        )
+        self.assertEqual(first['regime'], 'BULL')
+        self.assertEqual(transition['regime'], 'TRANSITION')
+        self.assertEqual(confirmed['regime'], 'BEAR')
+
+    def test_human_challenger_abstains_when_evidence_is_near_boundaries(self):
+        decision = {
+            'action': 'KOOPKANS', 'route': 'SWING_OPBOUW', 'score': 72.0,
+            'net_reward_risk': 1.52, 'relative_strength_vs_btc_1h_pct': .3,
+            'features': {'volume_ratio': 1.0}, 'stop_reference': 97.0,
+            'target_reference': 105.0,
+        }
+        review = evaluate_human_challenger(
+            decision, regime_state={'regime': 'SIDEWAYS'},
+        )
+        self.assertEqual(review['review_action'], 'AFZIEN')
+        self.assertIn('meerdere_onzekere_randgevallen', review['vetoes'])
+        self.assertFalse(review['active_paper_changed'])
+
+    def test_human_challenger_accepts_strong_paper_candidate(self):
+        decision = {
+            'action': 'KOOPKANS', 'route': 'VROEG_MOMENTUM', 'score': 92.0,
+            'net_reward_risk': 2.1, 'relative_strength_vs_btc_1h_pct': 2.0,
+            'features': {'volume_ratio': 1.8}, 'stop_reference': 97.0,
+            'target_reference': 110.0,
+        }
+        review = evaluate_human_challenger(
+            decision, regime_state={'regime': 'BULL'},
+        )
+        self.assertEqual(review['review_action'], 'PAPER_KANDIDAAT')
+        self.assertEqual(review['evidence_strength'], 'STERK')
+        self.assertEqual(review['vetoes'], [])
+
+    def test_human_challenger_pauses_after_loss_streak(self):
+        decision = {
+            'action': 'KOOPKANS', 'route': 'VROEG_MOMENTUM', 'score': 95.0,
+            'net_reward_risk': 2.2, 'relative_strength_vs_btc_1h_pct': 2.5,
+            'features': {'volume_ratio': 2.0},
+        }
+        review = evaluate_human_challenger(
+            decision, regime_state={'regime': 'BULL'},
+            consecutive_losses=3, pause_active=True, daily_realized_pnl_eur=-30.0,
+        )
+        self.assertEqual(review['review_action'], 'AFZIEN')
+        self.assertIn('pauze_na_verliesreeks_of_dagverlies', review['vetoes'])
+
+    def test_dynamic_l2_challenger_detects_fading_buy_pressure(self):
+        review = evaluate_dynamic_l2_challenger([
+            {'spread_pct': .05, 'imbalance': .40, 'buy_vwap': 100.00},
+            {'spread_pct': .06, 'imbalance': .10, 'buy_vwap': 100.05},
+            {'spread_pct': .08, 'imbalance': -.05, 'buy_vwap': 100.10},
+        ], atr_pct=1.0)
+        self.assertEqual(review['status'], 'AFZIEN')
+        self.assertIn('l2_koopdruk_verzwakt_snel', review['vetoes'])
+        self.assertFalse(review['active_paper_changed'])
 
     def test_requires_closed_history(self):
         result = candle_features(candles_from_closes([100.0] * 59))
