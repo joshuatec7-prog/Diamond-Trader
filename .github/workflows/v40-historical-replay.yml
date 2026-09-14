@@ -12,6 +12,9 @@ on:
       - clean-room-20260826
     paths:
       - .github/workflows/v40-historical-replay.yml
+      - v40_historical_lab.py
+      - v40_replay.py
+      - v40_human_engine.py
 
 jobs:
   replay:
