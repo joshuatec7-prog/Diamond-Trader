@@ -73,6 +73,24 @@ class AutonomousV40Tests(unittest.TestCase):
             self.assertEqual(meta['live_orders_possible'], '0')
             self.assertEqual(meta['existing_assets_excluded'], '1')
 
+    def test_human_challenger_is_persisted_but_does_not_block_active_paper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self.settings(Path(temporary))
+            v40.ensure_runtime(settings, NOW_MS)
+            stored = v40.ingest_scan(settings, buy_scan(), now_ms=NOW_MS)
+            self.assertEqual(stored['queued_l2'], 1)
+            with sqlite3.connect(settings.db_path) as conn:
+                review = conn.execute(
+                    'SELECT review_action,active_paper_changed FROM v40_human_reviews'
+                ).fetchone()
+            self.assertIsNotNone(review)
+            self.assertEqual(review[1], 0)
+            report = v40.build_report(settings, NOW_MS)
+            self.assertFalse(report['human_challenger']['applied_to_paper_entries'])
+            self.assertFalse(report['human_challenger']['active_bot_changed'])
+            self.assertEqual(report['prospective_readiness']['decision'], 'VERZAMELEN')
+            self.assertFalse(report['prospective_readiness']['live_discussion_allowed'])
+
     def test_candidate_needs_three_l2_samples_over_one_minute(self):
         with tempfile.TemporaryDirectory() as temporary:
             settings = self.settings(Path(temporary))
