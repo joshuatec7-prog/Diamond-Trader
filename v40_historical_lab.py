@@ -12,6 +12,7 @@ from v40_replay import (
     DAY_MS,
     audit_large_moves,
     build_runner_validation,
+    build_capacity_validation,
     replay_market,
     simulate_broad_runner_trade,
     simulate_signal_trade,
@@ -141,6 +142,7 @@ def run_historical_lab(
         'signal_summary': summary,
         'paper_trade_summary': paper_summary,
         'runner_validation': build_runner_validation(paper_trades, runner_trades),
+        'capacity_validation': build_capacity_validation(paper_trades),
         'large_move_audit': large_move_summary,
         'control_cases': controls,
         'notes': [
@@ -161,6 +163,7 @@ def print_status(report: dict[str, Any]) -> None:
     paper = report['paper_trade_summary']
     moves = report['large_move_audit']
     runner = report['runner_validation']
+    capacity = report['capacity_validation']
     print('=== CRYPTOBOT v4.0 FASE 2 | BREDE HISTORISCHE REPLAY ===')
     print('UITVOERING             : UIT / TECHNISCH ONMOGELIJK')
     print(f"PERIODE                : {report['period']['days']} dagen + 1 dag opwarming")
@@ -181,6 +184,13 @@ def print_status(report: dict[str, Any]) -> None:
         f" | verschil €{without_lsk['runner_minus_baseline_eur']:.2f}"
     )
     print(f"RUNNERBESLUIT          : {runner['decision']}")
+    constrained = capacity['without_lsk']
+    print(
+        f"MENSELIJKE PORTEFEUILLE: {constrained['trades_accepted']} genomen"
+        f" | {constrained['trades_rejected']} afgewezen"
+        f" | totaal €{constrained['total_result_eur']:.2f}"
+    )
+    print(f"PORTEFEUILLEBESLUIT    : {capacity['decision']}")
     for market, control in report['control_cases'].items():
         print(
             f"{market:<22}: {len(control['signals'])} signalen"

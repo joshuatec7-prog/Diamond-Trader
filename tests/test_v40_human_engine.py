@@ -16,6 +16,8 @@ from v40_replay import (
     SIGNAL_COOLDOWN_MS,
     audit_large_moves,
     build_runner_validation,
+    build_capacity_validation,
+    simulate_capacity_limited_portfolio,
     forward_outcomes,
     rolling_quote_volume,
     rolling_quote_volume_series,
@@ -396,3 +398,40 @@ class V40HumanEngineTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class V40CapacityPortfolioTests(unittest.TestCase):
+    def trade(self, market, signal_ms, *, result, close_ms, score=80.0):
+        notional = 1000.0
+        return {
+            'market': market, 'signal_ms': signal_ms, 'score': score,
+            'position_eur': notional, 'status': 'GESLOTEN',
+            'realized_proceeds_eur': notional + result, 'open_value_eur': 0.0,
+            'result_eur': result,
+            'events': [
+                {'event_ms': signal_ms, 'action': 'KOPEN'},
+                {'event_ms': close_ms, 'action': 'VERKOPEN'},
+            ],
+        }
+
+    def test_capacity_blocks_duplicate_and_over_deployment(self):
+        report = simulate_capacity_limited_portfolio([
+            self.trade('AAA-EUR', 0, result=100.0, close_ms=10),
+            self.trade('BBB-EUR', 1, result=-50.0, close_ms=20),
+            self.trade('AAA-EUR', 2, result=20.0, close_ms=30),
+            self.trade('CCC-EUR', 3, result=20.0, close_ms=30),
+        ])
+        self.assertEqual(report['trades_accepted'], 2)
+        self.assertEqual(report['trades_rejected'], 2)
+        self.assertEqual(report['rejection_counts']['dubbele_munt'], 1)
+        self.assertEqual(report['rejection_counts']['maximale_inzet_2500'], 1)
+        self.assertEqual(report['portfolio_limits']['reserve_eur'], 200.0)
+        self.assertEqual(report['portfolio_limits']['maximum_open_positions'], 5)
+
+    def test_capacity_validation_is_observe_only(self):
+        report = build_capacity_validation([
+            self.trade('AAA-EUR', 0, result=10.0, close_ms=1),
+        ])
+        self.assertFalse(report['execution_enabled'])
+        self.assertFalse(report['live_orders_possible'])
+        self.assertFalse(report['active_paper_changed'])

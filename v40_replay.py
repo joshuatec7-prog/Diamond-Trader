@@ -456,6 +456,166 @@ def build_runner_validation(
     }
 
 
+
+# Deze comparator is uitsluitend voor historische beoordeling. Hij bepaalt welke
+# signalen een menselijk beperkte PAPER-portefeuille daadwerkelijk had kunnen nemen.
+CAPACITY_STARTING_CAPITAL_EUR = 3600.0
+CAPACITY_RESERVE_EUR = 200.0
+CAPACITY_MAX_OPEN_POSITIONS = 5
+CAPACITY_MAX_DEPLOYED_EUR = 2500.0
+
+
+def simulate_capacity_limited_portfolio(
+    trades: Sequence[dict[str, Any]],
+    *,
+    starting_capital_eur: float = CAPACITY_STARTING_CAPITAL_EUR,
+    reserve_eur: float = CAPACITY_RESERVE_EUR,
+    maximum_open_positions: int = CAPACITY_MAX_OPEN_POSITIONS,
+    maximum_deployed_eur: float = CAPACITY_MAX_DEPLOYED_EUR,
+) -> dict[str, Any]:
+    """Speel signaaltrades af als één begrensde portefeuille, zonder voorkennis."""
+    if starting_capital_eur <= reserve_eur:
+        raise ValueError('startkapitaal moet groter zijn dan de reserve')
+    if maximum_open_positions < 1 or maximum_deployed_eur <= 0.0:
+        raise ValueError('portefeuillegrenzen zijn ongeldig')
+
+    ordered = sorted(
+        trades,
+        key=lambda item: (
+            int(item.get('signal_ms', 0)),
+            -float(item.get('score', 0.0)),
+            str(item.get('market', '')),
+        ),
+    )
+    cash = float(starting_capital_eur)
+    deployed = 0.0
+    realized_pnl = 0.0
+    peak_realized_pnl = 0.0
+    maximum_realized_drawdown = 0.0
+    accepted: list[dict[str, Any]] = []
+    rejections: Counter[str] = Counter()
+    open_positions: list[dict[str, Any]] = []
+
+    def close_due(until_ms: int) -> None:
+        nonlocal cash, deployed, realized_pnl, peak_realized_pnl, maximum_realized_drawdown
+        due = sorted(
+            (position for position in open_positions if position['close_ms'] <= until_ms),
+            key=lambda position: (position['close_ms'], position['market']),
+        )
+        for position in due:
+            open_positions.remove(position)
+            cash += position['final_value_eur']
+            deployed -= position['notional_eur']
+            pnl = position['final_value_eur'] - position['notional_eur']
+            realized_pnl += pnl
+            peak_realized_pnl = max(peak_realized_pnl, realized_pnl)
+            maximum_realized_drawdown = max(
+                maximum_realized_drawdown, peak_realized_pnl - realized_pnl,
+            )
+
+    for trade in ordered:
+        signal_ms = int(trade.get('signal_ms', 0))
+        close_due(signal_ms)
+        market = str(trade.get('market', ''))
+        notional = float(trade.get('position_eur', 0.0))
+        if not market or notional <= 0.0:
+            rejections['ongeldig_signaal'] += 1
+            continue
+        if any(position['market'] == market for position in open_positions):
+            rejections['dubbele_munt'] += 1
+            continue
+        if len(open_positions) >= maximum_open_positions:
+            rejections['maximaal_vijf_posities'] += 1
+            continue
+        if deployed + notional > maximum_deployed_eur + 1e-9:
+            rejections['maximale_inzet_2500'] += 1
+            continue
+        if cash - notional < reserve_eur - 1e-9:
+            rejections['reserve_200'] += 1
+            continue
+
+        events = trade.get('events', [])
+        closed = str(trade.get('status', '')).upper() == 'GESLOTEN' and len(events) > 1
+        close_ms = int(events[-1].get('event_ms', signal_ms)) if closed else math.inf
+        final_value = float(trade.get('realized_proceeds_eur', 0.0))
+        if not closed:
+            final_value += float(trade.get('open_value_eur', 0.0))
+        cash -= notional
+        deployed += notional
+        open_positions.append({
+            'market': market,
+            'close_ms': close_ms,
+            'notional_eur': notional,
+            'final_value_eur': final_value,
+        })
+        accepted.append({
+            'market': market,
+            'signal_ms': signal_ms,
+            'score': round(float(trade.get('score', 0.0)), 3),
+            'position_eur': round(notional, 2),
+            'status': 'GESLOTEN' if closed else 'OPEN_EINDE_PERIODE',
+        })
+
+    open_value = sum(position['final_value_eur'] for position in open_positions)
+    equity = cash + open_value
+    total_result = equity - starting_capital_eur
+    selected_without_lsk = [item for item in accepted if item['market'] != 'LSK-EUR']
+    # Uitkomst per LSK-vrije selectie wordt apart opnieuw gesimuleerd door de aanroeper.
+    return {
+        'mode': 'OFFLINE_REPLAY_ONLY',
+        'execution_enabled': False,
+        'live_orders_possible': False,
+        'portfolio_limits': {
+            'starting_capital_eur': starting_capital_eur,
+            'reserve_eur': reserve_eur,
+            'maximum_open_positions': maximum_open_positions,
+            'maximum_deployed_eur': maximum_deployed_eur,
+            'duplicate_market_allowed': False,
+        },
+        'trades_considered': len(ordered),
+        'trades_accepted': len(accepted),
+        'trades_rejected': sum(rejections.values()),
+        'rejection_counts': dict(rejections),
+        'accepted_trades': accepted,
+        'open_at_period_end': len(open_positions),
+        'ending_cash_eur': round(cash, 8),
+        'ending_open_value_eur': round(open_value, 8),
+        'ending_equity_eur': round(equity, 8),
+        'total_result_eur': round(total_result, 8),
+        'maximum_realized_drawdown_eur': round(maximum_realized_drawdown, 8),
+        'selected_without_lsk_count': len(selected_without_lsk),
+        'future_data_used_for_entry': False,
+    }
+
+
+def build_capacity_validation(trades: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Vergelijk dezelfde signalen met echte menselijke portefeuillegrenzen."""
+    all_markets = simulate_capacity_limited_portfolio(trades)
+    without_lsk = simulate_capacity_limited_portfolio(
+        [trade for trade in trades if str(trade.get('market')) != 'LSK-EUR']
+    )
+    enough = without_lsk['trades_accepted'] >= RUNNER_MINIMUM_TRADES
+    positive = without_lsk['total_result_eur'] > 0.0
+    controlled = without_lsk['maximum_realized_drawdown_eur'] <= RUNNER_MAX_DRAWDOWN_EUR
+    return {
+        'all_markets': all_markets,
+        'without_lsk': without_lsk,
+        'criteria': {
+            'minimum_accepted_trades': RUNNER_MINIMUM_TRADES,
+            'enough_accepted_trades_without_lsk': enough,
+            'positive_result_without_lsk': positive,
+            'drawdown_within_360_eur_without_lsk': controlled,
+        },
+        'decision': (
+            'KANDIDAAT_VOOR_APARTE_PAPER_CHALLENGER'
+            if enough and positive and controlled else 'AFWIJZEN'
+        ),
+        'active_paper_changed': False,
+        'execution_enabled': False,
+        'live_orders_possible': False,
+    }
+
+
 def audit_large_moves(
     market: str,
     candles: Sequence[Candle],
