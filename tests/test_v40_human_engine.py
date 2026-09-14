@@ -14,10 +14,13 @@ from v40_offline_scan import scan_all_eur
 from v40_historical_lab import run_historical_lab
 from v40_replay import (
     SIGNAL_COOLDOWN_MS,
+    TOURNAMENT_POLICIES,
     audit_large_moves,
     build_runner_validation,
     build_capacity_validation,
     build_capacity_diagnostics,
+    apply_tournament_policy,
+    build_tournament_challenger,
     simulate_capacity_limited_portfolio,
     forward_outcomes,
     rolling_quote_volume,
@@ -462,3 +465,44 @@ class V40CapacityDiagnosticTests(unittest.TestCase):
         self.assertEqual(report['by_route']['VROEG_MOMENTUM']['total_result_eur'], 12.0)
         self.assertFalse(report['active_paper_changed'])
         self.assertFalse(report['live_orders_possible'])
+
+
+class V40TournamentTests(unittest.TestCase):
+    def candidate(self, market, signal_ms, score, result=10.0):
+        return {
+            'market': market, 'signal_ms': signal_ms, 'score': score,
+            'route': 'VROEG_MOMENTUM', 'position_eur': 500.0,
+            'relative_strength_vs_btc_1h_pct': 2.0,
+            'net_reward_risk': 2.1,
+            'entry_features': {
+                'volume_ratio': 2.0, 'return_15m_pct': 1.0, 'return_60m_pct': 3.0,
+            },
+            'btc_return_1h_pct': .5,
+            'status': 'GESLOTEN', 'realized_proceeds_eur': 500.0 + result,
+            'open_value_eur': 0.0, 'result_eur': result,
+            'events': [
+                {'event_ms': signal_ms, 'action': 'KOPEN'},
+                {'event_ms': signal_ms + 300_000, 'action': 'VERKOPEN'},
+            ],
+        }
+
+    def test_tournament_selects_single_best_simultaneous_candidate(self):
+        policy = dict(TOURNAMENT_POLICIES[0])
+        result = apply_tournament_policy([
+            self.candidate('AAA-EUR', 0, 82.0),
+            self.candidate('VTHO-EUR', 0, 91.0),
+        ], policy)
+        self.assertEqual(result['tournament_selected'], 1)
+        self.assertEqual(result['selected_trades'][0]['market'], 'VTHO-EUR')
+        self.assertEqual(result['vtho_audit']['selected'], 1)
+        self.assertFalse(result['future_data_used_for_selection'])
+
+    def test_tournament_challenger_never_activates_execution(self):
+        trades = [
+            self.candidate(f'M{index}-EUR', index * DAY_MS, 91.0)
+            for index in range(90)
+        ]
+        result = build_tournament_challenger(trades)
+        self.assertFalse(result['execution_enabled'])
+        self.assertFalse(result['live_orders_possible'])
+        self.assertFalse(result['active_paper_changed'])

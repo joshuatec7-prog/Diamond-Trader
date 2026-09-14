@@ -752,6 +752,301 @@ def build_capacity_validation(trades: Sequence[dict[str, Any]]) -> dict[str, Any
     }
 
 
+
+TOURNAMENT_POLICIES = (
+    {
+        'name': 'BREED_SELECTIEF',
+        'minimum_score': 80.0,
+        'minimum_relative_strength_pct': 0.50,
+        'minimum_volume_ratio': 1.30,
+        'minimum_net_reward_risk': 1.65,
+        'maximum_new_trades_per_day': 2,
+        'routes': ('VROEG_MOMENTUM', 'SWING_OPBOUW', 'PULLBACK_HERVATTING'),
+    },
+    {
+        'name': 'KWALITEIT',
+        'minimum_score': 85.0,
+        'minimum_relative_strength_pct': 1.00,
+        'minimum_volume_ratio': 1.50,
+        'minimum_net_reward_risk': 1.80,
+        'maximum_new_trades_per_day': 2,
+        'routes': ('VROEG_MOMENTUM', 'SWING_OPBOUW', 'PULLBACK_HERVATTING'),
+    },
+    {
+        'name': 'UITZONDERLIJK',
+        'minimum_score': 90.0,
+        'minimum_relative_strength_pct': 1.50,
+        'minimum_volume_ratio': 2.00,
+        'minimum_net_reward_risk': 2.00,
+        'maximum_new_trades_per_day': 1,
+        'routes': ('VROEG_MOMENTUM', 'SWING_OPBOUW', 'PULLBACK_HERVATTING'),
+    },
+    {
+        'name': 'PULLBACK_FOCUS',
+        'minimum_score': 80.0,
+        'minimum_relative_strength_pct': 0.50,
+        'minimum_volume_ratio': 1.00,
+        'minimum_net_reward_risk': 1.65,
+        'maximum_new_trades_per_day': 2,
+        'routes': ('PULLBACK_HERVATTING',),
+    },
+    {
+        'name': 'OPBOUW_ZONDER_PUMP',
+        'minimum_score': 85.0,
+        'minimum_relative_strength_pct': 1.00,
+        'minimum_volume_ratio': 1.50,
+        'minimum_net_reward_risk': 1.80,
+        'maximum_new_trades_per_day': 2,
+        'routes': ('SWING_OPBOUW', 'PULLBACK_HERVATTING'),
+    },
+    {
+        'name': 'MOMENTUM_ZEER_STRENG',
+        'minimum_score': 90.0,
+        'minimum_relative_strength_pct': 2.00,
+        'minimum_volume_ratio': 2.50,
+        'minimum_net_reward_risk': 2.00,
+        'maximum_new_trades_per_day': 1,
+        'routes': ('VROEG_MOMENTUM',),
+    },
+)
+
+
+def _tournament_reasons(trade: dict[str, Any], policy: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    features = trade.get('entry_features', {})
+    score = float(trade.get('score', 0.0))
+    relative = trade.get('relative_strength_vs_btc_1h_pct')
+    volume = features.get('volume_ratio') if isinstance(features, dict) else None
+    net_rr = trade.get('net_reward_risk')
+    btc_return = trade.get('btc_return_1h_pct')
+    route = str(trade.get('route', 'ONBEKEND'))
+    if route not in policy['routes']:
+        reasons.append('route_niet_toegestaan')
+    if score < float(policy['minimum_score']):
+        reasons.append('score_te_laag')
+    if relative is None or float(relative) < float(policy['minimum_relative_strength_pct']):
+        reasons.append('relatieve_sterkte_te_laag')
+    if volume is None or float(volume) < float(policy['minimum_volume_ratio']):
+        reasons.append('volume_te_laag')
+    if net_rr is None or float(net_rr) < float(policy['minimum_net_reward_risk']):
+        reasons.append('netto_rr_te_laag')
+    if btc_return is None:
+        reasons.append('bitcoin_context_ontbreekt')
+    elif float(btc_return) <= -2.0:
+        reasons.append('bitcoin_marktschok')
+    return reasons
+
+
+def _tournament_rank(trade: dict[str, Any]) -> float:
+    """Rangschik uitsluitend informatie die op het instapmoment bekend was."""
+    features = trade.get('entry_features', {})
+    score = float(trade.get('score', 0.0))
+    relative = max(0.0, min(5.0, float(trade.get('relative_strength_vs_btc_1h_pct') or 0.0)))
+    volume = max(0.0, min(4.0, float(features.get('volume_ratio') or 0.0)))
+    net_rr = max(0.0, min(3.0, float(trade.get('net_reward_risk') or 0.0)))
+    m15 = float(features.get('return_15m_pct') or 0.0)
+    m60 = float(features.get('return_60m_pct') or 0.0)
+    extension_penalty = max(0.0, m15 - 2.0) * 5.0 + max(0.0, m60 - 8.0) * 3.0
+    return round(score + relative * 4.0 + volume * 3.0 + net_rr * 5.0 - extension_penalty, 6)
+
+
+def apply_tournament_policy(
+    trades: Sequence[dict[str, Any]],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    """Kies chronologisch één opvallende winnaar; kijkt nooit vooruit."""
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for trade in trades:
+        grouped.setdefault(int(trade.get('signal_ms', 0)), []).append(trade)
+    selected: list[dict[str, Any]] = []
+    daily_entries: Counter[int] = Counter()
+    vetoes: Counter[str] = Counter()
+    vtho_seen = 0
+    vtho_eligible = 0
+    vtho_selected = 0
+    vtho_vetoes: Counter[str] = Counter()
+    vtho_lost_to: Counter[str] = Counter()
+
+    for signal_ms, candidates in sorted(grouped.items()):
+        eligible: list[dict[str, Any]] = []
+        for trade in candidates:
+            market = str(trade.get('market', ''))
+            if market == 'LSK-EUR':
+                continue
+            if market == 'VTHO-EUR':
+                vtho_seen += 1
+            reasons = _tournament_reasons(trade, policy)
+            if reasons:
+                for reason in reasons:
+                    vetoes[reason] += 1
+                    if market == 'VTHO-EUR':
+                        vtho_vetoes[reason] += 1
+                continue
+            eligible.append(trade)
+            if market == 'VTHO-EUR':
+                vtho_eligible += 1
+        if not eligible:
+            continue
+
+        utc_day = signal_ms // DAY_MS
+        if daily_entries[utc_day] >= int(policy['maximum_new_trades_per_day']):
+            vetoes['daglimiet_bereikt'] += len(eligible)
+            for trade in eligible:
+                if str(trade.get('market')) == 'VTHO-EUR':
+                    vtho_vetoes['daglimiet_bereikt'] += 1
+            continue
+
+        ranked = sorted(
+            eligible,
+            key=lambda trade: (
+                -_tournament_rank(trade),
+                -float(trade.get('score', 0.0)),
+                str(trade.get('market', '')),
+            ),
+        )
+        winner = dict(ranked[0])
+        winner['tournament_score'] = _tournament_rank(winner)
+        selected.append(winner)
+        daily_entries[utc_day] += 1
+        if str(winner.get('market')) == 'VTHO-EUR':
+            vtho_selected += 1
+        elif any(str(trade.get('market')) == 'VTHO-EUR' for trade in eligible):
+            vtho_lost_to[str(winner.get('market', 'ONBEKEND'))] += 1
+
+    return {
+        'selected_trades': selected,
+        'candidate_trades': len(trades),
+        'tournament_selected': len(selected),
+        'veto_counts': dict(vetoes),
+        'vtho_audit': {
+            'candidates': vtho_seen,
+            'eligible': vtho_eligible,
+            'selected': vtho_selected,
+            'veto_counts': dict(vtho_vetoes),
+            'lost_to_markets': dict(vtho_lost_to.most_common(15)),
+        },
+        'future_data_used_for_selection': False,
+    }
+
+
+def _evaluate_tournament_period(
+    trades: Sequence[dict[str, Any]],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    tournament = apply_tournament_policy(trades, policy)
+    portfolio = simulate_capacity_limited_portfolio(tournament['selected_trades'])
+    performance = _diagnostic_trade_summary(portfolio['accepted_trades'])
+    return {
+        'signals_considered': len(trades),
+        'tournament_selected': tournament['tournament_selected'],
+        'portfolio_accepted': portfolio['trades_accepted'],
+        'portfolio_rejected': portfolio['trades_rejected'],
+        'performance': performance,
+        'maximum_realized_drawdown_eur': portfolio['maximum_realized_drawdown_eur'],
+        'veto_counts': tournament['veto_counts'],
+        'vtho_audit': tournament['vtho_audit'],
+    }
+
+
+def build_tournament_challenger(trades: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Ontwikkel 60d, valideer 15d en beslis op een onaangeraakte laatste 15d."""
+    clean = sorted(
+        (
+            trade for trade in trades
+            if str(trade.get('market')) != 'LSK-EUR'
+        ),
+        key=lambda trade: (int(trade.get('signal_ms', 0)), str(trade.get('market', ''))),
+    )
+    if not clean:
+        return {
+            'decision': 'ONVOLDOENDE_DATA',
+            'active_paper_changed': False,
+            'execution_enabled': False,
+            'live_orders_possible': False,
+        }
+    period_end = max(int(trade.get('signal_ms', 0)) for trade in clean) + 1
+    test_start = period_end - 15 * DAY_MS
+    validation_start = test_start - 15 * DAY_MS
+    periods = {
+        'development': [trade for trade in clean if int(trade.get('signal_ms', 0)) < validation_start],
+        'validation': [
+            trade for trade in clean
+            if validation_start <= int(trade.get('signal_ms', 0)) < test_start
+        ],
+        'untouched_test': [
+            trade for trade in clean if int(trade.get('signal_ms', 0)) >= test_start
+        ],
+    }
+
+    development_results = []
+    for policy in TOURNAMENT_POLICIES:
+        result = _evaluate_tournament_period(periods['development'], policy)
+        development_results.append({'policy': policy, 'result': result})
+    eligible = [
+        item for item in development_results
+        if item['result']['portfolio_accepted'] >= 20
+        and item['result']['performance']['total_result_eur'] > 0.0
+        and (item['result']['performance']['profit_factor'] or 0.0) > 1.0
+    ]
+    pool = eligible or development_results
+    chosen = max(
+        pool,
+        key=lambda item: (
+            float(item['result']['performance']['total_result_eur']),
+            float(item['result']['performance']['profit_factor'] or 0.0),
+        ),
+    )
+    locked_policy = chosen['policy']
+    validation = _evaluate_tournament_period(periods['validation'], locked_policy)
+    untouched = _evaluate_tournament_period(periods['untouched_test'], locked_policy)
+    full = _evaluate_tournament_period(clean, locked_policy)
+
+    criteria = {
+        'development_positive': chosen['result']['performance']['total_result_eur'] > 0.0,
+        'development_pf_above_1_10': (
+            chosen['result']['performance']['profit_factor'] or 0.0
+        ) > 1.10,
+        'validation_positive': validation['performance']['total_result_eur'] > 0.0,
+        'untouched_test_positive': untouched['performance']['total_result_eur'] > 0.0,
+        'full_minimum_50_trades': full['portfolio_accepted'] >= 50,
+        'full_positive': full['performance']['total_result_eur'] > 0.0,
+        'full_pf_above_1_20': (full['performance']['profit_factor'] or 0.0) > 1.20,
+        'full_drawdown_within_360_eur': full['maximum_realized_drawdown_eur'] <= 360.0,
+    }
+    candidate = all(criteria.values())
+    return {
+        'method': 'CHRONOLOGISCH_KEUZETOERNOOI',
+        'period_boundaries_ms': {
+            'validation_start': validation_start,
+            'untouched_test_start': test_start,
+            'period_end': period_end,
+        },
+        'policies_compared_on_development_only': [
+            {
+                'name': item['policy']['name'],
+                'accepted': item['result']['portfolio_accepted'],
+                'total_result_eur': item['result']['performance']['total_result_eur'],
+                'profit_factor': item['result']['performance']['profit_factor'],
+            }
+            for item in development_results
+        ],
+        'development_had_eligible_policy': bool(eligible),
+        'locked_policy': locked_policy,
+        'development': chosen['result'],
+        'validation': validation,
+        'untouched_test': untouched,
+        'full_period': full,
+        'criteria': criteria,
+        'decision': (
+            'KANDIDAAT_VOOR_APARTE_PAPER_CHALLENGER' if candidate else 'AFWIJZEN'
+        ),
+        'active_paper_changed': False,
+        'execution_enabled': False,
+        'live_orders_possible': False,
+        'future_data_used_for_selection': False,
+    }
+
+
 def audit_large_moves(
     market: str,
     candles: Sequence[Candle],

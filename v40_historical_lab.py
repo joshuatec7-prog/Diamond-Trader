@@ -14,6 +14,7 @@ from v40_replay import (
     build_runner_validation,
     build_capacity_validation,
     build_capacity_diagnostics,
+    build_tournament_challenger,
     replay_market,
     simulate_broad_runner_trade,
     simulate_signal_trade,
@@ -124,6 +125,7 @@ def run_historical_lab(
     }
     capacity_validation = build_capacity_validation(paper_trades)
     capacity_diagnostics = build_capacity_diagnostics(capacity_validation)
+    tournament_challenger = build_tournament_challenger(paper_trades)
     report = {
         'version': '4.0-phase-6',
         'component': 'FULL_EUR_HISTORICAL_REPLAY',
@@ -147,6 +149,7 @@ def run_historical_lab(
         'runner_validation': build_runner_validation(paper_trades, runner_trades),
         'capacity_validation': capacity_validation,
         'capacity_diagnostics': capacity_diagnostics,
+        'tournament_challenger': tournament_challenger,
         'large_move_audit': large_move_summary,
         'control_cases': controls,
         'notes': [
@@ -169,6 +172,7 @@ def print_status(report: dict[str, Any]) -> None:
     runner = report['runner_validation']
     capacity = report['capacity_validation']
     diagnostics = report['capacity_diagnostics']
+    tournament = report['tournament_challenger']
     print('=== CRYPTOBOT v4.0 FASE 2 | BREDE HISTORISCHE REPLAY ===')
     print('UITVOERING             : UIT / TECHNISCH ONMOGELIJK')
     print(f"PERIODE                : {report['period']['days']} dagen + 1 dag opwarming")
@@ -210,6 +214,22 @@ def print_status(report: dict[str, Any]) -> None:
             f" | €{chosen['total_result_eur']:.2f}"
             f" | afgewezen {sum(item['rejection_counts'].values())}"
         )
+    print('--- KEUZETOERNOOI | 60D + 15D + 15D ---')
+    print(f"VAST BELEID            : {tournament.get('locked_policy', {}).get('name', 'GEEN')}")
+    for label in ('development', 'validation', 'untouched_test', 'full_period'):
+        item = tournament.get(label, {})
+        performance = item.get('performance', {})
+        print(
+            f"{label.upper():<23}: {item.get('portfolio_accepted', 0)} trades"
+            f" | €{float(performance.get('total_result_eur', 0.0)):.2f}"
+            f" | PF {performance.get('profit_factor')}"
+        )
+    vtho = tournament.get('full_period', {}).get('vtho_audit', {})
+    print(
+        f"VTHO TOERNOOI          : {vtho.get('candidates', 0)} kandidaten"
+        f" | {vtho.get('eligible', 0)} geldig | {vtho.get('selected', 0)} gekozen"
+    )
+    print(f"TOERNOOIBESLUIT        : {tournament['decision']}")
     for market, control in report['control_cases'].items():
         print(
             f"{market:<22}: {len(control['signals'])} signalen"
