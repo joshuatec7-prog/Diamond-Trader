@@ -126,6 +126,16 @@ def replay_market(
             'entry_reference': candle.close,
             'route': decision['route'],
             'score': decision['score'],
+            'relative_strength_vs_btc_1h_pct': decision.get('relative_strength_vs_btc_1h_pct'),
+            'net_reward_risk': decision.get('net_reward_risk'),
+            'entry_features': {
+                key: decision.get('features', {}).get(key)
+                for key in (
+                    'return_15m_pct', 'return_60m_pct', 'return_4h_pct',
+                    'atr_pct', 'volume_ratio', 'trend_up',
+                )
+            },
+            'btc_return_1h_pct': decision.get('bitcoin_features', {}).get('return_60m_pct'),
             'proposed_paper_eur': decision['proposed_paper_eur'],
             'stop_reference': decision['stop_reference'],
             'target_reference': decision['target_reference'],
@@ -221,6 +231,10 @@ def simulate_signal_trade(
         'signal_ms': signal_ms,
         'route': str(signal.get('route', '')),
         'score': float(signal.get('score', 0.0)),
+        'relative_strength_vs_btc_1h_pct': signal.get('relative_strength_vs_btc_1h_pct'),
+        'net_reward_risk': signal.get('net_reward_risk'),
+        'entry_features': signal.get('entry_features', {}),
+        'btc_return_1h_pct': signal.get('btc_return_1h_pct'),
         'position_eur': notional,
         'entry_price': entry,
         'initial_base': initial_base,
@@ -494,7 +508,12 @@ def simulate_capacity_limited_portfolio(
     maximum_realized_drawdown = 0.0
     accepted: list[dict[str, Any]] = []
     rejections: Counter[str] = Counter()
+    rejections_by_market: dict[str, Counter[str]] = {}
     open_positions: list[dict[str, Any]] = []
+
+    def record_rejection(market: str, reason: str) -> None:
+        rejections[reason] += 1
+        rejections_by_market.setdefault(market or 'ONBEKEND', Counter())[reason] += 1
 
     def close_due(until_ms: int) -> None:
         nonlocal cash, deployed, realized_pnl, peak_realized_pnl, maximum_realized_drawdown
@@ -519,19 +538,19 @@ def simulate_capacity_limited_portfolio(
         market = str(trade.get('market', ''))
         notional = float(trade.get('position_eur', 0.0))
         if not market or notional <= 0.0:
-            rejections['ongeldig_signaal'] += 1
+            record_rejection(market, 'ongeldig_signaal')
             continue
         if any(position['market'] == market for position in open_positions):
-            rejections['dubbele_munt'] += 1
+            record_rejection(market, 'dubbele_munt')
             continue
         if len(open_positions) >= maximum_open_positions:
-            rejections['maximaal_vijf_posities'] += 1
+            record_rejection(market, 'maximaal_vijf_posities')
             continue
         if deployed + notional > maximum_deployed_eur + 1e-9:
-            rejections['maximale_inzet_2500'] += 1
+            record_rejection(market, 'maximale_inzet_2500')
             continue
         if cash - notional < reserve_eur - 1e-9:
-            rejections['reserve_200'] += 1
+            record_rejection(market, 'reserve_200')
             continue
 
         events = trade.get('events', [])
@@ -553,6 +572,13 @@ def simulate_capacity_limited_portfolio(
             'signal_ms': signal_ms,
             'score': round(float(trade.get('score', 0.0)), 3),
             'position_eur': round(notional, 2),
+            'route': str(trade.get('route', 'ONBEKEND')),
+            'result_eur': round(final_value - notional, 8),
+            'holding_hours': round((close_ms - signal_ms) / 3_600_000, 3) if closed else None,
+            'relative_strength_vs_btc_1h_pct': trade.get('relative_strength_vs_btc_1h_pct'),
+            'net_reward_risk': trade.get('net_reward_risk'),
+            'entry_features': trade.get('entry_features', {}),
+            'btc_return_1h_pct': trade.get('btc_return_1h_pct'),
             'status': 'GESLOTEN' if closed else 'OPEN_EINDE_PERIODE',
         })
 
@@ -576,6 +602,9 @@ def simulate_capacity_limited_portfolio(
         'trades_accepted': len(accepted),
         'trades_rejected': sum(rejections.values()),
         'rejection_counts': dict(rejections),
+        'rejection_counts_by_market': {
+            market: dict(counts) for market, counts in sorted(rejections_by_market.items())
+        },
         'accepted_trades': accepted,
         'open_at_period_end': len(open_positions),
         'ending_cash_eur': round(cash, 8),
@@ -585,6 +614,113 @@ def simulate_capacity_limited_portfolio(
         'maximum_realized_drawdown_eur': round(maximum_realized_drawdown, 8),
         'selected_without_lsk_count': len(selected_without_lsk),
         'future_data_used_for_entry': False,
+    }
+
+
+
+def _diagnostic_trade_summary(trades: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    values = [float(trade.get('result_eur', 0.0)) for trade in trades]
+    wins = [value for value in values if value > 0.0]
+    losses = [-value for value in values if value < 0.0]
+    return {
+        'trades': len(values),
+        'wins': len(wins),
+        'losses': len(losses),
+        'total_result_eur': round(sum(values), 8),
+        'average_result_eur': round(mean(values), 8) if values else None,
+        'win_rate_pct': round(len(wins) / len(values) * 100.0, 3) if values else None,
+        'profit_factor': round(sum(wins) / sum(losses), 4) if losses else None,
+    }
+
+
+def _diagnostic_groups(
+    trades: Sequence[dict[str, Any]],
+    labeler: Any,
+) -> dict[str, dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        groups.setdefault(str(labeler(trade)), []).append(trade)
+    return {
+        label: _diagnostic_trade_summary(items)
+        for label, items in sorted(groups.items())
+    }
+
+
+def build_capacity_diagnostics(capacity_validation: dict[str, Any]) -> dict[str, Any]:
+    """Verklaar waar de begrensde portefeuille wint en verliest; wijzigt niets."""
+    all_report = capacity_validation['all_markets']
+    without_lsk_report = capacity_validation['without_lsk']
+    selected = list(without_lsk_report.get('accepted_trades', []))
+    selected_all = list(all_report.get('accepted_trades', []))
+
+    def score_bucket(trade: dict[str, Any]) -> str:
+        score = float(trade.get('score', 0.0))
+        return '90_PLUS' if score >= 90.0 else '80_89' if score >= 80.0 else '70_79'
+
+    def strength_bucket(trade: dict[str, Any]) -> str:
+        value = trade.get('relative_strength_vs_btc_1h_pct')
+        if value is None:
+            return 'ONBEKEND'
+        value = float(value)
+        return 'MIN_0_5' if value < .5 else '0_5_TOT_1' if value < 1.0 else '1_TOT_2' if value < 2.0 else '2_PLUS'
+
+    def volume_bucket(trade: dict[str, Any]) -> str:
+        value = trade.get('entry_features', {}).get('volume_ratio')
+        if value is None:
+            return 'ONBEKEND'
+        value = float(value)
+        return 'ONDER_1' if value < 1.0 else '1_TOT_1_5' if value < 1.5 else '1_5_TOT_2_5' if value < 2.5 else '2_5_PLUS'
+
+    def holding_bucket(trade: dict[str, Any]) -> str:
+        value = trade.get('holding_hours')
+        if value is None:
+            return 'OPEN_EINDE'
+        value = float(value)
+        return '0_4U' if value <= 4.0 else '4_12U' if value <= 12.0 else '12_24U' if value <= 24.0 else '24_48U' if value <= 48.0 else '48U_PLUS'
+
+    def btc_bucket(trade: dict[str, Any]) -> str:
+        value = trade.get('btc_return_1h_pct')
+        if value is None:
+            return 'ONBEKEND'
+        value = float(value)
+        return 'BTC_SCHOK' if value <= -2.0 else 'BTC_ZWAK' if value <= 0.0 else 'BTC_POSITIEF' if value < 2.0 else 'BTC_STERK'
+
+    markets = _diagnostic_groups(selected, lambda trade: trade.get('market', 'ONBEKEND'))
+    ranked = sorted(
+        markets.items(),
+        key=lambda item: float(item[1]['total_result_eur']),
+        reverse=True,
+    )
+    controls = {}
+    rejection_markets = all_report.get('rejection_counts_by_market', {})
+    for market in ('VTHO-EUR', 'LSK-EUR'):
+        controls[market] = {
+            'selected': _diagnostic_trade_summary([
+                trade for trade in selected_all if trade.get('market') == market
+            ]),
+            'rejection_counts': rejection_markets.get(market, {}),
+        }
+
+    return {
+        'population': 'CAPACITY_ACCEPTED_WITHOUT_LSK',
+        'selected_trades': len(selected),
+        'overall': _diagnostic_trade_summary(selected),
+        'by_route': _diagnostic_groups(selected, lambda trade: trade.get('route', 'ONBEKEND')),
+        'by_score': _diagnostic_groups(selected, score_bucket),
+        'by_relative_strength': _diagnostic_groups(selected, strength_bucket),
+        'by_volume_ratio': _diagnostic_groups(selected, volume_bucket),
+        'by_holding_time': _diagnostic_groups(selected, holding_bucket),
+        'by_btc_context': _diagnostic_groups(selected, btc_bucket),
+        'best_markets': [
+            {'market': market, **summary} for market, summary in ranked[:15]
+        ],
+        'worst_markets': [
+            {'market': market, **summary} for market, summary in reversed(ranked[-15:])
+        ],
+        'control_markets': controls,
+        'active_paper_changed': False,
+        'execution_enabled': False,
+        'live_orders_possible': False,
     }
 
 

@@ -17,6 +17,7 @@ from v40_replay import (
     audit_large_moves,
     build_runner_validation,
     build_capacity_validation,
+    build_capacity_diagnostics,
     simulate_capacity_limited_portfolio,
     forward_outcomes,
     rolling_quote_volume,
@@ -435,3 +436,29 @@ class V40CapacityPortfolioTests(unittest.TestCase):
         self.assertFalse(report['execution_enabled'])
         self.assertFalse(report['live_orders_possible'])
         self.assertFalse(report['active_paper_changed'])
+
+
+class V40CapacityDiagnosticTests(unittest.TestCase):
+    def test_diagnostics_keep_vtho_visible_and_are_observe_only(self):
+        accepted = [{
+            'market': 'VTHO-EUR', 'route': 'VROEG_MOMENTUM', 'score': 91.0,
+            'result_eur': 12.0, 'holding_hours': 6.0,
+            'relative_strength_vs_btc_1h_pct': 1.4,
+            'entry_features': {'volume_ratio': 2.0},
+            'btc_return_1h_pct': .5,
+        }]
+        validation = {
+            'all_markets': {
+                'accepted_trades': accepted,
+                'rejection_counts_by_market': {'VTHO-EUR': {'dubbele_munt': 2}},
+            },
+            'without_lsk': {'accepted_trades': accepted},
+        }
+        report = build_capacity_diagnostics(validation)
+        self.assertEqual(report['control_markets']['VTHO-EUR']['selected']['trades'], 1)
+        self.assertEqual(
+            report['control_markets']['VTHO-EUR']['rejection_counts']['dubbele_munt'], 2
+        )
+        self.assertEqual(report['by_route']['VROEG_MOMENTUM']['total_result_eur'], 12.0)
+        self.assertFalse(report['active_paper_changed'])
+        self.assertFalse(report['live_orders_possible'])

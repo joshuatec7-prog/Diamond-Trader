@@ -13,6 +13,7 @@ from v40_replay import (
     audit_large_moves,
     build_runner_validation,
     build_capacity_validation,
+    build_capacity_diagnostics,
     replay_market,
     simulate_broad_runner_trade,
     simulate_signal_trade,
@@ -121,6 +122,8 @@ def run_historical_lab(
         }
         for market in ('VTHO-EUR', 'LSK-EUR')
     }
+    capacity_validation = build_capacity_validation(paper_trades)
+    capacity_diagnostics = build_capacity_diagnostics(capacity_validation)
     report = {
         'version': '4.0-phase-6',
         'component': 'FULL_EUR_HISTORICAL_REPLAY',
@@ -142,7 +145,8 @@ def run_historical_lab(
         'signal_summary': summary,
         'paper_trade_summary': paper_summary,
         'runner_validation': build_runner_validation(paper_trades, runner_trades),
-        'capacity_validation': build_capacity_validation(paper_trades),
+        'capacity_validation': capacity_validation,
+        'capacity_diagnostics': capacity_diagnostics,
         'large_move_audit': large_move_summary,
         'control_cases': controls,
         'notes': [
@@ -164,6 +168,7 @@ def print_status(report: dict[str, Any]) -> None:
     moves = report['large_move_audit']
     runner = report['runner_validation']
     capacity = report['capacity_validation']
+    diagnostics = report['capacity_diagnostics']
     print('=== CRYPTOBOT v4.0 FASE 2 | BREDE HISTORISCHE REPLAY ===')
     print('UITVOERING             : UIT / TECHNISCH ONMOGELIJK')
     print(f"PERIODE                : {report['period']['days']} dagen + 1 dag opwarming")
@@ -191,6 +196,20 @@ def print_status(report: dict[str, Any]) -> None:
         f" | totaal €{constrained['total_result_eur']:.2f}"
     )
     print(f"PORTEFEUILLEBESLUIT    : {capacity['decision']}")
+    print('--- DIAGNOSE MENSELIJKE SELECTIE ZONDER LSK ---')
+    for route, item in diagnostics['by_route'].items():
+        print(
+            f"ROUTE {route:<20}: {item['trades']} trades"
+            f" | €{item['total_result_eur']:.2f} | PF {item['profit_factor']}"
+        )
+    for market in ('VTHO-EUR', 'LSK-EUR'):
+        item = diagnostics['control_markets'][market]
+        chosen = item['selected']
+        print(
+            f"CONTROLE {market:<15}: {chosen['trades']} genomen"
+            f" | €{chosen['total_result_eur']:.2f}"
+            f" | afgewezen {sum(item['rejection_counts'].values())}"
+        )
     for market, control in report['control_cases'].items():
         print(
             f"{market:<22}: {len(control['signals'])} signalen"
