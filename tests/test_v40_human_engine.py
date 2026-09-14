@@ -13,6 +13,7 @@ from v40_human_engine import (
 from v40_offline_scan import scan_all_eur
 from v40_historical_lab import run_historical_lab
 from v40_replay import (
+    DAY_MS,
     SIGNAL_COOLDOWN_MS,
     TOURNAMENT_POLICIES,
     audit_large_moves,
