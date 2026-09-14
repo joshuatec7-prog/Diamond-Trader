@@ -22,6 +22,8 @@ from v40_replay import (
     build_capacity_diagnostics,
     apply_tournament_policy,
     build_tournament_challenger,
+    apply_shadow_decision_desk,
+    build_shadow_decision_desk,
     simulate_capacity_limited_portfolio,
     forward_outcomes,
     rolling_quote_volume,
@@ -390,7 +392,7 @@ class V40HumanEngineTests(unittest.TestCase):
         self.assertIn('VTHO-EUR', report['control_cases'])
         self.assertIn('LSK-EUR', report['control_cases'])
         self.assertFalse(report['raw_candles_saved'])
-        self.assertEqual(report['version'], '4.0-phase-6')
+        self.assertEqual(report['version'], '4.0-phase-7')
         self.assertEqual(report['control_cases']['LSK-EUR']['paper_trades'], [])
         self.assertEqual(report['control_cases']['LSK-EUR']['runner_trades'], [])
         self.assertEqual(report['runner_validation']['decision'], 'ONVOLDOENDE_DATA')
@@ -507,3 +509,61 @@ class V40TournamentTests(unittest.TestCase):
         self.assertFalse(result['execution_enabled'])
         self.assertFalse(result['live_orders_possible'])
         self.assertFalse(result['active_paper_changed'])
+
+
+class V40ShadowDecisionDeskTests(V40TournamentTests):
+    def desk_candidate(self, market, signal_ms, result=10.0, close_delay=300_000):
+        item = self.candidate(market, signal_ms, 80.0, result=result)
+        item['route'] = 'PULLBACK_HERVATTING'
+        item['relative_strength_vs_btc_1h_pct'] = 1.5
+        item['net_reward_risk'] = 1.645
+        item['entry_features'].update({
+            'return_15m_pct': 1.0,
+            'return_60m_pct': 1.5,
+            'return_4h_pct': 2.5,
+            'atr_pct': .6,
+            'volume_ratio': 2.0,
+            'trend_up': True,
+        })
+        item['events'][-1]['event_ms'] = signal_ms + close_delay
+        return item
+
+    def test_shadow_desk_accepts_existing_rr_floor_and_stays_observe_only(self):
+        result = apply_shadow_decision_desk([
+            self.desk_candidate('AAA-EUR', 0),
+        ])
+        self.assertEqual(result['desk_selected'], 1)
+        self.assertEqual(result['selected_trades'][0]['market'], 'AAA-EUR')
+        self.assertFalse(result['future_data_used_for_selection'])
+        self.assertTrue(result['memory_uses_only_cases_closed_before_decision'])
+
+    def test_shadow_desk_rejects_extended_pump(self):
+        candidate = self.desk_candidate('FAST-EUR', 0)
+        candidate['entry_features']['return_15m_pct'] = 4.0
+        result = apply_shadow_decision_desk([candidate])
+        self.assertEqual(result['desk_selected'], 0)
+        self.assertEqual(result['veto_counts']['kwartierbeweging_te_ver_doorgeschoten'], 1)
+
+    def test_shadow_desk_memory_never_uses_cases_before_they_close(self):
+        trades = [
+            self.desk_candidate(f'M{index}-EUR', index * DAY_MS, result=-10.0,
+                                close_delay=20 * DAY_MS)
+            for index in range(12)
+        ]
+        result = apply_shadow_decision_desk(trades)
+        self.assertNotIn('geheugen_vergelijkbare_situaties_negatief', result['veto_counts'])
+
+    def test_shadow_desk_tracks_vtho_without_preference(self):
+        result = apply_shadow_decision_desk([
+            self.desk_candidate('VTHO-EUR', 0),
+        ])
+        self.assertEqual(result['vtho_audit']['candidates'], 1)
+        self.assertEqual(result['vtho_audit']['selected'], 1)
+
+    def test_shadow_desk_builder_never_activates_execution(self):
+        trades = [self.desk_candidate(f'M{index}-EUR', index * DAY_MS) for index in range(90)]
+        result = build_shadow_decision_desk(trades)
+        self.assertFalse(result['execution_enabled'])
+        self.assertFalse(result['live_orders_possible'])
+        self.assertFalse(result['active_paper_changed'])
+        self.assertEqual(result['configuration']['profiles_optimized_on_replay'], 0)

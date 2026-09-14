@@ -47,6 +47,7 @@ jobs:
           report = json.loads(Path('cryptobot_v40_historical_replay.json').read_text())
           validation = report['runner_validation']
           without_lsk = validation['without_lsk']
+          shadow = report['shadow_decision_desk']
           print('## CryptoBot v4.0 replay')
           print(f"- Markten: {report['markets_completed']}/{report['markets_requested']}")
           print(f"- Dataproblemen: {len(report['errors'])}")
@@ -55,6 +56,12 @@ jobs:
           print(f"- Runner zonder LSK: EUR {without_lsk['runner']['total_result_eur']:.2f}")
           print(f"- Verschil: EUR {without_lsk['runner_minus_baseline_eur']:.2f}")
           print(f"- Besluit: {validation['decision']}")
+          print(f"- Shadow Decision Desk: {shadow['portfolio_accepted']} trades, EUR {shadow['full_period']['total_result_eur']:.2f}")
+          print(f"- Shadow PF: {shadow['full_period']['profit_factor']}")
+          print(f"- Shadow validatie: EUR {shadow['validation']['total_result_eur']:.2f}")
+          print(f"- Shadow onaangeraakte test: EUR {shadow['untouched_test']['total_result_eur']:.2f}")
+          print(f"- Shadow VTHO: {shadow['vtho_audit']['candidates']} kandidaten, {shadow['vtho_audit']['selected']} gekozen")
+          print(f"- Shadow besluit: {shadow['decision']}")
           PY
           else
             echo 'Replay heeft geen JSON-resultaat opgeleverd.' | tee -a "$GITHUB_STEP_SUMMARY"

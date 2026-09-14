@@ -811,6 +811,369 @@ TOURNAMENT_POLICIES = (
 )
 
 
+# De Shadow Decision Desk gebruikt bewust één vooraf vastgelegde methode. Er
+# wordt dus niet opnieuw achteraf het minst slechte profiel uit dezelfde data
+# gekozen. De grens voor netto RR is gelijk aan de bestaande entrygrens; 1,65
+# bleek onverenigbaar met veel geldige signalen die door de kostenformule op
+# circa 1,645 uitkomen.
+SHADOW_DESK_MINIMUM_CONFIDENCE = 75.0
+SHADOW_DESK_MINIMUM_WINNER_MARGIN = 5.0
+SHADOW_DESK_MAXIMUM_NEW_TRADES_PER_DAY = 1
+SHADOW_DESK_MEMORY_MINIMUM_CASES = 10
+SHADOW_DESK_LOSS_PAUSE_COUNT = 3
+SHADOW_DESK_LOSS_PAUSE_MS = DAY_MS
+
+
+def _shadow_memory_key(trade: dict[str, Any]) -> str:
+    features = trade.get('entry_features', {})
+    m60 = float(features.get('return_60m_pct') or 0.0)
+    m4h = float(features.get('return_4h_pct') or 0.0)
+    btc = float(trade.get('btc_return_1h_pct') or 0.0)
+    speed = 'VROEG' if m60 <= 2.5 else 'SNEL'
+    extension = 'LAAG' if m4h <= 4.0 else 'HOOG'
+    context = 'BTC_ZWAK' if btc < 0.0 else 'BTC_POSITIEF'
+    return '|'.join((str(trade.get('route', 'ONBEKEND')), speed, extension, context))
+
+
+def _shadow_close_ms(trade: dict[str, Any]) -> int | float:
+    events = trade.get('events', [])
+    if str(trade.get('status', '')).upper() != 'GESLOTEN' or len(events) < 2:
+        return math.inf
+    return int(events[-1].get('event_ms', math.inf))
+
+
+def _shadow_memory_summary(cases: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    values = [float(case.get('result_eur', 0.0)) for case in cases]
+    wins = [value for value in values if value > 0.0]
+    losses = [-value for value in values if value < 0.0]
+    return {
+        'cases': len(values),
+        'average_result_eur': round(mean(values), 8) if values else None,
+        'win_rate_pct': round(len(wins) / len(values) * 100.0, 3) if values else None,
+        'profit_factor': round(sum(wins) / sum(losses), 4) if losses else None,
+    }
+
+
+def _shadow_desk_review(
+    trade: dict[str, Any],
+    memory_cases: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Laat vaste specialisten stemmen met alleen informatie van het signaalmoment."""
+    features = trade.get('entry_features', {})
+    route = str(trade.get('route', 'ONBEKEND'))
+    score = float(trade.get('score', 0.0))
+    relative = float(trade.get('relative_strength_vs_btc_1h_pct') or 0.0)
+    net_rr = float(trade.get('net_reward_risk') or 0.0)
+    btc = float(trade.get('btc_return_1h_pct') or 0.0)
+    m15 = float(features.get('return_15m_pct') or 0.0)
+    m60 = float(features.get('return_60m_pct') or 0.0)
+    m4h = float(features.get('return_4h_pct') or 0.0)
+    atr = float(features.get('atr_pct') or 0.0)
+    volume = float(features.get('volume_ratio') or 0.0)
+    trend_up = bool(features.get('trend_up'))
+
+    confidence = 0.0
+    bull_reasons: list[str] = []
+    bear_reasons: list[str] = []
+    risk_vetoes: list[str] = []
+
+    route_points = {
+        'PULLBACK_HERVATTING': 14.0,
+        'SWING_OPBOUW': 9.0,
+        'VROEG_MOMENTUM': 5.0,
+    }.get(route, 0.0)
+    confidence += route_points
+    if route_points:
+        bull_reasons.append(f'herkenbare_route_{route.lower()}')
+    else:
+        risk_vetoes.append('route_niet_toegestaan')
+
+    if trend_up:
+        confidence += 10.0
+        bull_reasons.append('trend_opwaarts')
+    else:
+        risk_vetoes.append('trend_niet_opwaarts')
+    if 0.50 <= relative <= 3.50:
+        confidence += 12.0
+        bull_reasons.append('relatieve_sterkte_gezond')
+    elif relative > 5.0:
+        risk_vetoes.append('relatieve_sterkte_mogelijk_doorgeschoten')
+    else:
+        bear_reasons.append('relatieve_sterkte_onvoldoende_of_extreem')
+    if 1.20 <= volume <= 5.00:
+        confidence += 10.0
+        bull_reasons.append('volume_bevestigt_zonder_extreme_piek')
+    elif volume > 8.0:
+        risk_vetoes.append('volume_piek_mogelijk_te_laat')
+    else:
+        bear_reasons.append('volume_bevestigt_niet')
+    if 0.20 <= m15 <= 1.80:
+        confidence += 15.0
+        bull_reasons.append('beweging_begint_net')
+    elif m15 > 3.0:
+        risk_vetoes.append('kwartierbeweging_te_ver_doorgeschoten')
+    else:
+        bear_reasons.append('kwartiermomentum_niet_ideaal')
+    if 0.30 <= m60 <= 3.00:
+        confidence += 15.0
+        bull_reasons.append('uurtempo_gezond')
+    elif m60 > 6.0:
+        risk_vetoes.append('uurbeweging_te_ver_doorgeschoten')
+    else:
+        bear_reasons.append('uurtempo_niet_ideaal')
+    if 0.75 <= m4h <= 4.00:
+        confidence += 12.0
+        bull_reasons.append('vieruursopbouw_nog_vroeg')
+    elif m4h > 10.0:
+        risk_vetoes.append('vieruursbeweging_te_ver_doorgeschoten')
+    else:
+        bear_reasons.append('vieruursopbouw_niet_ideaal')
+    if -1.0 <= btc <= 1.5:
+        confidence += 7.0
+        bull_reasons.append('bitcoin_context_stabiel')
+    elif btc <= -2.0:
+        risk_vetoes.append('bitcoin_marktschok')
+    else:
+        bear_reasons.append('bitcoin_context_minder_gunstig')
+    if net_rr >= 1.50:
+        confidence += 10.0
+        bull_reasons.append('netto_rr_boven_bestaande_entrygrens')
+    else:
+        risk_vetoes.append('netto_rr_onder_bestaande_entrygrens')
+    if 0.25 <= atr <= 1.50:
+        confidence += 8.0
+        bull_reasons.append('volatiliteit_beheersbaar')
+    elif atr > 2.5:
+        risk_vetoes.append('volatiliteit_te_hoog')
+    else:
+        bear_reasons.append('volatiliteit_niet_ideaal')
+    if score >= 70.0:
+        confidence += 4.0
+    else:
+        risk_vetoes.append('basisscore_onder_70')
+
+    memory = _shadow_memory_summary(memory_cases)
+    memory_pf = memory.get('profit_factor')
+    memory_average = memory.get('average_result_eur')
+    if memory['cases'] >= SHADOW_DESK_MEMORY_MINIMUM_CASES:
+        effective_memory_pf = (
+            float(memory_pf) if memory_pf is not None
+            else math.inf if float(memory_average or 0.0) > 0.0
+            else 0.0
+        )
+        if effective_memory_pf < 0.80 or float(memory_average or 0.0) < -1.0:
+            risk_vetoes.append('geheugen_vergelijkbare_situaties_negatief')
+        elif effective_memory_pf >= 1.20 and float(memory_average or 0.0) > 0.0:
+            confidence += 5.0
+            bull_reasons.append('geheugen_vergelijkbare_situaties_positief')
+
+    confidence = round(confidence, 6)
+    if confidence < SHADOW_DESK_MINIMUM_CONFIDENCE:
+        bear_reasons.append('totale_bewijssterkte_onvoldoende')
+    return {
+        'confidence': confidence,
+        'bull_reasons': bull_reasons,
+        'bear_reasons': bear_reasons,
+        'risk_vetoes': list(dict.fromkeys(risk_vetoes)),
+        'memory_key': _shadow_memory_key(trade),
+        'memory': memory,
+        'eligible': not risk_vetoes and confidence >= SHADOW_DESK_MINIMUM_CONFIDENCE,
+    }
+
+
+def apply_shadow_decision_desk(trades: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Chronologische observe-only commissie met geheugen en harde onthouding."""
+    clean = sorted(
+        (trade for trade in trades if str(trade.get('market')) != 'LSK-EUR'),
+        key=lambda trade: (int(trade.get('signal_ms', 0)), str(trade.get('market', ''))),
+    )
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for trade in clean:
+        grouped.setdefault(int(trade.get('signal_ms', 0)), []).append(trade)
+
+    memory_pending = sorted(
+        (trade for trade in clean if _shadow_close_ms(trade) != math.inf),
+        key=lambda trade: (_shadow_close_ms(trade), int(trade.get('signal_ms', 0))),
+    )
+    memory_cursor = 0
+    memory: dict[str, list[dict[str, Any]]] = {}
+    selected: list[dict[str, Any]] = []
+    selected_pending: list[dict[str, Any]] = []
+    daily_entries: Counter[int] = Counter()
+    vetoes: Counter[str] = Counter()
+    vtho_seen = vtho_eligible = vtho_selected = 0
+    vtho_vetoes: Counter[str] = Counter()
+    vtho_lost_to: Counter[str] = Counter()
+    consecutive_losses = 0
+    pause_until_ms = 0
+
+    for signal_ms, candidates in sorted(grouped.items()):
+        while memory_cursor < len(memory_pending) and _shadow_close_ms(memory_pending[memory_cursor]) <= signal_ms:
+            case = memory_pending[memory_cursor]
+            memory.setdefault(_shadow_memory_key(case), []).append(case)
+            memory_cursor += 1
+        closed_selected = [item for item in selected_pending if _shadow_close_ms(item) <= signal_ms]
+        for item in sorted(closed_selected, key=_shadow_close_ms):
+            selected_pending.remove(item)
+            if float(item.get('result_eur', 0.0)) < 0.0:
+                consecutive_losses += 1
+                if consecutive_losses >= SHADOW_DESK_LOSS_PAUSE_COUNT:
+                    pause_until_ms = max(pause_until_ms, int(_shadow_close_ms(item)) + SHADOW_DESK_LOSS_PAUSE_MS)
+                    consecutive_losses = 0
+            else:
+                consecutive_losses = 0
+
+        reviewed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for trade in candidates:
+            market = str(trade.get('market', ''))
+            if market == 'VTHO-EUR':
+                vtho_seen += 1
+            review = _shadow_desk_review(trade, memory.get(_shadow_memory_key(trade), []))
+            reasons = list(review['risk_vetoes'])
+            if not review['eligible']:
+                reasons.extend(review['bear_reasons'])
+                for reason in dict.fromkeys(reasons):
+                    vetoes[reason] += 1
+                    if market == 'VTHO-EUR':
+                        vtho_vetoes[reason] += 1
+                continue
+            reviewed.append((trade, review))
+            if market == 'VTHO-EUR':
+                vtho_eligible += 1
+        if not reviewed:
+            continue
+
+        utc_day = signal_ms // DAY_MS
+        shared_veto = None
+        if signal_ms < pause_until_ms:
+            shared_veto = 'pauze_na_drie_afgesloten_verliezen'
+        elif daily_entries[utc_day] >= SHADOW_DESK_MAXIMUM_NEW_TRADES_PER_DAY:
+            shared_veto = 'daglimiet_een_keuze_bereikt'
+        if shared_veto:
+            vetoes[shared_veto] += len(reviewed)
+            for trade, _ in reviewed:
+                if str(trade.get('market')) == 'VTHO-EUR':
+                    vtho_vetoes[shared_veto] += 1
+            continue
+
+        ranked = sorted(
+            reviewed,
+            key=lambda item: (-float(item[1]['confidence']), str(item[0].get('market', ''))),
+        )
+        if len(ranked) > 1:
+            margin = float(ranked[0][1]['confidence']) - float(ranked[1][1]['confidence'])
+            if margin < SHADOW_DESK_MINIMUM_WINNER_MARGIN:
+                vetoes['geen_duidelijke_winnaar'] += len(ranked)
+                for trade, _ in ranked:
+                    if str(trade.get('market')) == 'VTHO-EUR':
+                        vtho_vetoes['geen_duidelijke_winnaar'] += 1
+                continue
+
+        winner = dict(ranked[0][0])
+        winner['shadow_desk'] = ranked[0][1]
+        selected.append(winner)
+        if _shadow_close_ms(winner) != math.inf:
+            selected_pending.append(winner)
+        daily_entries[utc_day] += 1
+        if str(winner.get('market')) == 'VTHO-EUR':
+            vtho_selected += 1
+        elif any(str(trade.get('market')) == 'VTHO-EUR' for trade, _ in ranked):
+            vtho_lost_to[str(winner.get('market', 'ONBEKEND'))] += 1
+
+    return {
+        'selected_trades': selected,
+        'candidate_trades': len(clean),
+        'desk_selected': len(selected),
+        'veto_counts': dict(vetoes),
+        'vtho_audit': {
+            'candidates': vtho_seen,
+            'eligible': vtho_eligible,
+            'selected': vtho_selected,
+            'veto_counts': dict(vtho_vetoes),
+            'lost_to_markets': dict(vtho_lost_to.most_common(15)),
+        },
+        'future_data_used_for_selection': False,
+        'memory_uses_only_cases_closed_before_decision': True,
+    }
+
+
+def build_shadow_decision_desk(trades: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Beoordeel één vooraf vastgelegde desk over 60d/15d/15d zonder tuning."""
+    clean = sorted(
+        (trade for trade in trades if str(trade.get('market')) != 'LSK-EUR'),
+        key=lambda trade: (int(trade.get('signal_ms', 0)), str(trade.get('market', ''))),
+    )
+    if not clean:
+        return {
+            'decision': 'ONVOLDOENDE_DATA', 'active_paper_changed': False,
+            'execution_enabled': False, 'live_orders_possible': False,
+        }
+    period_end = max(int(trade.get('signal_ms', 0)) for trade in clean) + 1
+    test_start = period_end - 15 * DAY_MS
+    validation_start = test_start - 15 * DAY_MS
+    desk = apply_shadow_decision_desk(clean)
+    portfolio = simulate_capacity_limited_portfolio(desk['selected_trades'])
+    accepted = portfolio['accepted_trades']
+
+    def period_result(start: int | None, end: int | None) -> dict[str, Any]:
+        rows = [
+            trade for trade in accepted
+            if (start is None or int(trade['signal_ms']) >= start)
+            and (end is None or int(trade['signal_ms']) < end)
+        ]
+        return summarize_strategy_trades(rows)
+
+    development = period_result(None, validation_start)
+    validation = period_result(validation_start, test_start)
+    untouched = period_result(test_start, None)
+    full = summarize_strategy_trades(accepted)
+    criteria = {
+        'development_positive': development['total_result_eur'] > 0.0,
+        'validation_positive': validation['total_result_eur'] > 0.0,
+        'untouched_test_positive': untouched['total_result_eur'] > 0.0,
+        'full_minimum_50_trades': full['trades'] >= 50,
+        'full_positive': full['total_result_eur'] > 0.0,
+        'full_pf_above_1_20': (full['profit_factor'] or 0.0) > 1.20,
+        'full_drawdown_within_360_eur': portfolio['maximum_realized_drawdown_eur'] <= 360.0,
+    }
+    return {
+        'method': 'VASTE_CHRONOLOGISCHE_SHADOW_DECISION_DESK',
+        'configuration': {
+            'minimum_confidence': SHADOW_DESK_MINIMUM_CONFIDENCE,
+            'minimum_winner_margin': SHADOW_DESK_MINIMUM_WINNER_MARGIN,
+            'maximum_new_trades_per_day': SHADOW_DESK_MAXIMUM_NEW_TRADES_PER_DAY,
+            'memory_minimum_closed_cases': SHADOW_DESK_MEMORY_MINIMUM_CASES,
+            'loss_pause_after': SHADOW_DESK_LOSS_PAUSE_COUNT,
+            'loss_pause_hours': SHADOW_DESK_LOSS_PAUSE_MS / 3_600_000,
+            'net_reward_risk_floor': 1.50,
+            'profiles_optimized_on_replay': 0,
+        },
+        'period_boundaries_ms': {
+            'validation_start': validation_start,
+            'untouched_test_start': test_start,
+            'period_end': period_end,
+        },
+        'signals_considered': desk['candidate_trades'],
+        'desk_selected': desk['desk_selected'],
+        'portfolio_accepted': portfolio['trades_accepted'],
+        'portfolio_rejected': portfolio['trades_rejected'],
+        'development': development,
+        'validation': validation,
+        'untouched_test': untouched,
+        'full_period': full,
+        'maximum_realized_drawdown_eur': portfolio['maximum_realized_drawdown_eur'],
+        'veto_counts': desk['veto_counts'],
+        'vtho_audit': desk['vtho_audit'],
+        'criteria': criteria,
+        'decision': 'KANDIDAAT_VOOR_APARTE_PAPER_CHALLENGER' if all(criteria.values()) else 'AFWIJZEN',
+        'active_paper_changed': False,
+        'execution_enabled': False,
+        'live_orders_possible': False,
+        'future_data_used_for_selection': False,
+        'memory_uses_only_cases_closed_before_decision': True,
+    }
+
+
 def _tournament_reasons(trade: dict[str, Any], policy: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
     features = trade.get('entry_features', {})

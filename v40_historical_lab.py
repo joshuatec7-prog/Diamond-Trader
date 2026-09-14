@@ -15,6 +15,7 @@ from v40_replay import (
     build_capacity_validation,
     build_capacity_diagnostics,
     build_tournament_challenger,
+    build_shadow_decision_desk,
     replay_market,
     simulate_broad_runner_trade,
     simulate_signal_trade,
@@ -126,8 +127,9 @@ def run_historical_lab(
     capacity_validation = build_capacity_validation(paper_trades)
     capacity_diagnostics = build_capacity_diagnostics(capacity_validation)
     tournament_challenger = build_tournament_challenger(paper_trades)
+    shadow_decision_desk = build_shadow_decision_desk(paper_trades)
     report = {
-        'version': '4.0-phase-6',
+        'version': '4.0-phase-7',
         'component': 'FULL_EUR_HISTORICAL_REPLAY',
         'generated_at_utc': datetime.now(timezone.utc).isoformat(),
         'period': {
@@ -150,6 +152,7 @@ def run_historical_lab(
         'capacity_validation': capacity_validation,
         'capacity_diagnostics': capacity_diagnostics,
         'tournament_challenger': tournament_challenger,
+        'shadow_decision_desk': shadow_decision_desk,
         'large_move_audit': large_move_summary,
         'control_cases': controls,
         'notes': [
@@ -173,6 +176,7 @@ def print_status(report: dict[str, Any]) -> None:
     capacity = report['capacity_validation']
     diagnostics = report['capacity_diagnostics']
     tournament = report['tournament_challenger']
+    shadow = report['shadow_decision_desk']
     print('=== CRYPTOBOT v4.0 FASE 2 | BREDE HISTORISCHE REPLAY ===')
     print('UITVOERING             : UIT / TECHNISCH ONMOGELIJK')
     print(f"PERIODE                : {report['period']['days']} dagen + 1 dag opwarming")
@@ -230,6 +234,23 @@ def print_status(report: dict[str, Any]) -> None:
         f" | {vtho.get('eligible', 0)} geldig | {vtho.get('selected', 0)} gekozen"
     )
     print(f"TOERNOOIBESLUIT        : {tournament['decision']}")
+    print('--- SHADOW DECISION DESK | VAST, GEEN PROFIELTUNING ---')
+    print(
+        f"DESK SELECTIE          : {shadow['desk_selected']} gekozen"
+        f" | {shadow['portfolio_accepted']} portefeuille"
+    )
+    for label in ('development', 'validation', 'untouched_test', 'full_period'):
+        item = shadow[label]
+        print(
+            f"DESK {label.upper():<18}: {item['trades']} trades"
+            f" | €{item['total_result_eur']:.2f} | PF {item['profit_factor']}"
+        )
+    vtho_desk = shadow['vtho_audit']
+    print(
+        f"VTHO DESK              : {vtho_desk['candidates']} kandidaten"
+        f" | {vtho_desk['eligible']} geldig | {vtho_desk['selected']} gekozen"
+    )
+    print(f"DESKBESLUIT            : {shadow['decision']}")
     for market, control in report['control_cases'].items():
         print(
             f"{market:<22}: {len(control['signals'])} signalen"
