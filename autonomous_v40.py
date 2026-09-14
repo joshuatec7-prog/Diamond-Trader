@@ -15,7 +15,12 @@ from statistics import mean, median
 from typing import Any
 
 from bitvavo_public import BitvavoPublic
-from v40_human_engine import evaluate_exit
+from v40_human_engine import (
+    evaluate_dynamic_l2_challenger,
+    evaluate_exit,
+    evaluate_human_challenger,
+    resolve_market_regime,
+)
 from v40_offline_scan import scan_all_eur
 from v40_replay import DEFAULT_HORIZONS_MINUTES
 
@@ -151,10 +156,18 @@ def _connect(settings: V40RuntimeSettings) -> sqlite3.Connection:
         id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT NOT NULL UNIQUE,
         event_ms INTEGER NOT NULL, notification_type TEXT NOT NULL, market TEXT NOT NULL,
         message TEXT NOT NULL, payload_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS v40_human_reviews(
+        cycle_ms INTEGER NOT NULL, market TEXT NOT NULL, review_action TEXT NOT NULL,
+        evidence_strength TEXT NOT NULL, confidence_score REAL NOT NULL,
+        regime TEXT NOT NULL, vetoes_json TEXT NOT NULL, uncertainty_json TEXT NOT NULL,
+        thesis_json TEXT NOT NULL, l2_review_json TEXT NOT NULL DEFAULT '{}',
+        active_paper_changed INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(cycle_ms,market));
       CREATE TABLE IF NOT EXISTS v40_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_v40_candidate_status ON v40_candidates(status,created_ms);
       CREATE INDEX IF NOT EXISTS idx_v40_alert_market_time ON v40_alerts(market,event_ms);
       CREATE INDEX IF NOT EXISTS idx_v40_notification_time ON v40_notifications(event_ms);
+      CREATE INDEX IF NOT EXISTS idx_v40_human_review_time ON v40_human_reviews(cycle_ms);
     ''')
     return conn
 
@@ -248,7 +261,7 @@ def ensure_runtime(settings: V40RuntimeSettings, now_ms: int | None = None) -> N
     current = int(time.time() * 1000) if now_ms is None else int(now_ms)
     conn = _connect(settings)
     try:
-        _set_meta(conn, 'version', '4.0-phase-6')
+        _set_meta(conn, 'version', '4.0-phase-7')
         _set_meta(conn, 'initialized_ms', _meta(conn, 'initialized_ms', str(current)))
         _set_meta(conn, 'mode', 'OBSERVE_ONLY')
         _set_meta(conn, 'execution_enabled', '0')
@@ -273,8 +286,38 @@ def _compact_decision(decision: dict[str, Any]) -> dict[str, Any]:
             'entry_reference', 'stop_reference', 'target_reference',
             'gross_stop_pct', 'gross_target_pct', 'estimated_roundtrip_cost_pct',
             'net_reward_risk', 'relative_strength_vs_btc_1h_pct', 'features',
+            'maximum_hold_hours',
             'execution_enabled', 'live_orders_possible',
         )
+    }
+
+
+def _performance_guard(conn: sqlite3.Connection, current: int) -> dict[str, Any]:
+    rows = conn.execute(
+        """SELECT closed_ms,realized_pnl_eur FROM v40_paper_positions
+           WHERE status='GESLOTEN' AND closed_ms IS NOT NULL
+           ORDER BY closed_ms DESC,id DESC LIMIT 20"""
+    ).fetchall()
+    consecutive_losses = 0
+    for row in rows:
+        if float(row['realized_pnl_eur']) < 0.0:
+            consecutive_losses += 1
+        else:
+            break
+    day_start = current - current % DAY_MS
+    daily_pnl = sum(
+        float(row['realized_pnl_eur']) for row in rows
+        if int(row['closed_ms']) >= day_start
+    )
+    latest_closed = int(rows[0]['closed_ms']) if rows else 0
+    loss_pause_until = latest_closed + 6 * HOUR_MS if consecutive_losses >= 3 else 0
+    daily_pause_until = day_start + DAY_MS if daily_pnl <= -45.0 else 0
+    pause_until = max(loss_pause_until, daily_pause_until)
+    return {
+        'consecutive_losses': consecutive_losses,
+        'daily_realized_pnl_eur': daily_pnl,
+        'pause_until_ms': pause_until,
+        'pause_active': current < pause_until,
     }
 
 
@@ -300,6 +343,18 @@ def ingest_scan(
     conn = _connect(settings)
     try:
         conn.execute('BEGIN IMMEDIATE')
+        regime_state = resolve_market_regime(
+            decisions,
+            previous_regime=_meta(conn, 'human_stable_regime'),
+            pending_regime=_meta(conn, 'human_pending_regime'),
+            pending_count=int(_meta(conn, 'human_pending_count', '0') or 0),
+        )
+        performance = _performance_guard(conn, current)
+        _set_meta(conn, 'human_stable_regime', regime_state['stable_regime'])
+        _set_meta(conn, 'human_visible_regime', regime_state['regime'])
+        _set_meta(conn, 'human_pending_regime', regime_state['pending_regime'])
+        _set_meta(conn, 'human_pending_count', regime_state['pending_count'])
+        _set_meta(conn, 'human_regime_json', json.dumps(regime_state, ensure_ascii=False))
         conn.execute(
             'INSERT OR REPLACE INTO v40_cycles VALUES (?,?,?,?,?,?)',
             (
@@ -312,6 +367,14 @@ def ingest_scan(
             compact = _compact_decision(decision)
             market = str(decision.get('market'))
             action = str(decision.get('action'))
+            human_review = evaluate_human_challenger(
+                decision,
+                regime_state=regime_state,
+                consecutive_losses=int(performance['consecutive_losses']),
+                pause_active=bool(performance['pause_active']),
+                daily_realized_pnl_eur=float(performance['daily_realized_pnl_eur']),
+            )
+            compact['human_challenger'] = human_review
             conn.execute(
                 'INSERT OR REPLACE INTO v40_decisions VALUES (?,?,?,?,?,?,?)',
                 (
@@ -321,6 +384,22 @@ def ingest_scan(
                     json.dumps(compact, ensure_ascii=False),
                 ),
             )
+            if action in {'KOOPKANS', 'VOLGEN'} and str(decision.get('route')) != 'GEEN_SETUP':
+                conn.execute(
+                    '''INSERT OR REPLACE INTO v40_human_reviews
+                       (cycle_ms,market,review_action,evidence_strength,confidence_score,
+                        regime,vetoes_json,uncertainty_json,thesis_json,l2_review_json,
+                        active_paper_changed)
+                       VALUES (?,?,?,?,?,?,?,?,?,'{}',0)''',
+                    (
+                        current, market, str(human_review['review_action']),
+                        str(human_review['evidence_strength']),
+                        float(human_review['confidence_score']), str(human_review['regime']),
+                        json.dumps(human_review['vetoes'], ensure_ascii=False),
+                        json.dumps(human_review['uncertainty'], ensure_ascii=False),
+                        json.dumps(human_review['thesis'], ensure_ascii=False),
+                    ),
+                )
             if (
                 action == 'VOLGEN'
                 and str(decision.get('route')) != 'GEEN_SETUP'
@@ -374,6 +453,7 @@ def ingest_scan(
         ).rowcount
         removed_paper = _prune_paper_history(conn, current - PAPER_HISTORY_RETENTION_MS)
         removed_history = _prune_history(conn, current - HISTORY_RETENTION_MS)
+        conn.execute('DELETE FROM v40_human_reviews WHERE cycle_ms<?', (current - HISTORY_RETENTION_MS,))
         _set_meta(conn, 'scan_attempted_ms', current)
         _set_meta(conn, 'scan_generated_ms', current)
         _set_meta(conn, 'last_scan_errors', json.dumps(scan.get('errors', []), ensure_ascii=False))
@@ -487,6 +567,32 @@ def recheck_candidates(
                     conn.commit()
                     continue
                 summary = _l2_summary(rows)
+                details = json.loads(str(candidate['details_json']))
+                l2_review = evaluate_dynamic_l2_challenger(
+                    rows,
+                    atr_pct=float(details.get('features', {}).get('atr_pct', 0.0)),
+                )
+                review_row = conn.execute(
+                    '''SELECT review_action,vetoes_json FROM v40_human_reviews
+                       WHERE cycle_ms=? AND market=?''',
+                    (int(candidate['cycle_ms']), str(candidate['market'])),
+                ).fetchone()
+                if review_row:
+                    human_vetoes = json.loads(str(review_row['vetoes_json']))
+                    human_vetoes.extend(l2_review.get('vetoes', []))
+                    human_action = (
+                        'AFZIEN' if human_vetoes else str(review_row['review_action'])
+                    )
+                    conn.execute(
+                        '''UPDATE v40_human_reviews SET review_action=?,vetoes_json=?,
+                           l2_review_json=? WHERE cycle_ms=? AND market=?''',
+                        (
+                            human_action,
+                            json.dumps(list(dict.fromkeys(human_vetoes)), ensure_ascii=False),
+                            json.dumps(l2_review, ensure_ascii=False),
+                            int(candidate['cycle_ms']), str(candidate['market']),
+                        ),
+                    )
                 blockers = []
                 if summary['median_spread_pct'] > MAXIMUM_L2_SPREAD_PCT:
                     blockers.append('mediane_l2_spread_te_hoog')
@@ -505,7 +611,6 @@ def recheck_candidates(
                     )
                     rejected.append(str(candidate['market']))
                 else:
-                    details = json.loads(str(candidate['details_json']))
                     reference = float(candidate['entry_reference'])
                     buy = float(summary['buy_vwap'])
                     stop_ratio = float(details.get('stop_reference', reference)) / reference
@@ -825,6 +930,118 @@ def _outcome_summary(conn: sqlite3.Connection, horizon: int) -> dict[str, Any]:
     }
 
 
+def _human_challenger_summary(conn: sqlite3.Connection, current: int) -> dict[str, Any]:
+    rows = conn.execute(
+        '''SELECT review_action,COUNT(*) AS samples,AVG(confidence_score) AS confidence
+           FROM v40_human_reviews WHERE cycle_ms>=?
+           GROUP BY review_action ORDER BY review_action''',
+        (current - DAY_MS,),
+    ).fetchall()
+    outcome_rows = conn.execute(
+        '''SELECT r.review_action,o.horizon_minutes,o.net_return_pct
+           FROM v40_human_reviews r
+           JOIN v40_candidates c ON c.cycle_ms=r.cycle_ms AND c.market=r.market
+           JOIN v40_alerts a ON a.candidate_id=c.id
+           JOIN v40_outcomes o ON o.alert_id=a.id'''
+    ).fetchall()
+    outcomes: dict[str, dict[str, list[float]]] = {}
+    for row in outcome_rows:
+        action = str(row['review_action'])
+        horizon = str(int(row['horizon_minutes']))
+        outcomes.setdefault(action, {}).setdefault(horizon, []).append(float(row['net_return_pct']))
+    calibration_values = [
+        (float(row['confidence_score']) / 100.0, float(row['net_return_pct']) > 0.0)
+        for row in conn.execute(
+            '''SELECT r.confidence_score,o.net_return_pct
+               FROM v40_human_reviews r
+               JOIN v40_candidates c ON c.cycle_ms=r.cycle_ms AND c.market=r.market
+               JOIN v40_alerts a ON a.candidate_id=c.id
+               JOIN v40_outcomes o ON o.alert_id=a.id AND o.horizon_minutes=60'''
+        )
+    ]
+    calibration = {
+        'status': 'VOLDOENDE_DATA' if len(calibration_values) >= 50 else 'ONVOLDOENDE_DATA',
+        'samples': len(calibration_values),
+        'minimum_samples': 50,
+        'brier_score': round(mean(
+            (probability - float(won)) ** 2 for probability, won in calibration_values
+        ), 6) if calibration_values else None,
+        'used_to_trade': False,
+    }
+    return {
+        'observation_only': True,
+        'applied_to_paper_entries': False,
+        'reviews_last_24h': {
+            str(row['review_action']): {
+                'samples': int(row['samples']),
+                'average_confidence_score': round(float(row['confidence']), 3),
+            }
+            for row in rows
+        },
+        'prospective_comparison': {
+            action: {
+                horizon: {
+                    'samples': len(values),
+                    'average_net_pct': round(mean(values), 5),
+                }
+                for horizon, values in by_horizon.items()
+            }
+            for action, by_horizon in outcomes.items()
+        },
+        'probability_calibrated': False,
+        'calibration_check': calibration,
+        'active_bot_changed': False,
+    }
+
+
+def _prospective_readiness(conn: sqlite3.Connection) -> dict[str, Any]:
+    rows = conn.execute(
+        '''SELECT market,opened_ms,closed_ms,realized_pnl_eur
+           FROM v40_paper_positions WHERE status='GESLOTEN'
+           ORDER BY closed_ms,id'''
+    ).fetchall()
+    results = [float(row['realized_pnl_eur']) for row in rows]
+    wins = [value for value in results if value > 0.0]
+    losses = [-value for value in results if value < 0.0]
+    profit_factor = sum(wins) / sum(losses) if losses else None
+    equity = peak = drawdown = 0.0
+    for value in results:
+        equity += value
+        peak = max(peak, equity)
+        drawdown = max(drawdown, peak - equity)
+    span_days = (
+        (int(rows[-1]['closed_ms']) - int(rows[0]['opened_ms'])) / DAY_MS
+        if len(rows) >= 2 else 0.0
+    )
+    per_market: dict[str, float] = {}
+    for row in rows:
+        per_market[str(row['market'])] = per_market.get(str(row['market']), 0.0) + max(
+            0.0, float(row['realized_pnl_eur'])
+        )
+    total_positive = sum(per_market.values())
+    concentration = max(per_market.values(), default=0.0) / total_positive * 100.0 if total_positive else None
+    requirements = {
+        'minimum_trades_150': len(rows) >= 150,
+        'minimum_weeks_6': span_days >= 42.0,
+        'profit_factor_at_least_1_25': profit_factor is not None and profit_factor >= 1.25,
+        'drawdown_at_most_5_pct_of_start': drawdown <= 180.0,
+        'single_market_profit_at_most_25_pct': concentration is not None and concentration <= 25.0,
+        'cost_stress_profit_factor_at_least_1_05': False,
+    }
+    enough_observation = requirements['minimum_trades_150'] and requirements['minimum_weeks_6']
+    return {
+        'decision': 'AFWIJZEN' if enough_observation and not all(requirements.values()) else 'VERZAMELEN',
+        'closed_trades': len(rows),
+        'observation_days': round(span_days, 2),
+        'profit_factor': round(profit_factor, 4) if profit_factor is not None else None,
+        'maximum_drawdown_eur': round(drawdown, 2),
+        'largest_market_profit_share_pct': round(concentration, 2) if concentration is not None else None,
+        'requirements': requirements,
+        'live_discussion_allowed': False,
+        'live_orders_possible': False,
+    }
+
+
 def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dict[str, Any]:
     current = int(time.time() * 1000) if now_ms is None else int(now_ms)
     conn = _connect(settings)
@@ -856,6 +1073,12 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
             'SELECT * FROM v40_notifications WHERE event_ms>=? ORDER BY event_ms DESC,id DESC LIMIT 100',
             (current - DAY_MS,),
         )]
+        human_challenger = _human_challenger_summary(conn, current)
+        prospective_readiness = _prospective_readiness(conn)
+        try:
+            human_challenger['latest_regime'] = json.loads(_meta(conn, 'human_regime_json', '{}'))
+        except ValueError:
+            human_challenger['latest_regime'] = {}
     finally:
         conn.close()
     for alert in alerts:
@@ -872,7 +1095,7 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
         'counts': json.loads(str(cycle['counts_json'])),
     } if cycle else {}
     return {
-        'version': '4.0-phase-6',
+        'version': '4.0-phase-7',
         'component': 'FULL_EUR_HUMAN_PAPER_V40',
         'generated_at_ms': current,
         'generated_at_utc': datetime.fromtimestamp(current / 1000, timezone.utc).isoformat(),
@@ -903,6 +1126,8 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
         'alerts_last_24h': alerts,
         'notifications_last_24h': notifications,
         'prospective_outcomes': outcomes,
+        'human_challenger': human_challenger,
+        'prospective_readiness': prospective_readiness,
         'heartbeat': heartbeat,
         'storage': {
             'database_bytes': db_bytes,
@@ -940,7 +1165,7 @@ def write_notification_feed(
     finally:
         conn.close()
     feed = {
-        'version': '4.0-phase-6',
+        'version': '4.0-phase-7',
         'generated_at_ms': current,
         'generated_at_utc': datetime.fromtimestamp(current / 1000, timezone.utc).isoformat(),
         'delivery': 'LOKALE_FEED; EXTERN_KANAAL_NOG_NIET_GEKOZEN',
@@ -975,7 +1200,7 @@ def load_report(settings: V40RuntimeSettings) -> dict[str, Any]:
 def print_status(report: dict[str, Any]) -> None:
     cycle = report.get('latest_cycle', {})
     portfolio = report.get('paper_portfolio', {})
-    print('=== CRYPTOBOT v4.0 FASE 6 | ADAPTIEVE HERINSTAP + MELDINGENFEED ===')
+    print('=== CRYPTOBOT v4.0 FASE 7 | MENSELIJKE CHALLENGER (OBSERVATIE) ===')
     print('MODUS                 : OBSERVE-ONLY')
     print('PAPER-SIMULATIE       : AAN (ALLEEN REKENWERK)')
     print('LIVE ORDERS           : UIT / TECHNISCH ONMOGELIJK')
@@ -1003,6 +1228,11 @@ def print_status(report: dict[str, Any]) -> None:
         )
     print(f"DATABASE              : {int(report.get('storage', {}).get('database_bytes', 0))/1_048_576:.1f} MB")
     print(f"MELDINGEN 24U         : {len(report.get('notifications_last_24h', []))}")
+    challenger = report.get('human_challenger', {})
+    regime = challenger.get('latest_regime', {})
+    print(f"MENSELIJK REGIME      : {regime.get('regime', 'ONBEKEND')}")
+    print(f"CHALLENGER 24U        : {challenger.get('reviews_last_24h', {})}")
+    print('CHALLENGER INVLOED    : GEEN; ALLEEN VERGELIJKEN')
     print('EXTERN MELDKANAAL     : NOG NIET GEKOZEN')
 
 
