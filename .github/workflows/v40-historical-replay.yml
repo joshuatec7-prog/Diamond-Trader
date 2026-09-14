@@ -1,0 +1,67 @@
+name: v4.0 historical replay
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Aantal historische dagen (7-90)
+        required: true
+        default: '90'
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - .github/workflows/v40-historical-replay.yml
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.14'
+      - run: python -m pip install -r requirements.txt
+      - name: Run isolated replay
+        env:
+          REPLAY_DAYS: ${{ inputs.days || '90' }}
+        run: |
+          python -u v40_historical_lab.py \
+            --days "$REPLAY_DAYS" \
+            --output cryptobot_v40_historical_replay.json \
+            | tee cryptobot_v40_historical_replay.log
+      - name: Publish compact result
+        if: always()
+        run: |
+          if test -f cryptobot_v40_historical_replay.json; then
+            python - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path('cryptobot_v40_historical_replay.json').read_text())
+          validation = report['runner_validation']
+          without_lsk = validation['without_lsk']
+          print('## CryptoBot v4.0 replay')
+          print(f"- Markten: {report['markets_completed']}/{report['markets_requested']}")
+          print(f"- Dataproblemen: {len(report['errors'])}")
+          print(f"- Signalen: {report['signal_summary']['signals']}")
+          print(f"- Baseline zonder LSK: EUR {without_lsk['baseline']['total_result_eur']:.2f}")
+          print(f"- Runner zonder LSK: EUR {without_lsk['runner']['total_result_eur']:.2f}")
+          print(f"- Verschil: EUR {without_lsk['runner_minus_baseline_eur']:.2f}")
+          print(f"- Besluit: {validation['decision']}")
+          PY
+          else
+            echo 'Replay heeft geen JSON-resultaat opgeleverd.' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cryptobot-v40-historical-replay
+          path: |
+            cryptobot_v40_historical_replay.json
+            cryptobot_v40_historical_replay.log
+          if-no-files-found: warn
+          retention-days: 14
