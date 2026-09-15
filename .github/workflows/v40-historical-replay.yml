@@ -15,6 +15,7 @@ on:
       - v40_historical_lab.py
       - v40_replay.py
       - v40_human_engine.py
+      - v40_marketwide_audit.py
 
 jobs:
   replay:
@@ -36,32 +37,35 @@ jobs:
             --days "$REPLAY_DAYS" \
             --output cryptobot_v40_historical_replay.json \
             | tee cryptobot_v40_historical_replay.log
-      - name: Publish compact result
+      - name: Build market-wide audit
         if: always()
         run: |
           if test -f cryptobot_v40_historical_replay.json; then
+            python -u v40_marketwide_audit.py \
+              --report cryptobot_v40_historical_replay.json \
+              --output cryptobot_v40_marketwide_audit.json \
+              --markdown cryptobot_v40_marketwide_audit.md
+          fi
+      - name: Publish compact result
+        if: always()
+        run: |
+          if test -f cryptobot_v40_marketwide_audit.md; then
+            cat cryptobot_v40_marketwide_audit.md >> "$GITHUB_STEP_SUMMARY"
+          elif test -f cryptobot_v40_historical_replay.json; then
             python - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json
           from pathlib import Path
 
           report = json.loads(Path('cryptobot_v40_historical_replay.json').read_text())
-          validation = report['runner_validation']
-          without_lsk = validation['without_lsk']
           shadow = report['shadow_decision_desk']
           print('## CryptoBot v4.0 replay')
           print(f"- Markten: {report['markets_completed']}/{report['markets_requested']}")
           print(f"- Dataproblemen: {len(report['errors'])}")
           print(f"- Signalen: {report['signal_summary']['signals']}")
-          print(f"- Baseline zonder LSK: EUR {without_lsk['baseline']['total_result_eur']:.2f}")
-          print(f"- Runner zonder LSK: EUR {without_lsk['runner']['total_result_eur']:.2f}")
-          print(f"- Verschil: EUR {without_lsk['runner_minus_baseline_eur']:.2f}")
-          print(f"- Besluit: {validation['decision']}")
           print(f"- Shadow Decision Desk: {shadow['portfolio_accepted']} trades, EUR {shadow['full_period']['total_result_eur']:.2f}")
           print(f"- Shadow PF: {shadow['full_period']['profit_factor']}")
-          print(f"- Shadow validatie: EUR {shadow['validation']['total_result_eur']:.2f}")
-          print(f"- Shadow onaangeraakte test: EUR {shadow['untouched_test']['total_result_eur']:.2f}")
-          print(f"- Shadow VTHO: {shadow['vtho_audit']['candidates']} kandidaten, {shadow['vtho_audit']['selected']} gekozen")
           print(f"- Shadow besluit: {shadow['decision']}")
+          print('- Marktbrede audit kon niet worden opgebouwd.')
           PY
           else
             echo 'Replay heeft geen JSON-resultaat opgeleverd.' | tee -a "$GITHUB_STEP_SUMMARY"
@@ -73,5 +77,7 @@ jobs:
           path: |
             cryptobot_v40_historical_replay.json
             cryptobot_v40_historical_replay.log
+            cryptobot_v40_marketwide_audit.json
+            cryptobot_v40_marketwide_audit.md
           if-no-files-found: warn
           retention-days: 14
