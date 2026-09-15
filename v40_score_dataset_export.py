@@ -8,10 +8,24 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from bitvavo_public import BitvavoPublic
+from v40_human_engine import candle_features
 from v40_replay import DAY_MS, replay_market, simulate_signal_trade
 
 
 FIVE_MINUTE_MS = 300_000
+RICH_FEATURE_KEYS = (
+    'return_15m_pct',
+    'return_60m_pct',
+    'return_4h_pct',
+    'atr_pct',
+    'volume_ratio',
+    'trend_up',
+    'distance_to_4h_high_pct',
+    'extension_atr',
+    'compression_ratio',
+    'higher_low',
+    'positive_bars_last_6',
+)
 
 
 def _write_report(path_text: str, report: dict[str, Any]) -> None:
@@ -22,11 +36,43 @@ def _write_report(path_text: str, report: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def enrich_trade_features(candles: Sequence[Any], trade: dict[str, Any]) -> dict[str, Any]:
+    """Voeg alleen kenmerken toe die op het historische signaalmoment al bekend waren."""
+    signal_ms = int(trade.get('signal_ms', 0))
+    rows = sorted((c for c in candles if c.is_valid), key=lambda c: c.timestamp_ms)
+    signal_index = next(
+        (index for index, candle in enumerate(rows) if candle.timestamp_ms == signal_ms),
+        None,
+    )
+    if signal_index is None:
+        raise ValueError('signaalmoment ontbreekt voor feature-export')
+    features = candle_features(rows[max(0, signal_index - 119):signal_index + 1])
+    if not bool(features.get('valid')):
+        raise ValueError('onvoldoende gesloten candles voor feature-export')
+    enriched = dict(trade)
+    merged = dict(trade.get('entry_features') or {})
+    for key in RICH_FEATURE_KEYS:
+        merged[key] = features.get(key)
+    enriched['entry_features'] = merged
+    return enriched
+
+
 def compact_trade(trade: dict[str, Any]) -> dict[str, Any]:
     events = list(trade.get('events') or [])
     closed = str(trade.get('status', '')).upper() == 'GESLOTEN' and len(events) > 1
     close_ms = int(events[-1].get('event_ms', 0)) if closed else None
     features = trade.get('entry_features') or {}
+    m15 = float(features.get('return_15m_pct') or 0.0)
+    m60 = float(features.get('return_60m_pct') or 0.0)
+    m4h = float(features.get('return_4h_pct') or 0.0)
+    exported_features = {
+        key: features.get(key)
+        for key in RICH_FEATURE_KEYS
+    }
+    exported_features['trend_up'] = bool(features.get('trend_up'))
+    exported_features['higher_low'] = bool(features.get('higher_low'))
+    exported_features['momentum_accel_15m_vs_60m'] = round(m15 * 4.0 - m60, 8)
+    exported_features['momentum_accel_60m_vs_4h'] = round(m60 * 4.0 - m4h, 8)
     return {
         'market': str(trade.get('market', '')),
         'signal_ms': int(trade.get('signal_ms', 0)),
@@ -40,14 +86,7 @@ def compact_trade(trade: dict[str, Any]) -> dict[str, Any]:
         'relative_strength_vs_btc_1h_pct': trade.get('relative_strength_vs_btc_1h_pct'),
         'net_reward_risk': trade.get('net_reward_risk'),
         'btc_return_1h_pct': trade.get('btc_return_1h_pct'),
-        'entry_features': {
-            'return_15m_pct': features.get('return_15m_pct'),
-            'return_60m_pct': features.get('return_60m_pct'),
-            'return_4h_pct': features.get('return_4h_pct'),
-            'atr_pct': features.get('atr_pct'),
-            'volume_ratio': features.get('volume_ratio'),
-            'trend_up': bool(features.get('trend_up')),
-        },
+        'entry_features': exported_features,
         'status': 'GESLOTEN' if closed else 'OPEN_EINDE_PERIODE',
     }
 
@@ -91,14 +130,16 @@ def run_export(
                 signal_start_ms=signal_start,
             )
             for signal in replay['signals']:
-                candidates.append(compact_trade(simulate_signal_trade(rows, signal)))
+                trade = simulate_signal_trade(rows, signal)
+                trade = enrich_trade_features(rows, trade)
+                candidates.append(compact_trade(trade))
             markets_completed += 1
         except Exception as exc:
             errors.append(f'{market}: {type(exc).__name__}: {exc}')
 
     candidates.sort(key=lambda item: (int(item['signal_ms']), str(item['market'])))
     report = {
-        'version': '4.0-score-dataset-1',
+        'version': '4.0-score-dataset-2-rich-context',
         'component': 'V40_SCORE_CALIBRATION_DATASET',
         'generated_at_utc': datetime.now(timezone.utc).isoformat(),
         'period': {
@@ -116,12 +157,17 @@ def run_export(
         'markets_requested': len(active),
         'markets_completed': markets_completed,
         'candidates': len(candidates),
+        'feature_set': list(RICH_FEATURE_KEYS) + [
+            'momentum_accel_15m_vs_60m',
+            'momentum_accel_60m_vs_4h',
+        ],
         'errors': errors,
         'rows': candidates,
         'notes': [
             'Dit bestand exporteert uitsluitend historische PAPER-kandidaten en uitkomsten.',
             'Er wordt geen selectieregel gewijzigd en er kunnen geen orders worden geplaatst.',
             'Alle EUR-markten worden gelijk behandeld; er zijn geen munt-specifieke uitzonderingen.',
+            'Extra context wordt opnieuw berekend uit uitsluitend gesloten candles tot en met het signaalmoment.',
             'De dataset is bedoeld voor een vooraf vastgelegde 60/15/15 score-herkalibratie.',
         ],
     }
@@ -131,10 +177,11 @@ def run_export(
 
 
 def print_status(report: dict[str, Any]) -> None:
-    print('=== v4.0 SCORE-CALIBRATIE DATASET EXPORT ===')
+    print('=== v4.0 SCORE-CALIBRATIE DATASET EXPORT | RIJKE CONTEXT ===')
     print('UITVOERING : UIT / OFFLINE METING')
     print(f"MARKTEN    : {report['markets_completed']}/{report['markets_requested']}")
     print(f"KANDIDATEN : {report['candidates']}")
+    print(f"FEATURES   : {len(report['feature_set'])}")
     print(f"FOUTEN     : {len(report['errors'])}")
 
 
