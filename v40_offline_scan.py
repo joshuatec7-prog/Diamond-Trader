@@ -44,14 +44,19 @@ def scan_all_eur(api: BitvavoPublic, *, output_path: str | None = None) -> dict:
                 if book is None:
                     raise RuntimeError('bruikbaar orderboek ontbreekt')
                 spread_pct = book.spread_pct
-            decisions.append(evaluate_entry(
+            decision = evaluate_entry(
                 market,
                 candles,
                 btc,
                 volume_quote_eur=volume_quote,
                 spread_pct=spread_pct,
                 settings=V40Settings(),
-            ))
+            )
+            # Het observe-only beslislogboek moet ook kunnen meten wat er na een
+            # afwijzing of te late pump gebeurde. De publieke ticker is uitsluitend
+            # een referentieprijs en kan geen order of PAPER-positie openen.
+            decision.setdefault('entry_reference', float(ticker['last']))
+            decisions.append(decision)
         except Exception as exc:
             errors.append(f'{market}: {type(exc).__name__}: {exc}')
     priority = {'KOOPKANS': 0, 'VOLGEN': 1, 'PUMP_TE_LAAT': 2, 'AFWIJZEN': 3}

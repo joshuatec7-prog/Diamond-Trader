@@ -317,6 +317,7 @@ class V40HumanEngineTests(unittest.TestCase):
         self.assertEqual(api.candle_markets.count('THIN-EUR'), 0)
         thin = next(item for item in report['decisions'] if item['market'] == 'THIN-EUR')
         self.assertEqual(thin['action'], 'AFWIJZEN')
+        self.assertEqual(thin['entry_reference'], 1.0)
         missing = next(item for item in report['decisions'] if item['market'] == 'MISSING-EUR')
         self.assertIn('actieve_markt_zonder_bruikbare_ticker', missing['reasons'])
         self.assertFalse(report['execution_enabled'])
