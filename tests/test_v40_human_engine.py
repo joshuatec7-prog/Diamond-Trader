@@ -391,8 +391,9 @@ class V40HumanEngineTests(unittest.TestCase):
         self.assertEqual(report['markets_completed'], 3)
         self.assertIn('VTHO-EUR', report['control_cases'])
         self.assertIn('LSK-EUR', report['control_cases'])
+        self.assertIn('VET-EUR', report['control_cases'])
         self.assertFalse(report['raw_candles_saved'])
-        self.assertEqual(report['version'], '4.0-phase-7')
+        self.assertEqual(report['version'], '4.0-phase-8')
         self.assertEqual(report['control_cases']['LSK-EUR']['paper_trades'], [])
         self.assertEqual(report['control_cases']['LSK-EUR']['runner_trades'], [])
         self.assertEqual(report['runner_validation']['decision'], 'ONVOLDOENDE_DATA')
@@ -559,6 +560,8 @@ class V40ShadowDecisionDeskTests(V40TournamentTests):
         ])
         self.assertEqual(result['vtho_audit']['candidates'], 1)
         self.assertEqual(result['vtho_audit']['selected'], 1)
+        self.assertEqual(len(result['vtho_audit']['cases']), 1)
+        self.assertTrue(result['vtho_audit']['cases'][0]['selected'])
 
     def test_shadow_desk_builder_never_activates_execution(self):
         trades = [self.desk_candidate(f'M{index}-EUR', index * DAY_MS) for index in range(90)]
@@ -567,3 +570,5 @@ class V40ShadowDecisionDeskTests(V40TournamentTests):
         self.assertFalse(result['live_orders_possible'])
         self.assertFalse(result['active_paper_changed'])
         self.assertEqual(result['configuration']['profiles_optimized_on_replay'], 0)
+        self.assertEqual(len(result['selected_trade_audit']), 90)
+        self.assertEqual(result['selected_trade_audit'][0]['desk_review']['confidence'], 117.0)

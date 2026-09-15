@@ -235,6 +235,7 @@ def simulate_signal_trade(
         'net_reward_risk': signal.get('net_reward_risk'),
         'entry_features': signal.get('entry_features', {}),
         'btc_return_1h_pct': signal.get('btc_return_1h_pct'),
+        'outcomes': signal.get('outcomes', {}),
         'position_eur': notional,
         'entry_price': entry,
         'initial_base': initial_base,
@@ -579,6 +580,12 @@ def simulate_capacity_limited_portfolio(
             'net_reward_risk': trade.get('net_reward_risk'),
             'entry_features': trade.get('entry_features', {}),
             'btc_return_1h_pct': trade.get('btc_return_1h_pct'),
+            'entry_price': trade.get('entry_price'),
+            'result_pct': trade.get('result_pct'),
+            'close_ms': close_ms if closed else None,
+            'exit_reason': str(events[-1].get('reason', 'OPEN')) if closed else 'OPEN',
+            'outcomes': trade.get('outcomes', {}),
+            'selection_review': trade.get('shadow_desk', {}),
             'status': 'GESLOTEN' if closed else 'OPEN_EINDE_PERIODE',
         })
 
@@ -693,7 +700,7 @@ def build_capacity_diagnostics(capacity_validation: dict[str, Any]) -> dict[str,
     )
     controls = {}
     rejection_markets = all_report.get('rejection_counts_by_market', {})
-    for market in ('VTHO-EUR', 'LSK-EUR'):
+    for market in ('VET-EUR', 'VTHO-EUR', 'LSK-EUR'):
         controls[market] = {
             'selected': _diagnostic_trade_summary([
                 trade for trade in selected_all if trade.get('market') == market
@@ -1004,6 +1011,7 @@ def apply_shadow_decision_desk(trades: Sequence[dict[str, Any]]) -> dict[str, An
     vtho_seen = vtho_eligible = vtho_selected = 0
     vtho_vetoes: Counter[str] = Counter()
     vtho_lost_to: Counter[str] = Counter()
+    vtho_cases: list[dict[str, Any]] = []
     consecutive_losses = 0
     pause_until_ms = 0
 
@@ -1029,6 +1037,23 @@ def apply_shadow_decision_desk(trades: Sequence[dict[str, Any]]) -> dict[str, An
             if market == 'VTHO-EUR':
                 vtho_seen += 1
             review = _shadow_desk_review(trade, memory.get(_shadow_memory_key(trade), []))
+            vtho_case = None
+            if market == 'VTHO-EUR':
+                vtho_case = {
+                    'signal_ms': int(trade.get('signal_ms', 0)),
+                    'route': str(trade.get('route', 'ONBEKEND')),
+                    'score': float(trade.get('score', 0.0)),
+                    'confidence': float(review['confidence']),
+                    'eligible': bool(review['eligible']),
+                    'selected': False,
+                    'bull_reasons': list(review['bull_reasons']),
+                    'bear_reasons': list(review['bear_reasons']),
+                    'risk_vetoes': list(review['risk_vetoes']),
+                    'memory': dict(review['memory']),
+                    'result_eur': float(trade.get('result_eur', 0.0)),
+                    'outcomes': trade.get('outcomes', {}),
+                }
+                vtho_cases.append(vtho_case)
             reasons = list(review['risk_vetoes'])
             if not review['eligible']:
                 reasons.extend(review['bear_reasons'])
@@ -1077,8 +1102,16 @@ def apply_shadow_decision_desk(trades: Sequence[dict[str, Any]]) -> dict[str, An
         daily_entries[utc_day] += 1
         if str(winner.get('market')) == 'VTHO-EUR':
             vtho_selected += 1
+            for case in reversed(vtho_cases):
+                if int(case['signal_ms']) == signal_ms:
+                    case['selected'] = True
+                    break
         elif any(str(trade.get('market')) == 'VTHO-EUR' for trade, _ in ranked):
             vtho_lost_to[str(winner.get('market', 'ONBEKEND'))] += 1
+            for case in reversed(vtho_cases):
+                if int(case['signal_ms']) == signal_ms and bool(case['eligible']):
+                    case['lost_to_market'] = str(winner.get('market', 'ONBEKEND'))
+                    break
 
     return {
         'selected_trades': selected,
@@ -1091,6 +1124,7 @@ def apply_shadow_decision_desk(trades: Sequence[dict[str, Any]]) -> dict[str, An
             'selected': vtho_selected,
             'veto_counts': dict(vtho_vetoes),
             'lost_to_markets': dict(vtho_lost_to.most_common(15)),
+            'cases': vtho_cases,
         },
         'future_data_used_for_selection': False,
         'memory_uses_only_cases_closed_before_decision': True,
@@ -1127,6 +1161,20 @@ def build_shadow_decision_desk(trades: Sequence[dict[str, Any]]) -> dict[str, An
     validation = period_result(validation_start, test_start)
     untouched = period_result(test_start, None)
     full = summarize_strategy_trades(accepted)
+    selected_audit = []
+    for trade in accepted:
+        selected_audit.append({
+            'market': str(trade.get('market', '')),
+            'signal_ms': int(trade.get('signal_ms', 0)),
+            'route': str(trade.get('route', '')),
+            'score': float(trade.get('score', 0.0)),
+            'result_eur': float(trade.get('result_eur', 0.0)),
+            'result_pct': float(trade.get('result_pct') or 0.0),
+            'entry_price': float(trade.get('entry_price') or 0.0),
+            'exit_reason': str(trade.get('exit_reason', 'OPEN')),
+            'outcomes': trade.get('outcomes', {}),
+            'desk_review': trade.get('selection_review', {}),
+        })
     criteria = {
         'development_positive': development['total_result_eur'] > 0.0,
         'validation_positive': validation['total_result_eur'] > 0.0,
@@ -1162,6 +1210,7 @@ def build_shadow_decision_desk(trades: Sequence[dict[str, Any]]) -> dict[str, An
         'untouched_test': untouched,
         'full_period': full,
         'maximum_realized_drawdown_eur': portfolio['maximum_realized_drawdown_eur'],
+        'selected_trade_audit': selected_audit,
         'veto_counts': desk['veto_counts'],
         'vtho_audit': desk['vtho_audit'],
         'criteria': criteria,

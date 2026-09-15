@@ -91,6 +91,61 @@ class AutonomousV40Tests(unittest.TestCase):
             self.assertEqual(report['prospective_readiness']['decision'], 'VERZAMELEN')
             self.assertFalse(report['prospective_readiness']['live_discussion_allowed'])
 
+    def test_decision_logbook_keeps_top_five_and_fixed_controls_without_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self.settings(Path(temporary))
+            v40.ensure_runtime(settings, NOW_MS)
+            scan = buy_scan()
+            template = dict(scan['decisions'][0])
+            scan['decisions'] = []
+            for index, market in enumerate(
+                ('ONE-EUR', 'TWO-EUR', 'THREE-EUR', 'FOUR-EUR', 'FIVE-EUR', 'SIX-EUR')
+            ):
+                item = dict(template)
+                item.update({'market': market, 'score': 90.0 - index})
+                scan['decisions'].append(item)
+            for market in ('VET-EUR', 'VTHO-EUR', 'LSK-EUR'):
+                item = dict(template)
+                item.update({'market': market, 'action': 'VOLGEN', 'score': 50.0})
+                scan['decisions'].append(item)
+            scan['markets_seen'] = scan['markets_evaluated'] = len(scan['decisions'])
+
+            stored = v40.ingest_scan(settings, scan, now_ms=NOW_MS)
+            self.assertEqual(stored['logbook_stored'], 8)
+            with sqlite3.connect(settings.db_path) as conn:
+                rows = conn.execute(
+                    '''SELECT market,is_top_five,is_control_market,chosen_for_observation,
+                              execution_enabled FROM v40_decision_logbook
+                       ORDER BY rank_in_cycle'''
+                ).fetchall()
+            self.assertEqual(sum(row[1] for row in rows), 5)
+            self.assertEqual(sum(row[2] for row in rows), 3)
+            self.assertEqual(sum(row[3] for row in rows), 1)
+            self.assertTrue(all(row[4] == 0 for row in rows))
+            self.assertEqual(rows[0][0], 'ONE-EUR')
+
+    def test_decision_logbook_measures_rejected_choice_without_creating_alert(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self.settings(Path(temporary))
+            v40.ensure_runtime(settings, NOW_MS)
+            scan = buy_scan()
+            scan['decisions'][0].update({'action': 'VOLGEN', 'score': 72.0})
+            v40.ingest_scan(settings, scan, now_ms=NOW_MS)
+            api = StablePublicApi()
+            result = v40.monitor_outcomes(
+                settings, api=api, now_ms=NOW_MS + 15 * 60_000,
+            )
+            self.assertEqual(result['measured'], 0)
+            self.assertEqual(result['logbook_measured'], 1)
+            report = v40.build_report(settings, NOW_MS + 15 * 60_000)
+            logbook = report['decision_logbook']
+            self.assertFalse(logbook['order_or_paper_effect'])
+            self.assertFalse(logbook['execution_enabled'])
+            self.assertEqual(logbook['top_five_outcomes']['15']['samples'], 1)
+            self.assertEqual(
+                logbook['latest_top_five_and_controls'][0]['market'], 'TEST-EUR'
+            )
+
     def test_candidate_needs_three_l2_samples_over_one_minute(self):
         with tempfile.TemporaryDirectory() as temporary:
             settings = self.settings(Path(temporary))

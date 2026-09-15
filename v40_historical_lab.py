@@ -122,14 +122,14 @@ def run_historical_lab(
                 (replay['runner_trades'] for replay in replays if replay['market'] == market), []
             ),
         }
-        for market in ('VTHO-EUR', 'LSK-EUR')
+        for market in ('VET-EUR', 'VTHO-EUR', 'LSK-EUR')
     }
     capacity_validation = build_capacity_validation(paper_trades)
     capacity_diagnostics = build_capacity_diagnostics(capacity_validation)
     tournament_challenger = build_tournament_challenger(paper_trades)
     shadow_decision_desk = build_shadow_decision_desk(paper_trades)
     report = {
-        'version': '4.0-phase-7',
+        'version': '4.0-phase-8',
         'component': 'FULL_EUR_HISTORICAL_REPLAY',
         'generated_at_utc': datetime.now(timezone.utc).isoformat(),
         'period': {
@@ -157,7 +157,7 @@ def run_historical_lab(
         'control_cases': controls,
         'notes': [
             'Iedere beslissing gebruikt uitsluitend gesloten candles tot dat moment.',
-            'VTHO en LSK zijn controles; de regels zijn voor alle markten identiek.',
+            'VET, VTHO en LSK zijn controles; de regels zijn voor alle markten identiek.',
             'Resultaten zijn inclusief 0,66% vaste roundtripkosten en 0,12% aangenomen spread.',
             'De runner is uitsluitend offline vergeleken en wijzigt de actieve PAPER-bot niet.',
             'De runner moet ook zonder LSK positief zijn en de normale route verslaan.',
@@ -210,7 +210,7 @@ def print_status(report: dict[str, Any]) -> None:
             f"ROUTE {route:<20}: {item['trades']} trades"
             f" | €{item['total_result_eur']:.2f} | PF {item['profit_factor']}"
         )
-    for market in ('VTHO-EUR', 'LSK-EUR'):
+    for market in ('VET-EUR', 'VTHO-EUR', 'LSK-EUR'):
         item = diagnostics['control_markets'][market]
         chosen = item['selected']
         print(

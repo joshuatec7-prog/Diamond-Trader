@@ -35,6 +35,12 @@ CYCLE_RETENTION_MS = 14 * DAY_MS
 HISTORY_RETENTION_MS = 90 * DAY_MS
 PAPER_HISTORY_RETENTION_MS = 365 * DAY_MS
 NOTIFICATION_RETENTION_MS = 30 * DAY_MS
+DECISION_LOGBOOK_RETENTION_MS = 30 * DAY_MS
+DECISION_LOGBOOK_TOP_N = 5
+DECISION_LOGBOOK_HORIZONS_MINUTES = (15, 60, 240, 1440)
+DECISION_LOGBOOK_CONTROL_MARKETS = ('VET-EUR', 'VTHO-EUR', 'LSK-EUR')
+DECISION_LOGBOOK_NOTIONAL_EUR = 250.0
+DECISION_LOGBOOK_MAX_OUTCOME_DELAY_MS = 10 * MINUTE_MS
 # Een bevestigde nieuwe opbouw mag na drie uur opnieuw worden beoordeeld.
 # De L2-hercontrole en de blokkade op een reeds open positie blijven leidend.
 CANDIDATE_COOLDOWN_MS = 3 * HOUR_MS
@@ -163,11 +169,33 @@ def _connect(settings: V40RuntimeSettings) -> sqlite3.Connection:
         thesis_json TEXT NOT NULL, l2_review_json TEXT NOT NULL DEFAULT '{}',
         active_paper_changed INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(cycle_ms,market));
+      CREATE TABLE IF NOT EXISTS v40_decision_logbook(
+        cycle_ms INTEGER NOT NULL, market TEXT NOT NULL, rank_in_cycle INTEGER NOT NULL,
+        is_top_five INTEGER NOT NULL, is_control_market INTEGER NOT NULL,
+        chosen_for_observation INTEGER NOT NULL, action TEXT NOT NULL, route TEXT NOT NULL,
+        score REAL NOT NULL, proposed_paper_eur REAL NOT NULL,
+        entry_reference REAL NOT NULL, observation_base REAL NOT NULL,
+        review_action TEXT NOT NULL, evidence_strength TEXT NOT NULL,
+        confidence_score REAL NOT NULL, regime TEXT NOT NULL,
+        reasons_json TEXT NOT NULL, vetoes_json TEXT NOT NULL,
+        uncertainty_json TEXT NOT NULL, thesis_json TEXT NOT NULL,
+        details_json TEXT NOT NULL, execution_enabled INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(cycle_ms,market));
+      CREATE TABLE IF NOT EXISTS v40_decision_logbook_outcomes(
+        cycle_ms INTEGER NOT NULL, market TEXT NOT NULL, horizon_minutes INTEGER NOT NULL,
+        measured_ms INTEGER NOT NULL, sell_vwap REAL NOT NULL,
+        gross_return_pct REAL NOT NULL, net_return_pct REAL NOT NULL,
+        details_json TEXT NOT NULL,
+        PRIMARY KEY(cycle_ms,market,horizon_minutes),
+        FOREIGN KEY(cycle_ms,market) REFERENCES v40_decision_logbook(cycle_ms,market));
       CREATE TABLE IF NOT EXISTS v40_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_v40_candidate_status ON v40_candidates(status,created_ms);
       CREATE INDEX IF NOT EXISTS idx_v40_alert_market_time ON v40_alerts(market,event_ms);
       CREATE INDEX IF NOT EXISTS idx_v40_notification_time ON v40_notifications(event_ms);
       CREATE INDEX IF NOT EXISTS idx_v40_human_review_time ON v40_human_reviews(cycle_ms);
+      CREATE INDEX IF NOT EXISTS idx_v40_logbook_time ON v40_decision_logbook(cycle_ms);
+      CREATE INDEX IF NOT EXISTS idx_v40_logbook_outcome_time
+        ON v40_decision_logbook_outcomes(cycle_ms,horizon_minutes);
     ''')
     return conn
 
@@ -261,7 +289,7 @@ def ensure_runtime(settings: V40RuntimeSettings, now_ms: int | None = None) -> N
     current = int(time.time() * 1000) if now_ms is None else int(now_ms)
     conn = _connect(settings)
     try:
-        _set_meta(conn, 'version', '4.0-phase-7')
+        _set_meta(conn, 'version', '4.0-phase-8')
         _set_meta(conn, 'initialized_ms', _meta(conn, 'initialized_ms', str(current)))
         _set_meta(conn, 'mode', 'OBSERVE_ONLY')
         _set_meta(conn, 'execution_enabled', '0')
@@ -321,6 +349,70 @@ def _performance_guard(conn: sqlite3.Connection, current: int) -> dict[str, Any]
     }
 
 
+def _logbook_rank_key(decision: dict[str, Any]) -> tuple[float, float, str]:
+    """Rangschik alleen met informatie die tijdens de scan bekend is."""
+    action_bonus = {'KOOPKANS': 20.0, 'VOLGEN': 10.0, 'PUMP_TE_LAAT': -10.0}.get(
+        str(decision.get('action', 'AFWIJZEN')), -20.0,
+    )
+    return (
+        -(float(decision.get('score', 0.0)) + action_bonus),
+        -float(decision.get('relative_strength_vs_btc_1h_pct') or 0.0),
+        str(decision.get('market', '')),
+    )
+
+
+def _store_decision_logbook(
+    conn: sqlite3.Connection,
+    decisions: list[dict[str, Any]],
+    reviews: dict[str, dict[str, Any]],
+    *,
+    cycle_ms: int,
+) -> int:
+    """Bewaar top vijf plus vaste controles; dit kan nooit een order starten."""
+    ranked = sorted(decisions, key=_logbook_rank_key)
+    ranks = {str(item.get('market', '')): index for index, item in enumerate(ranked, 1)}
+    top_markets = {str(item.get('market', '')) for item in ranked[:DECISION_LOGBOOK_TOP_N]}
+    keep_markets = top_markets | set(DECISION_LOGBOOK_CONTROL_MARKETS)
+    stored = 0
+    for decision in ranked:
+        market = str(decision.get('market', ''))
+        if market not in keep_markets:
+            continue
+        review = reviews[market]
+        entry = float(decision.get('entry_reference') or 0.0)
+        observation_base = DECISION_LOGBOOK_NOTIONAL_EUR / entry if entry > 0.0 else 0.0
+        compact = _compact_decision(decision)
+        compact['logbook_only'] = True
+        compact['human_review'] = review
+        conn.execute(
+            '''INSERT OR REPLACE INTO v40_decision_logbook
+               (cycle_ms,market,rank_in_cycle,is_top_five,is_control_market,
+                chosen_for_observation,action,route,score,proposed_paper_eur,
+                entry_reference,observation_base,review_action,evidence_strength,
+                confidence_score,regime,reasons_json,vetoes_json,uncertainty_json,
+                thesis_json,details_json,execution_enabled)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)''',
+            (
+                cycle_ms, market, ranks[market], int(market in top_markets),
+                int(market in DECISION_LOGBOOK_CONTROL_MARKETS),
+                int(ranks[market] == 1), str(decision.get('action', 'AFWIJZEN')),
+                str(decision.get('route', 'GEEN_SETUP')),
+                float(decision.get('score', 0.0)),
+                float(decision.get('proposed_paper_eur', 0.0)), entry, observation_base,
+                str(review.get('review_action', 'AFZIEN')),
+                str(review.get('evidence_strength', 'ONVOLDOENDE')),
+                float(review.get('confidence_score', 0.0)), str(review.get('regime', 'ONBEKEND')),
+                json.dumps(decision.get('reasons', []), ensure_ascii=False),
+                json.dumps(review.get('vetoes', []), ensure_ascii=False),
+                json.dumps(review.get('uncertainty', []), ensure_ascii=False),
+                json.dumps(review.get('thesis', []), ensure_ascii=False),
+                json.dumps(compact, ensure_ascii=False),
+            ),
+        )
+        stored += 1
+    return stored
+
+
 def ingest_scan(
     settings: V40RuntimeSettings,
     scan: dict[str, Any],
@@ -363,17 +455,23 @@ def ingest_scan(
                 json.dumps(counts, ensure_ascii=False),
             ),
         )
-        for decision in kept:
-            compact = _compact_decision(decision)
-            market = str(decision.get('market'))
-            action = str(decision.get('action'))
-            human_review = evaluate_human_challenger(
+        reviews: dict[str, dict[str, Any]] = {}
+        for decision in decisions:
+            reviews[str(decision.get('market'))] = evaluate_human_challenger(
                 decision,
                 regime_state=regime_state,
                 consecutive_losses=int(performance['consecutive_losses']),
                 pause_active=bool(performance['pause_active']),
                 daily_realized_pnl_eur=float(performance['daily_realized_pnl_eur']),
             )
+        logbook_stored = _store_decision_logbook(
+            conn, decisions, reviews, cycle_ms=current,
+        )
+        for decision in kept:
+            compact = _compact_decision(decision)
+            market = str(decision.get('market'))
+            action = str(decision.get('action'))
+            human_review = reviews[market]
             compact['human_challenger'] = human_review
             conn.execute(
                 'INSERT OR REPLACE INTO v40_decisions VALUES (?,?,?,?,?,?,?)',
@@ -454,6 +552,13 @@ def ingest_scan(
         removed_paper = _prune_paper_history(conn, current - PAPER_HISTORY_RETENTION_MS)
         removed_history = _prune_history(conn, current - HISTORY_RETENTION_MS)
         conn.execute('DELETE FROM v40_human_reviews WHERE cycle_ms<?', (current - HISTORY_RETENTION_MS,))
+        logbook_cutoff = current - DECISION_LOGBOOK_RETENTION_MS
+        conn.execute(
+            'DELETE FROM v40_decision_logbook_outcomes WHERE cycle_ms<?', (logbook_cutoff,),
+        )
+        removed_logbook = conn.execute(
+            'DELETE FROM v40_decision_logbook WHERE cycle_ms<?', (logbook_cutoff,),
+        ).rowcount
         _set_meta(conn, 'scan_attempted_ms', current)
         _set_meta(conn, 'scan_generated_ms', current)
         _set_meta(conn, 'last_scan_errors', json.dumps(scan.get('errors', []), ensure_ascii=False))
@@ -464,6 +569,7 @@ def ingest_scan(
         'decisions': len(decisions), 'stored': len(kept), 'queued_l2': queued,
         'removed_history': removed_history, 'removed_paper': removed_paper,
         'removed_notifications': removed_notifications,
+        'logbook_stored': logbook_stored, 'removed_logbook': removed_logbook,
     }
 
 
@@ -689,6 +795,30 @@ def monitor_outcomes(
         for horizon in DEFAULT_HORIZONS_MINUTES:
             if horizon not in existing and current >= int(alert['event_ms']) + horizon * MINUTE_MS:
                 pending.append((alert, horizon))
+    logbook_pending = []
+    logbook_rows = conn.execute(
+        '''SELECT * FROM v40_decision_logbook
+           WHERE entry_reference>0 AND observation_base>0 AND cycle_ms>=?
+           ORDER BY cycle_ms,rank_in_cycle,market''',
+        (current - 2 * DAY_MS,),
+    ).fetchall()
+    existing_logbook_outcomes = {
+        (int(item['cycle_ms']), str(item['market']), int(item['horizon_minutes']))
+        for item in conn.execute(
+            '''SELECT cycle_ms,market,horizon_minutes
+               FROM v40_decision_logbook_outcomes WHERE cycle_ms>=?''',
+            (current - 2 * DAY_MS,),
+        )
+    }
+    for row in logbook_rows:
+        for horizon in DECISION_LOGBOOK_HORIZONS_MINUTES:
+            key = (int(row['cycle_ms']), str(row['market']), horizon)
+            due_ms = int(row['cycle_ms']) + horizon * MINUTE_MS
+            if (
+                key not in existing_logbook_outcomes
+                and due_ms <= current <= due_ms + DECISION_LOGBOOK_MAX_OUTCOME_DELAY_MS
+            ):
+                logbook_pending.append((row, horizon))
     conn.close()
     measured = 0
     errors = []
@@ -714,6 +844,32 @@ def monitor_outcomes(
                 conn.close()
         except Exception as exc:
             errors.append(f"{alert['market']} {horizon}m: {type(exc).__name__}: {exc}")
+    logbook_measured = 0
+    for row, horizon in logbook_pending:
+        try:
+            book = market_api.sell_vwap_for_base(
+                str(row['market']), float(row['observation_base'])
+            )
+            sell = float(book['sell_vwap'])
+            entry = float(row['entry_reference'])
+            gross = (sell / entry - 1.0) * 100.0
+            net = gross - 0.66
+            conn = _connect(settings)
+            try:
+                conn.execute(
+                    '''INSERT OR IGNORE INTO v40_decision_logbook_outcomes
+                       VALUES (?,?,?,?,?,?,?,?)''',
+                    (
+                        int(row['cycle_ms']), str(row['market']), horizon, current,
+                        sell, gross, net, json.dumps(book, ensure_ascii=False),
+                    ),
+                )
+                conn.commit()
+                logbook_measured += 1
+            finally:
+                conn.close()
+        except Exception as exc:
+            errors.append(f"logboek {row['market']} {horizon}m: {type(exc).__name__}: {exc}")
     conn = _connect(settings)
     try:
         _set_meta(conn, 'outcome_attempted_ms', current)
@@ -721,7 +877,11 @@ def monitor_outcomes(
         conn.commit()
     finally:
         conn.close()
-    return {'pending': len(pending), 'measured': measured, 'errors': errors}
+    return {
+        'pending': len(pending), 'measured': measured,
+        'logbook_pending': len(logbook_pending),
+        'logbook_measured': logbook_measured, 'errors': errors,
+    }
 
 
 def _latest_features(conn: sqlite3.Connection, market: str) -> dict[str, Any]:
@@ -930,6 +1090,73 @@ def _outcome_summary(conn: sqlite3.Connection, horizon: int) -> dict[str, Any]:
     }
 
 
+def _decision_logbook_summary(conn: sqlite3.Connection, current: int) -> dict[str, Any]:
+    latest = conn.execute('SELECT MAX(cycle_ms) FROM v40_decision_logbook').fetchone()[0]
+    latest_rows = []
+    if latest is not None:
+        latest_rows = [dict(row) for row in conn.execute(
+            '''SELECT cycle_ms,market,rank_in_cycle,is_top_five,is_control_market,
+                      chosen_for_observation,action,route,score,review_action,
+                      evidence_strength,confidence_score,regime,reasons_json,vetoes_json,
+                      uncertainty_json,thesis_json,execution_enabled
+               FROM v40_decision_logbook WHERE cycle_ms=?
+               ORDER BY is_top_five DESC,rank_in_cycle,market''',
+            (int(latest),),
+        )]
+    for row in latest_rows:
+        for key in ('reasons_json', 'vetoes_json', 'uncertainty_json', 'thesis_json'):
+            row[key.removesuffix('_json')] = json.loads(str(row.pop(key)))
+        for key in ('is_top_five', 'is_control_market', 'chosen_for_observation', 'execution_enabled'):
+            row[key] = bool(row[key])
+
+    outcomes = {}
+    for horizon in DECISION_LOGBOOK_HORIZONS_MINUTES:
+        values = [float(row[0]) for row in conn.execute(
+            '''SELECT o.net_return_pct FROM v40_decision_logbook_outcomes o
+               JOIN v40_decision_logbook l
+                 ON l.cycle_ms=o.cycle_ms AND l.market=o.market
+               WHERE o.horizon_minutes=? AND l.is_top_five=1''',
+            (horizon,),
+        )]
+        winners = [value for value in values if value > 0.0]
+        outcomes[str(horizon)] = {
+            'samples': len(values),
+            'average_net_pct': round(mean(values), 5) if values else None,
+            'positive_pct': round(len(winners) / len(values) * 100.0, 2) if values else None,
+        }
+    control_rows = conn.execute(
+        '''SELECT l.market,o.horizon_minutes,COUNT(*) AS samples,
+                  AVG(o.net_return_pct) AS average_net_pct
+           FROM v40_decision_logbook l
+           JOIN v40_decision_logbook_outcomes o
+             ON o.cycle_ms=l.cycle_ms AND o.market=l.market
+           WHERE l.is_control_market=1
+           GROUP BY l.market,o.horizon_minutes
+           ORDER BY l.market,o.horizon_minutes'''
+    ).fetchall()
+    controls: dict[str, dict[str, Any]] = {
+        market: {} for market in DECISION_LOGBOOK_CONTROL_MARKETS
+    }
+    for row in control_rows:
+        controls[str(row['market'])][str(int(row['horizon_minutes']))] = {
+            'samples': int(row['samples']),
+            'average_net_pct': round(float(row['average_net_pct']), 5),
+        }
+    return {
+        'mode': 'OBSERVE_ONLY',
+        'purpose': 'VERGELIJK_BESTE_VIJF_EN_LEER_VAN_AFGEWEZEN_KEUZES',
+        'latest_cycle_ms': int(latest) if latest is not None else 0,
+        'latest_top_five_and_controls': latest_rows,
+        'top_five_outcomes': outcomes,
+        'control_market_outcomes': controls,
+        'retention_days': DECISION_LOGBOOK_RETENTION_MS // DAY_MS,
+        'horizons_minutes': list(DECISION_LOGBOOK_HORIZONS_MINUTES),
+        'order_or_paper_effect': False,
+        'execution_enabled': False,
+        'live_orders_possible': False,
+    }
+
+
 def _human_challenger_summary(conn: sqlite3.Connection, current: int) -> dict[str, Any]:
     rows = conn.execute(
         '''SELECT review_action,COUNT(*) AS samples,AVG(confidence_score) AS confidence
@@ -1074,6 +1301,7 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
             (current - DAY_MS,),
         )]
         human_challenger = _human_challenger_summary(conn, current)
+        decision_logbook = _decision_logbook_summary(conn, current)
         prospective_readiness = _prospective_readiness(conn)
         try:
             human_challenger['latest_regime'] = json.loads(_meta(conn, 'human_regime_json', '{}'))
@@ -1095,7 +1323,7 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
         'counts': json.loads(str(cycle['counts_json'])),
     } if cycle else {}
     return {
-        'version': '4.0-phase-7',
+        'version': '4.0-phase-8',
         'component': 'FULL_EUR_HUMAN_PAPER_V40',
         'generated_at_ms': current,
         'generated_at_utc': datetime.fromtimestamp(current / 1000, timezone.utc).isoformat(),
@@ -1127,6 +1355,7 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
         'notifications_last_24h': notifications,
         'prospective_outcomes': outcomes,
         'human_challenger': human_challenger,
+        'decision_logbook': decision_logbook,
         'prospective_readiness': prospective_readiness,
         'heartbeat': heartbeat,
         'storage': {
@@ -1136,6 +1365,7 @@ def build_report(settings: V40RuntimeSettings, now_ms: int | None = None) -> dic
             'signal_history_retention_days': HISTORY_RETENTION_MS // DAY_MS,
             'paper_history_retention_days': PAPER_HISTORY_RETENTION_MS // DAY_MS,
             'notification_retention_days': NOTIFICATION_RETENTION_MS // DAY_MS,
+            'decision_logbook_retention_days': DECISION_LOGBOOK_RETENTION_MS // DAY_MS,
         },
     }
 
@@ -1165,7 +1395,7 @@ def write_notification_feed(
     finally:
         conn.close()
     feed = {
-        'version': '4.0-phase-7',
+        'version': '4.0-phase-8',
         'generated_at_ms': current,
         'generated_at_utc': datetime.fromtimestamp(current / 1000, timezone.utc).isoformat(),
         'delivery': 'LOKALE_FEED; EXTERN_KANAAL_NOG_NIET_GEKOZEN',
@@ -1200,7 +1430,7 @@ def load_report(settings: V40RuntimeSettings) -> dict[str, Any]:
 def print_status(report: dict[str, Any]) -> None:
     cycle = report.get('latest_cycle', {})
     portfolio = report.get('paper_portfolio', {})
-    print('=== CRYPTOBOT v4.0 FASE 7 | MENSELIJKE CHALLENGER (OBSERVATIE) ===')
+    print('=== CRYPTOBOT v4.0 FASE 8 | BESLISLOGBOEK (OBSERVATIE) ===')
     print('MODUS                 : OBSERVE-ONLY')
     print('PAPER-SIMULATIE       : AAN (ALLEEN REKENWERK)')
     print('LIVE ORDERS           : UIT / TECHNISCH ONMOGELIJK')
@@ -1232,6 +1462,19 @@ def print_status(report: dict[str, Any]) -> None:
     regime = challenger.get('latest_regime', {})
     print(f"MENSELIJK REGIME      : {regime.get('regime', 'ONBEKEND')}")
     print(f"CHALLENGER 24U        : {challenger.get('reviews_last_24h', {})}")
+    logbook = report.get('decision_logbook', {})
+    latest = [
+        item for item in logbook.get('latest_top_five_and_controls', [])
+        if item.get('is_top_five')
+    ]
+    print(f"BESLISLOGBOEK TOP 5   : {len(latest)} kandidaten")
+    for item in latest:
+        print(
+            f"  {int(item['rank_in_cycle'])}. {item['market']:<12}"
+            f" | {item['action']:<12} | score {float(item['score']):>5.1f}"
+            f" | mens {item['review_action']}"
+        )
+    print('BESLISLOGBOEK INVLOED : GEEN; ALLEEN METEN EN VERGELIJKEN')
     print('CHALLENGER INVLOED    : GEEN; ALLEEN VERGELIJKEN')
     print('EXTERN MELDKANAAL     : NOG NIET GEKOZEN')
 
