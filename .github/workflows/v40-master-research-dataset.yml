@@ -28,7 +28,7 @@ jobs:
       - name: Export exact 90-day master dataset
         run: |
           python v40_master_research_dataset.py --days 90 --output cryptobot_v40_master_research_dataset.json | tee cryptobot_v40_master_research_dataset.log
-      - name: Add short BTC context without refetching every market
+      - name: Add short BTC context robustly
         run: |
           python - <<'PY'
           import json
@@ -40,35 +40,71 @@ jobs:
           report = json.loads(path.read_text(encoding="utf-8"))
           period = report["period"]
           api = BitvavoPublic("https://api.bitvavo.com/v2", timeout_seconds=20, retries=4)
+
           btc = api.closed_candles_between(
               "BTC-EUR", "5m",
               int(period["fetch_start_ms"]), int(period["fetch_end_ms"]),
               now_ms=int(period["fetch_end_ms"]),
           )
           closes = {int(c.timestamp_ms): float(c.close) for c in btc if c.is_valid}
+
           def pct(new, old):
               return (new / old - 1.0) * 100.0 if new > 0 and old > 0 else 0.0
+
+          def complete(ts):
+              needed = [ts, ts - FIVE, ts - 2 * FIVE, ts - 3 * FIVE, ts - 12 * FIVE]
+              return all(item in closes for item in needed)
+
+          signal_times = sorted({int(row["signal_ms"]) for row in report["rows"]})
+          missing = [ts for ts in signal_times if not complete(ts)]
+
+          # Een brede historische API-call kan incidenteel één candle missen.
+          # Haal dan uitsluitend een klein BTC-venster opnieuw op; geen EUR-markt wordt opnieuw gefetcht.
+          for ts in missing:
+              retry = api.closed_candles_between(
+                  "BTC-EUR", "5m",
+                  ts - 13 * FIVE, ts + FIVE,
+                  now_ms=ts + FIVE,
+              )
+              for candle in retry:
+                  if candle.is_valid:
+                      closes[int(candle.timestamp_ms)] = float(candle.close)
+
+          unresolved = {ts for ts in signal_times if not complete(ts)}
+          if unresolved:
+              before = len(report["rows"])
+              report["rows"] = [row for row in report["rows"] if int(row["signal_ms"]) not in unresolved]
+              removed = before - len(report["rows"])
+              report["candidates"] = len(report["rows"])
+              report["candidates_dropped_incomplete_labels_or_context"] = int(
+                  report.get("candidates_dropped_incomplete_labels_or_context", 0)
+              ) + removed
+              report["notes"].append(
+                  f"{removed} kandidaten op {len(unresolved)} tijdstip(pen) verwijderd omdat korte BTC-context na gerichte retry onvolledig bleef."
+              )
+
           keys = [
               "btc_return_5m_pct", "btc_return_10m_pct",
               "btc_return_15m_pct", "btc_return_1h_pct",
           ]
           for row in report["rows"]:
               ts = int(row["signal_ms"])
-              now = closes.get(ts)
-              prior = [closes.get(ts - n * FIVE) for n in (1, 2, 3, 12)]
-              if now is None or any(value is None for value in prior):
-                  raise RuntimeError(f"BTC-context ontbreekt op {ts}")
+              now = closes[ts]
+              prior = [closes[ts - n * FIVE] for n in (1, 2, 3, 12)]
               values = [pct(now, value) for value in prior]
               for key, value in zip(keys, values):
                   row["market_context"][key] = round(value, 8)
+
           existing = list(report["market_context_set"])
           for key in keys:
               if key not in existing:
                   existing.append(key)
           report["market_context_set"] = existing
-          report["notes"].append("Korte BTC-context 5m/10m/15m/1u is point-in-time uit dezelfde 5m-marktdata toegevoegd.")
+          report["notes"].append(
+              "Korte BTC-context 5m/10m/15m/1u is point-in-time toegevoegd; ontbrekende brede-fetch candles krijgen eerst een gerichte BTC-only retry."
+          )
           path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-          print("short BTC context added")
+          print(f"short BTC context added; unresolved timestamps removed: {len(unresolved)}")
           PY
       - name: Validate safety and reusable labels
         run: |
