@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -26,6 +28,19 @@ RICH_FEATURE_KEYS = (
     'higher_low',
     'positive_bars_last_6',
 )
+MARKET_CONTEXT_KEYS = (
+    'markets_used',
+    'breadth_positive_15m_pct',
+    'breadth_positive_1h_pct',
+    'breadth_positive_4h_pct',
+    'breadth_strong_1h_pct',
+    'breadth_weak_1h_pct',
+    'breadth_accelerating_pct',
+    'mean_return_15m_pct',
+    'mean_return_1h_pct',
+    'mean_return_4h_pct',
+    'dispersion_return_1h_pct',
+)
 
 
 def _write_report(path_text: str, report: dict[str, Any]) -> None:
@@ -34,6 +49,68 @@ def _write_report(path_text: str, report: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + '.tmp')
     temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     temporary.replace(path)
+
+
+def _pct(new: float, old: float) -> float:
+    return (new / old - 1.0) * 100.0 if new > 0.0 and old > 0.0 else 0.0
+
+
+def accumulate_market_context(
+    candles: Sequence[Any],
+    signal_start_ms: int,
+    aggregates: dict[int, dict[str, float]],
+) -> None:
+    """Verzamel marktbreedte zonder toekomstdata; elke bijdrage gebruikt alleen huidige/prior candles."""
+    rows = sorted((c for c in candles if c.is_valid), key=lambda c: c.timestamp_ms)
+    closes = {int(c.timestamp_ms): float(c.close) for c in rows}
+    for candle in rows:
+        ts = int(candle.timestamp_ms)
+        if ts < signal_start_ms:
+            continue
+        p15 = closes.get(ts - 3 * FIVE_MINUTE_MS)
+        p60 = closes.get(ts - 12 * FIVE_MINUTE_MS)
+        p4h = closes.get(ts - 48 * FIVE_MINUTE_MS)
+        if p15 is None or p60 is None or p4h is None:
+            continue
+        r15 = _pct(float(candle.close), p15)
+        r60 = _pct(float(candle.close), p60)
+        r4h = _pct(float(candle.close), p4h)
+        agg = aggregates.setdefault(ts, defaultdict(float))
+        agg['count'] += 1.0
+        agg['positive_15m'] += 1.0 if r15 > 0.0 else 0.0
+        agg['positive_1h'] += 1.0 if r60 > 0.0 else 0.0
+        agg['positive_4h'] += 1.0 if r4h > 0.0 else 0.0
+        agg['strong_1h'] += 1.0 if r60 >= 1.0 else 0.0
+        agg['weak_1h'] += 1.0 if r60 <= -1.0 else 0.0
+        agg['accelerating'] += 1.0 if r15 * 4.0 > r60 else 0.0
+        agg['sum_15m'] += r15
+        agg['sum_1h'] += r60
+        agg['sum_4h'] += r4h
+        agg['sum_sq_1h'] += r60 * r60
+
+
+def finalize_market_context(aggregates: dict[int, dict[str, float]]) -> dict[int, dict[str, float | int]]:
+    result: dict[int, dict[str, float | int]] = {}
+    for ts, agg in aggregates.items():
+        count = int(agg.get('count', 0.0))
+        if count <= 0:
+            continue
+        mean_1h = agg['sum_1h'] / count
+        variance = max(0.0, agg['sum_sq_1h'] / count - mean_1h * mean_1h)
+        result[int(ts)] = {
+            'markets_used': count,
+            'breadth_positive_15m_pct': round(agg['positive_15m'] / count * 100.0, 6),
+            'breadth_positive_1h_pct': round(agg['positive_1h'] / count * 100.0, 6),
+            'breadth_positive_4h_pct': round(agg['positive_4h'] / count * 100.0, 6),
+            'breadth_strong_1h_pct': round(agg['strong_1h'] / count * 100.0, 6),
+            'breadth_weak_1h_pct': round(agg['weak_1h'] / count * 100.0, 6),
+            'breadth_accelerating_pct': round(agg['accelerating'] / count * 100.0, 6),
+            'mean_return_15m_pct': round(agg['sum_15m'] / count, 8),
+            'mean_return_1h_pct': round(mean_1h, 8),
+            'mean_return_4h_pct': round(agg['sum_4h'] / count, 8),
+            'dispersion_return_1h_pct': round(math.sqrt(variance), 8),
+        }
+    return result
 
 
 def enrich_trade_features(candles: Sequence[Any], trade: dict[str, Any]) -> dict[str, Any]:
@@ -65,10 +142,7 @@ def compact_trade(trade: dict[str, Any]) -> dict[str, Any]:
     m15 = float(features.get('return_15m_pct') or 0.0)
     m60 = float(features.get('return_60m_pct') or 0.0)
     m4h = float(features.get('return_4h_pct') or 0.0)
-    exported_features = {
-        key: features.get(key)
-        for key in RICH_FEATURE_KEYS
-    }
+    exported_features = {key: features.get(key) for key in RICH_FEATURE_KEYS}
     exported_features['trend_up'] = bool(features.get('trend_up'))
     exported_features['higher_low'] = bool(features.get('higher_low'))
     exported_features['momentum_accel_15m_vs_60m'] = round(m15 * 4.0 - m60, 8)
@@ -87,6 +161,7 @@ def compact_trade(trade: dict[str, Any]) -> dict[str, Any]:
         'net_reward_risk': trade.get('net_reward_risk'),
         'btc_return_1h_pct': trade.get('btc_return_1h_pct'),
         'entry_features': exported_features,
+        'market_context': {},
         'status': 'GESLOTEN' if closed else 'OPEN_EINDE_PERIODE',
     }
 
@@ -116,12 +191,14 @@ def run_export(
 
     candidates: list[dict[str, Any]] = []
     errors: list[str] = []
+    context_aggregates: dict[int, dict[str, float]] = {}
     markets_completed = 0
     for market in active:
         try:
             rows = btc if market == 'BTC-EUR' else api.closed_candles_between(
                 market, '5m', fetch_start, end, now_ms=end,
             )
+            accumulate_market_context(rows, signal_start, context_aggregates)
             replay = replay_market(
                 market,
                 rows,
@@ -137,9 +214,16 @@ def run_export(
         except Exception as exc:
             errors.append(f'{market}: {type(exc).__name__}: {exc}')
 
+    market_context = finalize_market_context(context_aggregates)
+    for candidate in candidates:
+        context = market_context.get(int(candidate['signal_ms']))
+        if context is None:
+            raise RuntimeError(f"marktcontext ontbreekt op {candidate['signal_ms']}")
+        candidate['market_context'] = context
+
     candidates.sort(key=lambda item: (int(item['signal_ms']), str(item['market'])))
     report = {
-        'version': '4.0-score-dataset-2-rich-context',
+        'version': '4.0-score-dataset-3-market-breadth',
         'component': 'V40_SCORE_CALIBRATION_DATASET',
         'generated_at_utc': datetime.now(timezone.utc).isoformat(),
         'period': {
@@ -161,13 +245,15 @@ def run_export(
             'momentum_accel_15m_vs_60m',
             'momentum_accel_60m_vs_4h',
         ],
+        'market_context_set': list(MARKET_CONTEXT_KEYS),
         'errors': errors,
         'rows': candidates,
         'notes': [
             'Dit bestand exporteert uitsluitend historische PAPER-kandidaten en uitkomsten.',
             'Er wordt geen selectieregel gewijzigd en er kunnen geen orders worden geplaatst.',
             'Alle EUR-markten worden gelijk behandeld; er zijn geen munt-specifieke uitzonderingen.',
-            'Extra context wordt opnieuw berekend uit uitsluitend gesloten candles tot en met het signaalmoment.',
+            'Extra muntcontext en marktbreedte worden uitsluitend uit gesloten candles tot en met het signaalmoment berekend.',
+            'Marktbreedte ondersteunt expliciet de menselijke keuze om ook geen enkele kandidaat te nemen.',
             'De dataset is bedoeld voor een vooraf vastgelegde 60/15/15 score-herkalibratie.',
         ],
     }
@@ -177,11 +263,12 @@ def run_export(
 
 
 def print_status(report: dict[str, Any]) -> None:
-    print('=== v4.0 SCORE-CALIBRATIE DATASET EXPORT | RIJKE CONTEXT ===')
+    print('=== v4.0 SCORE-CALIBRATIE DATASET | RIJKE CONTEXT + MARKTBREEDTE ===')
     print('UITVOERING : UIT / OFFLINE METING')
     print(f"MARKTEN    : {report['markets_completed']}/{report['markets_requested']}")
     print(f"KANDIDATEN : {report['candidates']}")
-    print(f"FEATURES   : {len(report['feature_set'])}")
+    print(f"MUNTFEATURES: {len(report['feature_set'])}")
+    print(f"MARKTCONTEXT: {len(report['market_context_set'])}")
     print(f"FOUTEN     : {len(report['errors'])}")
 
 

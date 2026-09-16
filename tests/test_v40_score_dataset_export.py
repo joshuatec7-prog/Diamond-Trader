@@ -1,7 +1,12 @@
 import unittest
 
 from models import Candle
-from v40_score_dataset_export import compact_trade, enrich_trade_features
+from v40_score_dataset_export import (
+    accumulate_market_context,
+    compact_trade,
+    enrich_trade_features,
+    finalize_market_context,
+)
 
 
 class ScoreDatasetExportTests(unittest.TestCase):
@@ -49,6 +54,7 @@ class ScoreDatasetExportTests(unittest.TestCase):
         self.assertEqual(features['momentum_accel_60m_vs_4h'], 2.0)
         self.assertNotIn('unused', features)
         self.assertNotIn('events', row)
+        self.assertEqual(row['market_context'], {})
 
     def test_enrichment_uses_only_candles_through_signal(self):
         candles = []
@@ -64,10 +70,7 @@ class ScoreDatasetExportTests(unittest.TestCase):
                 volume=100.0 + index,
             ))
         signal_ms = candles[-1].timestamp_ms
-        trade = {
-            'signal_ms': signal_ms,
-            'entry_features': {'return_15m_pct': -999.0},
-        }
+        trade = {'signal_ms': signal_ms, 'entry_features': {'return_15m_pct': -999.0}}
         enriched = enrich_trade_features(candles, trade)
         features = enriched['entry_features']
         self.assertNotEqual(features['return_15m_pct'], -999.0)
@@ -76,6 +79,29 @@ class ScoreDatasetExportTests(unittest.TestCase):
         self.assertIn('compression_ratio', features)
         self.assertIn('higher_low', features)
         self.assertIn('positive_bars_last_6', features)
+
+    def test_market_context_is_point_in_time_and_marketwide(self):
+        aggregates = {}
+        for slope in (0.10, -0.05):
+            candles = []
+            for index in range(60):
+                close = 100.0 + index * slope
+                candles.append(Candle(
+                    timestamp_ms=index * 300_000,
+                    open=close,
+                    high=close + 0.1,
+                    low=close - 0.1,
+                    close=close,
+                    volume=100.0,
+                ))
+            accumulate_market_context(candles, 0, aggregates)
+        context = finalize_market_context(aggregates)
+        ts = 59 * 300_000
+        item = context[ts]
+        self.assertEqual(item['markets_used'], 2)
+        self.assertEqual(item['breadth_positive_1h_pct'], 50.0)
+        self.assertEqual(item['breadth_positive_4h_pct'], 50.0)
+        self.assertGreater(item['dispersion_return_1h_pct'], 0.0)
 
 
 if __name__ == '__main__':
