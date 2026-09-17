@@ -1,0 +1,89 @@
+name: v4.0 range research dataset
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - "research/v40_range_research_dataset.py"
+      - ".github/workflows/v40-range-research-dataset.yml"
+
+jobs:
+  export-range-dataset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile dedicated range exporter
+        run: python -m py_compile research/v40_range_research_dataset.py
+      - name: Export frozen 90-day range dataset
+        run: |
+          python research/v40_range_research_dataset.py \
+            --days 90 \
+            --now-ms 1789536900000 \
+            --output cryptobot_v40_range_research_dataset.json \
+            | tee cryptobot_v40_range_research_dataset.log
+      - name: Validate research safety and frozen period
+        run: |
+          python - <<'PY'
+          import json
+          report = json.load(open("cryptobot_v40_range_research_dataset.json", encoding="utf-8"))
+          assert report["mode"] == "OFFLINE_MEASUREMENT_ONLY"
+          assert report["execution_enabled"] is False
+          assert report["live_orders_possible"] is False
+          assert report["active_paper_changed"] is False
+          assert report["future_data_used_for_features"] is False
+          assert report["future_data_used_for_labels"] is True
+          assert report["sampling_independent_of_long_candidate_generator"] is True
+          assert report["sampling_independent_of_bear_candidate_generator"] is True
+          assert report["period"]["signal_days"] == 90
+          assert report["period"]["fetch_end_ms"] == 1789536900000
+          assert report["period"]["signal_start_ms"] == 1781588100000
+          assert report["period"]["signal_end_ms_exclusive"] == 1789364100000
+          assert report["period"]["purge_required_at_split_boundaries"] is True
+          assert report["candidates"] > 0
+          required = {"15", "60", "240", "480", "720", "1440", "2160", "2880"}
+          for row in report["rows"]:
+              assert row["side"] in {"RANGE_LONG", "RANGE_SHORT"}
+              assert required == set(row["forward_range_labels"])
+              assert all(label["mature"] == 1 for label in row["forward_range_labels"].values())
+              assert row["market_context"]["markets_used"] > 0
+              assert row["cross_section"]["simultaneous_range_candidate_count"] > 0
+          print("range research dataset validation OK")
+          PY
+      - name: Write summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          report = json.load(open("cryptobot_v40_range_research_dataset.json", encoding="utf-8"))
+          longs = sum(1 for row in report["rows"] if row["side"] == "RANGE_LONG")
+          shorts = sum(1 for row in report["rows"] if row["side"] == "RANGE_SHORT")
+          print("# v4.0 dedicated sideways/range research dataset")
+          print()
+          print(f"- Markten: {report['markets_completed']}/{report['markets_requested']}")
+          print(f"- Ruwe range-edge triggers: {report['trigger_rows_seen']}")
+          print(f"- Bewaarde kandidaten: {report['candidates']}")
+          print(f"- Range-long/range-short: {longs}/{shorts}")
+          print(f"- Unieke momenten: {report['moments']}")
+          print(f"- Fouten: {len(report['errors'])}")
+          print("- Periode: exact dezelfde bevroren 90 dagen")
+          print("- Sampling: onafhankelijk van LONG en BEAR generators")
+          print("- Uitvoering: UIT / OFFLINE MEASUREMENT ONLY")
+          print("- Render/PAPER/live: niet gewijzigd")
+          PY
+      - name: Upload range research dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-range-research-dataset
+          path: |
+            cryptobot_v40_range_research_dataset.json
+            cryptobot_v40_range_research_dataset.log
+          retention-days: 14
