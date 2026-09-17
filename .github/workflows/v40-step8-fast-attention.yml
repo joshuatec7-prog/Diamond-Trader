@@ -7,7 +7,7 @@ on:
       - clean-room-20260826
     paths:
       - "research/v40_step8_fast_attention.py"
-      - ".github/workflows/v40-step8-fast-attention.yml"
+      - "research/v40_step8_candle_preflight.py"
 
 jobs:
   analyze-fast-attention:
@@ -19,40 +19,89 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
       - name: Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install research dependencies
-        run: python -m pip install -r requirements.txt numpy pandas scikit-learn
-      - name: Compile Step 8 diagnostic
-        run: python -m py_compile research/v40_step8_fast_attention.py
-      - name: Download frozen Step 5 and Step 6 datasets
+
+      - name: Install pinned research dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install -r research/requirements-research.txt
+
+      - name: Compile and import research stack
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python -m py_compile \
+            research/v40_step8_fast_attention.py \
+            research/v40_step8_candle_preflight.py \
+            research/v40_step7_state_overlap.py
+          PYTHONPATH=. python - <<'PY'
+          import numpy, pandas, sklearn
+          import bitvavo_public
+          import research.v40_step7_state_overlap
+          import research.v40_step8_fast_attention
+          import research.v40_step8_candle_preflight
+          print('step 8 imports OK')
+          PY
+
+      - name: Run historical 1m API preflight
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python research/v40_step8_candle_preflight.py \
+            | tee v40_step8_candle_preflight.log
+          test -s v40_step8_candle_preflight_result.json
+          python - <<'PY'
+          import json
+          r=json.load(open('v40_step8_candle_preflight_result.json',encoding='utf-8'))
+          assert r['passed'] is True
+          assert r['raw_aligned']['ok'] is True
+          assert all(r['raw_aligned']['required_present'].values())
+          print('historical 1m aligned-candle preflight OK')
+          PY
+
+      - name: Download and verify frozen Step 5 and Step 6 datasets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          curl -L --fail \
+          set -euo pipefail
+          curl --retry 3 --retry-all-errors -L --fail \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -o bear.zip \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/10498130810/zip"
-          curl -L --fail \
+          curl --retry 3 --retry-all-errors -L --fail \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -o range.zip \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/10508180818/zip"
+          test "$(stat -c%s bear.zip)" -gt 1000000
+          test "$(stat -c%s range.zip)" -gt 1000000
+          unzip -tq bear.zip >/dev/null
+          unzip -tq range.zip >/dev/null
           mkdir -p bear range
           unzip -q bear.zip -d bear
           unzip -q range.zip -d range
+          test -s bear/cryptobot_v40_bear_research_dataset.json
+          test -s range/cryptobot_v40_range_research_dataset.json
+          test -s research/v40_step5_bear_untouched_once_result.json
+          test -s research/v40_step6_range_dataset_analysis_result.json
+          echo 'frozen datasets and result files OK'
+
       - name: Run Step 8 1m 3m attention diagnostic
         run: |
+          set -euo pipefail
           PYTHONPATH=. python research/v40_step8_fast_attention.py \
             bear/cryptobot_v40_bear_research_dataset.json \
             range/cryptobot_v40_range_research_dataset.json \
             --output v40_step8_fast_attention_result.json \
             | tee v40_step8_fast_attention.log
-      - name: Validate research safety
+          test -s v40_step8_fast_attention_result.json
+
+      - name: Validate research safety and result shape
         run: |
+          set -euo pipefail
           python - <<'PY'
           import json
           r=json.load(open('v40_step8_fast_attention_result.json',encoding='utf-8'))
@@ -63,10 +112,17 @@ jobs:
           assert r['new_untouched_test'] is False
           assert r['attention_lead_minutes']==2
           assert r['sample']['requested']==300
-          print('step 8 research safety OK')
+          assert r['decision'] in {
+              'KEEP_1M_3M_AS_FAST_ATTENTION_LAYER',
+              'REJECT_1M_3M_FAST_ATTENTION_UPLIFT',
+              'BLOCK_1M_3M_INSUFFICIENT_USABLE_DATA',
+          }
+          print('step 8 research safety/result OK')
           PY
+
       - name: Write summary
         run: |
+          set -euo pipefail
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json
           r=json.load(open('v40_step8_fast_attention_result.json',encoding='utf-8'))
@@ -74,20 +130,26 @@ jobs:
           print()
           print(f"- Beslissing: {r['decision']}")
           print(f"- Bruikbaar: {r['sample']['usable']}/{r['sample']['requested']}")
+          print(f"- Fouten/onbruikbaar: {r['sample']['errors']}")
           print(f"- FAST_CONFIRM n: {r['overall']['confirm']['n']}")
-          print(f"- FAST_CONFIRM mean: {r['overall']['confirm']['mean_pct']}")
-          print(f"- FAST_CONFIRM PF: {r['overall']['confirm']['pf']}")
-          print(f"- Niet bevestigd mean: {r['overall']['nonconfirm']['mean_pct']}")
+          print(f"- FAST_CONFIRM mean: {r['overall']['confirm'].get('mean_pct')}")
+          print(f"- FAST_CONFIRM PF: {r['overall']['confirm'].get('pf')}")
+          print(f"- Niet bevestigd mean: {r['overall']['nonconfirm'].get('mean_pct')}")
           print(f"- Uplift: {r['overall']['uplift_pp']} pp")
           print(f"- Eerste helft uplift: {r['overall']['first_half']['uplift_pp']} pp")
           print(f"- Tweede helft uplift: {r['overall']['second_half']['uplift_pp']} pp")
           print('- Alleen attention-diagnostiek; geen handelswijziging')
           PY
-      - name: Upload Step 8 result
+
+      - name: Upload Step 8 evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cryptobot-v40-step8-fast-attention
           path: |
             v40_step8_fast_attention_result.json
             v40_step8_fast_attention.log
+            v40_step8_candle_preflight_result.json
+            v40_step8_candle_preflight.log
+          if-no-files-found: warn
           retention-days: 14
