@@ -1,0 +1,140 @@
+name: v4.0 step 9 candidate ranking
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - "research/v40_step9_candidate_ranking.py"
+      - ".github/workflows/v40-step9-candidate-ranking.yml"
+      - "research/requirements-research.txt"
+
+jobs:
+  analyze-candidate-ranking:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned research environment
+        run: python -m pip install -r research/requirements-research.txt
+
+      - name: Preflight compile and imports
+        run: |
+          set -euo pipefail
+          python -m py_compile research/v40_step9_candidate_ranking.py
+          PYTHONPATH=. python - <<'PY'
+          import numpy, pandas, sklearn
+          import research.v40_step9_candidate_ranking as s9
+          assert s9.WINDOWS[0]['test_end_day'] <= 60
+          assert s9.WINDOWS[1]['test_end_day'] <= 60
+          print('step 9 compile/import preflight OK')
+          print('numpy', numpy.__version__, 'pandas', pandas.__version__, 'sklearn', sklearn.__version__)
+          PY
+
+      - name: Preflight download frozen datasets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -o bear.zip \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/10498130810/zip"
+          curl -L --fail --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -o range.zip \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/10508180818/zip"
+          unzip -tq bear.zip
+          unzip -tq range.zip
+          mkdir -p bear range
+          unzip -q bear.zip -d bear
+          unzip -q range.zip -d range
+          test -s bear/cryptobot_v40_bear_research_dataset.json
+          test -s range/cryptobot_v40_range_research_dataset.json
+          python - <<'PY'
+          from pathlib import Path
+          checks = [
+              Path('bear/cryptobot_v40_bear_research_dataset.json'),
+              Path('range/cryptobot_v40_range_research_dataset.json'),
+          ]
+          for p in checks:
+              assert p.stat().st_size > 1_000_000, (p, p.stat().st_size)
+              head = p.open('rb').read(65536)
+              assert b'"version"' in head and b'"period"' in head, p
+              print('dataset preflight OK', p, p.stat().st_size)
+          PY
+          df -h .
+
+      - name: Run Step 9 ranking diagnostic
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. /usr/bin/time -v python research/v40_step9_candidate_ranking.py \
+            bear/cryptobot_v40_bear_research_dataset.json \
+            range/cryptobot_v40_range_research_dataset.json \
+            --output v40_step9_candidate_ranking_result.json \
+            2>v40_step9_time.log \
+            | tee v40_step9_candidate_ranking.log
+
+      - name: Validate research safety and split guards
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          r=json.load(open('v40_step9_candidate_ranking_result.json',encoding='utf-8'))
+          assert r['mode']=='OFFLINE_MEASUREMENT_ONLY'
+          assert r['execution_enabled'] is False
+          assert r['live_orders_possible'] is False
+          assert r['active_paper_changed'] is False
+          assert r['hyperparameter_sweep'] is False
+          assert r['step5_step6_validation_reused'] is False
+          assert r['opened_final15_reused'] is False
+          assert r['development_cutoff_day']==60
+          for state in ('SHORT','RANGE'):
+              assert r[state]['days_60_plus_used'] is False
+              assert len(r[state]['windows'])==2
+              for w in r[state]['windows']:
+                  assert w['window']['test_end_day'] <= 60
+                  assert w['test_moments'] > 100
+          print('step 9 safety/split preflight OK')
+          PY
+
+      - name: Write summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r=json.load(open('v40_step9_candidate_ranking_result.json',encoding='utf-8'))
+          print('# Step 9 — candidate ranking')
+          print()
+          print(f"- Overall: {r['decision']}")
+          for state in ('SHORT','RANGE'):
+              s=r[state]
+              print(f"- {state}: {s['decision']}")
+              for w in s['windows']:
+                  b=w['baseline']; c=w['challenger']; d=w['comparison']
+                  print(f"  - venster {w['window']['name']}: baseline mean {b['mean_pct']:.4f}% PF {b['pf']:.4f}; challenger mean {c['mean_pct']:.4f}% PF {c['pf']:.4f}; uplift {d['mean_uplift_pp']:+.4f} pp; percentile uplift {d['realized_percentile_uplift_pp']:+.3f} pp")
+          print('- Dag 60+ niet gebruikt; final15 niet hergebruikt')
+          print('- Alleen OFFLINE research; geen PAPER/runtime/live wijziging')
+          PY
+
+      - name: Upload Step 9 result
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step9-candidate-ranking
+          path: |
+            v40_step9_candidate_ranking_result.json
+            v40_step9_candidate_ranking.log
+            v40_step9_time.log
+          retention-days: 14
