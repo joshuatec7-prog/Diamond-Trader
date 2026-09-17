@@ -1,0 +1,142 @@
+name: v4.0 step 10 execution veto
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - "research/v40_step10_execution_veto.py"
+      - ".github/workflows/v40-step10-execution-veto.yml"
+
+jobs:
+  analyze-execution-veto:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned research environment
+        run: python -m pip install -r research/requirements-research.txt
+
+      - name: Preflight compile and imports
+        run: |
+          python -m py_compile research/v40_step10_execution_veto.py
+          PYTHONPATH=. python - <<'PY'
+          import numpy, pandas, sklearn
+          from bitvavo_public import BitvavoPublic
+          from research.v40_step7_state_overlap import _load_bear_selected, _load_range_selected
+          from research.v40_step10_execution_veto import MICROSTRUCTURE_BUDGET_PCT
+          assert abs(MICROSTRUCTURE_BUDGET_PCT - 0.28) < 1e-9
+          print('step10 compile/import preflight OK')
+          PY
+
+      - name: Preflight download frozen datasets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -L --fail \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -o bear.zip \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/10498130810/zip"
+          curl -L --fail \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -o range.zip \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/10508180818/zip"
+          unzip -tq bear.zip
+          unzip -tq range.zip
+          mkdir -p bear range
+          unzip -q bear.zip -d bear
+          unzip -q range.zip -d range
+          test -s bear/cryptobot_v40_bear_research_dataset.json
+          test -s range/cryptobot_v40_range_research_dataset.json
+          echo "dataset artifact preflight OK"
+
+      - name: Preflight public L2 API
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          from bitvavo_public import BitvavoPublic
+          api=BitvavoPublic('https://api.bitvavo.com/v2', timeout_seconds=15, retries=4)
+          probes=api.probe_public_endpoints()
+          bad=[p for p in probes if p['status'] != 200]
+          assert not bad, bad
+          market=api.top_markets_by_quote_volume('EUR', 1)[0]
+          depth=api.depth_book(market, 500.0, depth=100)
+          assert depth['spread_pct'] >= 0
+          assert depth['execution_spread_pct'] >= 0
+          assert depth['near_bid_depth_quote'] > 0
+          assert depth['near_ask_depth_quote'] > 0
+          print('public L2 preflight OK', market, depth['spread_pct'], depth['execution_spread_pct'])
+          PY
+
+      - name: Run Step 10 execution veto research
+        run: |
+          set -o pipefail
+          PYTHONPATH=. python research/v40_step10_execution_veto.py \
+            bear/cryptobot_v40_bear_research_dataset.json \
+            range/cryptobot_v40_range_research_dataset.json \
+            --output v40_step10_execution_veto_result.json \
+            | tee v40_step10_execution_veto.log
+
+      - name: Validate research safety and frozen rules
+        run: |
+          python - <<'PY'
+          import json
+          r=json.load(open('v40_step10_execution_veto_result.json',encoding='utf-8'))
+          assert r['mode']=='OFFLINE_READ_ONLY_RESEARCH'
+          assert r['execution_enabled'] is False
+          assert r['live_orders_possible'] is False
+          assert r['active_paper_changed'] is False
+          assert r['render_changed'] is False
+          assert r['historical_l2_available'] is False
+          assert abs(r['frozen_cost_model']['original_roundtrip_cost_pct']-0.78) < 1e-9
+          assert abs(r['frozen_cost_model']['remaining_microstructure_budget_pct']-0.28) < 1e-9
+          rules=r['candidate_execution_veto']['rules']
+          assert abs(rules['top_spread_pct_max']-0.25) < 1e-9
+          assert abs(rules['execution_spread_pct_max']-0.28) < 1e-9
+          assert abs(rules['near_bid_and_ask_depth_min_multiple']-10.0) < 1e-9
+          assert abs(rules['volume_24h_min_multiple']-1000.0) < 1e-9
+          assert r['candidate_execution_veto']['runtime_or_paper_change_allowed'] is False
+          print('step10 research safety/frozen-rules OK')
+          PY
+
+      - name: Write summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r=json.load(open('v40_step10_execution_veto_result.json',encoding='utf-8'))
+          print('# Step 10 — costs / spread / liquidity / L2')
+          print()
+          print(f"- Beslissing: {r['decision']}")
+          for state in ('SHORT','RANGE'):
+              s=r['historical_cost_stress'][state]
+              row=next(x for x in s['stress'] if x['extra_roundtrip_cost_pct']==0.5)
+              print(f"- {state} +0.50% extra: n={row['n']} mean={row['mean_pct']:.4f}% PF={row['pf']:.4f} robust={s['robustness_test']['passed']}")
+          snap=r['current_bitvavo_eur_l2_snapshot']
+          print(f"- L2 sample usable: {snap['depth_sample_usable']}/{snap['depth_sample_requested']}")
+          for n in ('200','500','1000'):
+              x=snap['by_notional'][n]
+              print(f"- EUR {n}: pass={x['pass_pct']}% median execution spread={x['median_execution_spread_pct']}% p90={x['p90_execution_spread_pct']}%")
+          print('- Historical L2 niet beschikbaar; kandidaat-veto alleen prospective shadow')
+          PY
+
+      - name: Upload Step 10 result
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step10-execution-veto
+          path: |
+            v40_step10_execution_veto_result.json
+            v40_step10_execution_veto.log
+          retention-days: 14
