@@ -1,0 +1,74 @@
+{
+  "version": "v40-momentgate-repro-1",
+  "dataset": {
+    "candidates": 13431,
+    "markets_completed": 418
+  },
+  "split": {
+    "fit_rows": 5500,
+    "calibration_rows": 1571,
+    "validation_rows": 3253,
+    "fit_end_ms": 1785476100000,
+    "calibration_start_ms": 1785562500000,
+    "calibration_end_ms": 1786685700000,
+    "validation_start_ms": 1786772100000,
+    "validation_end_exclusive_ms": 1787981700000,
+    "untouched_start_ms": 1788068100000,
+    "untouched_opened": false,
+    "target_horizons_minutes": [240, 480, 720, 1440],
+    "purge_minutes": 1440
+  },
+  "model": {
+    "type": "HistGradientBoostingRegressor",
+    "max_iter": 100,
+    "learning_rate": 0.05,
+    "max_leaf_nodes": 7,
+    "min_samples_leaf": 40,
+    "l2_regularization": 1.0,
+    "random_state": 42,
+    "gate": "top 20% of calibration moment-level predicted score",
+    "threshold": -0.9299934472272676
+  },
+  "pass_criteria": {
+    "n_min": 100,
+    "mean_target_pct_gt": 0,
+    "pf_min": 1.2,
+    "positive_horizons_min": 3,
+    "positive_days_pct_min": 50,
+    "max_market_share_pct_max": 10
+  },
+  "calibration": {
+    "n": 251,
+    "mean": -1.0995711762948206,
+    "median": -2.039773,
+    "pf": 0.6222824632515225,
+    "win_pct": 28.68525896414343,
+    "240_mean": -0.6097975139442231,
+    "480_mean": -1.2268290199203187,
+    "720_mean": -1.3390535418326694,
+    "1440_mean": -1.2226046294820716,
+    "positive_days_pct": 21.428571428571427,
+    "max_market_share_pct": 3.5856573705179287
+  },
+  "validation": {
+    "n": 690,
+    "mean": -0.6362292778985508,
+    "median": -1.466651875,
+    "pf": 0.7202999834531276,
+    "win_pct": 38.84057971014493,
+    "240_mean": -0.943780311594203,
+    "480_mean": -0.7246749913043478,
+    "720_mean": -0.733565552173913,
+    "1440_mean": -0.14289625652173918,
+    "positive_days_pct": 33.33333333333333,
+    "max_market_share_pct": 1.7391304347826086
+  },
+  "baseline_validation_all_moments": {
+    "n": 1792,
+    "mean": -0.4847916967075892,
+    "pf": 0.7691682148327306,
+    "win_pct": 38.002232142857146
+  },
+  "validation_passed": false,
+  "decision": "REJECT_NONLINEAR_LONG_SELECTION_KEEP_UNTOUCHED_SEALED"
+}
