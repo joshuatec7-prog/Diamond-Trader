@@ -1,0 +1,58 @@
+{
+  "version": "v40-step3-selection-diagnostic-1",
+  "mode": "OFFLINE_MEASUREMENT_ONLY",
+  "execution_enabled": false,
+  "live_orders_possible": false,
+  "active_paper_changed": false,
+  "untouched_opened": false,
+  "dataset": {
+    "candidates": 13431,
+    "markets_completed": 418
+  },
+  "validation": {
+    "rows": 3253,
+    "moments": 1792,
+    "multi_candidate_moments": 722,
+    "multi_candidate_moments_pct": 40.29017857142857,
+    "avg_candidates_per_moment": 1.8152901785714286
+  },
+  "model_recognition": {
+    "corr_prediction_vs_candidate_outcome": 0.025397833730773523,
+    "corr_prediction_vs_market_moment_mean": 0.023429288205837614,
+    "corr_prediction_vs_within_moment_residual": 0.010269191531827555,
+    "selected_moments": 690,
+    "selected_chosen_candidate_mean_net_pct": -0.6362292778985508,
+    "selected_moment_mean_net_pct": -0.6073604141442374,
+    "chosen_candidate_residual_vs_selected_moment_mean_pct": -0.02886886375431334,
+    "selected_good_moment_precision_pct": 40.72463768115942,
+    "all_moments_good_prevalence_pct": 38.392857142857146,
+    "multi_selected_moments": 387,
+    "chosen_best_actual_candidate_pct_multi": 33.59173126614987,
+    "chosen_residual_multi_pct": -0.051471617546450084
+  },
+  "diagnostic_headroom_future_information_only": {
+    "note": "Oracle figures use forward labels only to locate the bottleneck; they are NOT tradable rules.",
+    "average_moment_mean_net_pct": -0.5328827796948076,
+    "positive_moment_pct": 38.392857142857146,
+    "oracle_positive_moment_count": 688,
+    "oracle_positive_moment_random_candidate_mean_net_pct": 3.75727917918123,
+    "oracle_best_candidate_every_moment_mean_net_pct": 0.5945069108537947,
+    "oracle_best_candidate_positive_pct": 46.595982142857146,
+    "oracle_candidate_uplift_all_moments_pct": 1.1273896905486023,
+    "oracle_candidate_uplift_multi_candidate_moments_pct": 2.7981749660153676
+  },
+  "variance_decomposition": {
+    "between_moment_variance": 19.793696099351717,
+    "within_moment_residual_variance": 6.8837011059374875,
+    "between_moment_share_of_sum_pct": 74.19650405560296
+  },
+  "decision": "CURRENT_SELECTOR_RECOGNIZES_NEITHER_MOMENT_NOR_COIN_RELIABLY",
+  "priority": "MOMENT_TIMING_FIRST_THEN_CANDIDATE_RANKING",
+  "reason": [
+    "Prediction correlations with outcome, moment quality and within-moment residual are all near zero.",
+    "The gate barely raises the share of actually positive moments versus prevalence.",
+    "Chosen coins underperform the average coin at their selected moments.",
+    "Most diagnostic variance is between moments, so timing/regime is the first bottleneck.",
+    "There is still meaningful candidate-ranking headroom when multiple candidates coexist."
+  ]
+}
