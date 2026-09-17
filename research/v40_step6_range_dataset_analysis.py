@@ -75,8 +75,14 @@ def metrics(sub: pd.DataFrame, target: str = "r") -> dict:
         daily = temp.groupby("day")[target].mean()
         out["days"] = int(len(daily))
         out["positive_days_pct"] = float((daily > 0).mean() * 100)
-        out["max_market_share_pct"] = float(temp.market.value_counts(normalize=True).max() * 100)
-        out["range_long_pct"] = float((temp.side == "RANGE_LONG").mean() * 100)
+        out["max_market_share_pct"] = (
+            float(temp.market.value_counts(normalize=True).max() * 100)
+            if "market" in temp.columns else None
+        )
+        out["range_long_pct"] = (
+            float((temp.side == "RANGE_LONG").mean() * 100)
+            if "side" in temp.columns else None
+        )
     else:
         out.update({"days": 0, "positive_days_pct": None, "max_market_share_pct": None, "range_long_pct": None})
     return out
@@ -122,7 +128,6 @@ def main() -> int:
     assert int(val.signal_ms.max()) < untouched_start
     assert int(val_m.signal_ms.max()) < untouched_start
 
-    # Moment gate: market context only; asks whether range behavior is attractive now.
     mc_features = [c for c in moments.columns if c.startswith("mc_")] + ["candidate_count"]
     xfitm = fit_m[mc_features].replace([np.inf, -np.inf], np.nan)
     medm = xfitm.median(numeric_only=True)
@@ -137,7 +142,6 @@ def main() -> int:
     cal_m_sel = cal_m[cal_m.pred >= moment_threshold].copy()
     val_m_sel = val_m[val_m.pred >= moment_threshold].copy()
 
-    # Candidate selector: chooses one edge candidate per moment, then fixed top-20% calibration threshold.
     excluded = {"market", "signal_ms", "side", "r", *{"r" + h for h in HORIZONS}}
     candidate_features = [c for c in df.columns if c not in excluded and pd.api.types.is_numeric_dtype(df[c])]
     xfit = fit[candidate_features].replace([np.inf, -np.inf], np.nan)
@@ -155,7 +159,6 @@ def main() -> int:
     cal_sel = cal_best[cal_best.pred >= candidate_threshold].copy()
     val_sel = val_best[val_best.pred >= candidate_threshold].copy()
 
-    # One interpretable market-neutral range regime, not tuned.
     def neutral_regime(sub: pd.DataFrame) -> pd.DataFrame:
         return sub[
             sub["mc_breadth_positive_1h_pct"].between(40, 60)
