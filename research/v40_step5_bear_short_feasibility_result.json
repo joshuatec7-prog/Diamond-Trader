@@ -1,0 +1,134 @@
+{
+  "version": "v40-step5-bear-short-feasibility-1",
+  "mode": "OFFLINE_MEASUREMENT_ONLY",
+  "execution_enabled": false,
+  "live_orders_possible": false,
+  "active_paper_changed": false,
+  "untouched_opened": false,
+  "sampling_limitation": "Master dataset contains only timestamps/markets where the existing LONG candidate generator produced a candidate; this is a short-on-long-candidate feasibility test, not a complete marketwide short test.",
+  "cost_model": {
+    "roundtrip_cost_pct": 0.78,
+    "short_net_formula": "-gross_long_close_pct - 0.78"
+  },
+  "dataset": {
+    "candidates": 13431,
+    "moments": 9473,
+    "markets_completed": 418
+  },
+  "split": {
+    "fit_moments": 4236,
+    "calibration_moments": 1252,
+    "validation_moments": 1792,
+    "purge_minutes": 1440,
+    "untouched_opened": false
+  },
+  "pass_criteria": {
+    "n_min": 100,
+    "mean_gt_pct": 0.0,
+    "pf_min": 1.2,
+    "positive_horizons_min": 3,
+    "positive_days_pct_min": 50.0
+  },
+  "baseline_short_all_long_candidate_moments": {
+    "n": 1792,
+    "mean_pct": -1.0271172203051926,
+    "pf": 0.526863065512005,
+    "win_pct": 45.25669642857143,
+    "240_mean_pct": -0.776471268906863,
+    "480_mean_pct": -0.8824401652444448,
+    "720_mean_pct": -0.866897346950069,
+    "1440_mean_pct": -1.5826601001193927,
+    "positive_horizons": 0,
+    "positive_days_pct": 53.333333333333336
+  },
+  "market_context_short_model": {
+    "type": "HistGradientBoostingRegressor",
+    "gate": "top 20% of calibration predicted short moment quality",
+    "validation": {
+      "n": 281,
+      "mean_pct": -0.46965547229071347,
+      "pf": 0.7273167940015147,
+      "win_pct": 50.177935943060504,
+      "240_mean_pct": -0.4706744300118624,
+      "480_mean_pct": -0.3347849886714117,
+      "720_mean_pct": -0.2671823538976445,
+      "1440_mean_pct": -0.8059801165819354,
+      "positive_horizons": 0,
+      "positive_days_pct": 33.33333333333333
+    },
+    "validation_prediction_correlation": 0.05745560713004935,
+    "passed": false
+  },
+  "interpretable_bear_rule": {
+    "rule": "breadth_positive_1h<=40 AND breadth_positive_4h<=45 AND btc_return_1h<0",
+    "development": {
+      "n": 832,
+      "mean_pct": 0.013532682842548058,
+      "pf": 1.007465839993868,
+      "positive_horizons": 2,
+      "positive_days_pct": 55.00000000000001
+    },
+    "validation": {
+      "n": 224,
+      "mean_pct": -0.14271506845238102,
+      "pf": 0.9187136567503698,
+      "win_pct": 58.03571428571429,
+      "240_mean_pct": -0.3999996168154762,
+      "480_mean_pct": -0.17496880840773818,
+      "720_mean_pct": 0.044191607886904585,
+      "1440_mean_pct": -0.04008345647321427,
+      "positive_horizons": 1,
+      "positive_days_pct": 53.333333333333336
+    },
+    "passed": false
+  },
+  "bear_transition_rule": {
+    "rule": "breadth_change_5m_pp<=-5 AND mean_return_10m<0 AND btc_return_15m<0",
+    "validation": {
+      "n": 206,
+      "mean_pct": -1.4219574814522653,
+      "pf": 0.42753384987703985,
+      "positive_horizons": 0,
+      "positive_days_pct": 33.33333333333333
+    },
+    "passed": false
+  },
+  "combined_candidate_model": {
+    "type": "HistGradientBoostingRegressor",
+    "gate": "choose highest predicted short candidate each moment, then top 20% calibration predicted score",
+    "validation": {
+      "n": 265,
+      "mean_pct": -0.20180352924528297,
+      "pf": 0.9065269490070945,
+      "win_pct": 52.45283018867924,
+      "positive_horizons": 1,
+      "positive_days_pct": 60.0
+    },
+    "validation_candidate_correlation": 0.025397833705708545,
+    "passed": false
+  },
+  "diagnostic_oracle_future_information_only": {
+    "note": "Uses forward outcomes only to measure headroom; not tradable.",
+    "best_short_candidate_every_validation_moment": {
+      "n": 1792,
+      "mean_pct": -0.015204928571428602,
+      "pf": 0.99058582432767,
+      "positive_horizons": 2,
+      "positive_days_pct": 66.66666666666666
+    },
+    "best_short_candidate_within_interpretable_bear_moments": {
+      "n": 224,
+      "mean_pct": 0.3333542946428571,
+      "pf": 1.2110107200307252,
+      "win_pct": 61.60714285714286,
+      "240_mean_pct": -0.1961271830357143,
+      "480_mean_pct": 0.2239776205357142,
+      "720_mean_pct": 0.5482714866071428,
+      "1440_mean_pct": 0.7572952544642858,
+      "positive_horizons": 3,
+      "positive_days_pct": 53.333333333333336
+    }
+  },
+  "decision": "DO_NOT_APPROVE_SHORT_FROM_LONG_SAMPLED_DATA",
+  "next": "Build a dedicated marketwide bear/short dataset independent of the long candidate generator, then repeat timing + ranking with the final 15 days sealed."
+}
