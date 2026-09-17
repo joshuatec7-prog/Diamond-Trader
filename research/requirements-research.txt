@@ -1,0 +1,6 @@
+# Frozen research environment for numbered v4.0 offline diagnostics.
+# Keep runtime requirements separate; research workflows install this file only.
+-r ../requirements.txt
+numpy==2.5.3
+pandas==3.0.5
+scikit-learn==1.9.1
