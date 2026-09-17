@@ -1,0 +1,94 @@
+{
+  "version": "v40-step7-state-overlap-1",
+  "mode": "OFFLINE_MEASUREMENT_ONLY",
+  "execution_enabled": false,
+  "live_orders_possible": false,
+  "active_paper_changed": false,
+  "new_untouched_test": false,
+  "warning": "Step 5/6 untouched windows were already opened separately; this combined analysis is diagnostic and needs later shadow/PAPER validation.",
+  "long_state": {
+    "enabled": false,
+    "reason": "Step 4 long momentgate failed validation"
+  },
+  "selected_counts": {
+    "short": 1544,
+    "range": 1855,
+    "short_unique_moments": 1544,
+    "range_unique_moments": 1855
+  },
+  "overlap": {
+    "same_moment_count": 534,
+    "same_moment_pct_of_short": 34.58549222797927,
+    "same_moment_pct_of_range": 28.787061994609164,
+    "exact_same_market_count": 279,
+    "exact_range_long_conflicts": 0,
+    "range_long_share_pct": 0.5390835579514826
+  },
+  "performance": {
+    "short_all": {
+      "n": 1544,
+      "mean_pct": 5.429450223445597,
+      "pf": 2.4238500044950806,
+      "win_pct": 74.87046632124353
+    },
+    "range_all": {
+      "n": 1855,
+      "mean_pct": 2.947827053638814,
+      "pf": 1.8497996184285352,
+      "win_pct": 70.45822102425876
+    },
+    "short_only_moments": {
+      "n": 1010,
+      "mean_pct": 4.8595095282178224,
+      "pf": 2.094971387008908,
+      "win_pct": 73.26732673267327
+    },
+    "range_only_moments": {
+      "n": 1321,
+      "mean_pct": 2.393774638342165,
+      "pf": 1.6399836738641516,
+      "win_pct": 68.43300529901589
+    },
+    "short_on_overlap_moments": {
+      "n": 534,
+      "mean_pct": 6.507427942883895,
+      "pf": 3.4729269450866145,
+      "win_pct": 77.90262172284645
+    },
+    "range_on_overlap_moments": {
+      "n": 534,
+      "mean_pct": 4.318432373127341,
+      "pf": 2.5438569598822207,
+      "win_pct": 75.46816479400749
+    }
+  },
+  "frozen_state_arbiter": {
+    "priority": [
+      "SHORT",
+      "RANGE_SHORT_AS_RANGE",
+      "NO_TRADE"
+    ],
+    "LONG": "disabled",
+    "RANGE_LONG": "NO_TRADE until separate long/range-long evidence exists",
+    "states": {
+      "SHORT": {
+        "n": 1544,
+        "mean_pct": 5.429450223445597,
+        "pf": 2.4238500044950806,
+        "win_pct": 74.87046632124353
+      },
+      "RANGE": {
+        "n": 1315,
+        "mean_pct": 2.4095871351711025,
+        "pf": 1.64517489529838,
+        "win_pct": 68.5171102661597
+      },
+      "NO_TRADE": {
+        "n": 6,
+        "mean_pct": null,
+        "pf": null,
+        "win_pct": null
+      }
+    }
+  }
+}
