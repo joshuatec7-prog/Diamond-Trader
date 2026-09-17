@@ -46,7 +46,7 @@ jobs:
           unzip -q range.zip -d range
       - name: Run Step 8 1m 3m attention diagnostic
         run: |
-          python research/v40_step8_fast_attention.py \
+          PYTHONPATH=. python research/v40_step8_fast_attention.py \
             bear/cryptobot_v40_bear_research_dataset.json \
             range/cryptobot_v40_range_research_dataset.json \
             --output v40_step8_fast_attention_result.json \
