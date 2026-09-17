@@ -1,0 +1,48 @@
+{
+  "version": "v40-step6-range-untouched-once-1",
+  "mode": "OFFLINE_MEASUREMENT_ONLY",
+  "execution_enabled": false,
+  "live_orders_possible": false,
+  "active_paper_changed": false,
+  "untouched_opened": true,
+  "no_tuning_after_open": true,
+  "frozen_validation_decision": "PASS_RANGE_VALIDATION_KEEP_UNTOUCHED_SEALED",
+  "candidate_threshold": 1.0510491510557503,
+  "untouched": {
+    "rows": 51647,
+    "selected": {
+      "n": 937,
+      "mean_pct": 2.4509050338847382,
+      "median_pct": 5.328018,
+      "pf": 1.646289221968005,
+      "win_pct": 69.69050160085379,
+      "60_mean_pct": 0.7695836958377802,
+      "60_pf": 1.2351428832969795,
+      "240_mean_pct": 1.5796642177161153,
+      "240_pf": 1.3135949078937996,
+      "480_mean_pct": 3.8878910149413013,
+      "480_pf": 1.9715626469805476,
+      "720_mean_pct": 3.566481207043757,
+      "720_pf": 1.6965262677744064,
+      "positive_horizons": 4,
+      "days": 16,
+      "positive_days_pct": 87.5,
+      "max_market_share_pct": 6.616862326574173,
+      "range_long_pct": 0.6403415154749199
+    }
+  },
+  "pass_criteria": {
+    "n_min": 100,
+    "mean_gt_pct": 0.0,
+    "pf_min": 1.2,
+    "positive_horizons_min": 3,
+    "positive_days_pct_min": 50.0
+  },
+  "passed": true,
+  "decision": "PASS_RANGE_UNTOUCHED",
+  "notes": [
+    "Exact frozen candidate model family/random_state uit Step 6 validation.",
+    "Geen tuning na openen van laatste 15 dagen.",
+    "Research forward labels na vast kostenmodel; nog geen uitvoerbare tradingstrategie."
+  ]
+}
