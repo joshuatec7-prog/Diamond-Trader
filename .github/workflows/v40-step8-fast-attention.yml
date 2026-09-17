@@ -1,0 +1,93 @@
+name: v4.0 step 8 fast attention
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - "research/v40_step8_fast_attention.py"
+      - ".github/workflows/v40-step8-fast-attention.yml"
+
+jobs:
+  analyze-fast-attention:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install research dependencies
+        run: python -m pip install -r requirements.txt numpy pandas scikit-learn
+      - name: Compile Step 8 diagnostic
+        run: python -m py_compile research/v40_step8_fast_attention.py
+      - name: Download frozen Step 5 and Step 6 datasets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -L --fail \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -o bear.zip \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/10498130810/zip"
+          curl -L --fail \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -o range.zip \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/10508180818/zip"
+          mkdir -p bear range
+          unzip -q bear.zip -d bear
+          unzip -q range.zip -d range
+      - name: Run Step 8 1m 3m attention diagnostic
+        run: |
+          python research/v40_step8_fast_attention.py \
+            bear/cryptobot_v40_bear_research_dataset.json \
+            range/cryptobot_v40_range_research_dataset.json \
+            --output v40_step8_fast_attention_result.json \
+            | tee v40_step8_fast_attention.log
+      - name: Validate research safety
+        run: |
+          python - <<'PY'
+          import json
+          r=json.load(open('v40_step8_fast_attention_result.json',encoding='utf-8'))
+          assert r['mode']=='OFFLINE_MEASUREMENT_ONLY'
+          assert r['execution_enabled'] is False
+          assert r['live_orders_possible'] is False
+          assert r['active_paper_changed'] is False
+          assert r['new_untouched_test'] is False
+          assert r['attention_lead_minutes']==2
+          assert r['sample']['requested']==300
+          print('step 8 research safety OK')
+          PY
+      - name: Write summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r=json.load(open('v40_step8_fast_attention_result.json',encoding='utf-8'))
+          print('# Step 8 — 1m/3m fast attention')
+          print()
+          print(f"- Beslissing: {r['decision']}")
+          print(f"- Bruikbaar: {r['sample']['usable']}/{r['sample']['requested']}")
+          print(f"- FAST_CONFIRM n: {r['overall']['confirm']['n']}")
+          print(f"- FAST_CONFIRM mean: {r['overall']['confirm']['mean_pct']}")
+          print(f"- FAST_CONFIRM PF: {r['overall']['confirm']['pf']}")
+          print(f"- Niet bevestigd mean: {r['overall']['nonconfirm']['mean_pct']}")
+          print(f"- Uplift: {r['overall']['uplift_pp']} pp")
+          print(f"- Eerste helft uplift: {r['overall']['first_half']['uplift_pp']} pp")
+          print(f"- Tweede helft uplift: {r['overall']['second_half']['uplift_pp']} pp")
+          print('- Alleen attention-diagnostiek; geen handelswijziging')
+          PY
+      - name: Upload Step 8 result
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step8-fast-attention
+          path: |
+            v40_step8_fast_attention_result.json
+            v40_step8_fast_attention.log
+          retention-days: 14
