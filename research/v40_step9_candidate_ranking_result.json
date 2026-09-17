@@ -1,0 +1,246 @@
+{
+  "version": "v40-step9-candidate-ranking-1",
+  "mode": "OFFLINE_MEASUREMENT_ONLY",
+  "execution_enabled": false,
+  "live_orders_possible": false,
+  "active_paper_changed": false,
+  "hyperparameter_sweep": false,
+  "step5_step6_validation_reused": false,
+  "opened_final15_reused": false,
+  "development_cutoff_day": 60,
+  "pass_criteria": {
+    "mean_uplift_pp_min_each_window": 0.25,
+    "pf_must_exceed_baseline_each_window": true,
+    "realized_percentile_must_exceed_baseline_each_window": true,
+    "oracle_hit_must_not_decline_each_window": true
+  },
+  "hgb": {
+    "max_iter": 100,
+    "learning_rate": 0.05,
+    "max_leaf_nodes": 7,
+    "min_samples_leaf": 40,
+    "l2_regularization": 1.0
+  },
+  "SHORT": {
+    "state": "SHORT",
+    "dataset_rows_total": 515042,
+    "dataset_moments_total": 25776,
+    "development_rows_used": 343020,
+    "development_moments_used": 17167,
+    "dataset_end_ms": 1789364100000,
+    "days_60_plus_used": false,
+    "method": "same fixed HGB capacity; challenger predicts training within-moment residual instead of absolute outcome",
+    "windows": [
+      {
+        "window": {
+          "name": "A",
+          "train_start_day": 0,
+          "train_end_day": 30,
+          "test_start_day": 31,
+          "test_end_day": 45
+        },
+        "train_rows": 170990,
+        "test_rows": 80213,
+        "train_moments": 8557,
+        "test_moments": 4017,
+        "feature_count": 38,
+        "baseline": {
+          "n_moments": 4017,
+          "mean_pct": 0.6515285220313667,
+          "median_pct": 1.9758062500000002,
+          "pf": 1.1761812882157934,
+          "win_pct": 61.389096340552655,
+          "oracle_hit_pct": 25.292506845904906,
+          "mean_realized_percentile": 62.166685857457125,
+          "mean_gap_to_oracle_pct": 8.97476297068708,
+          "max_market_share_pct": 4.082648742842918
+        },
+        "challenger": {
+          "n_moments": 4017,
+          "mean_pct": 0.6245000491038089,
+          "median_pct": 1.97098175,
+          "pf": 1.1673512897697385,
+          "win_pct": 60.7916355489171,
+          "oracle_hit_pct": 25.267612646253422,
+          "mean_realized_percentile": 61.65177606060432,
+          "mean_gap_to_oracle_pct": 9.001791443614636,
+          "max_market_share_pct": 4.132437142145879
+        },
+        "comparison": {
+          "mean_uplift_pp": -0.027028472927557834,
+          "pf_uplift": -0.00882999844605492,
+          "oracle_hit_uplift_pp": -0.024894199651484428,
+          "realized_percentile_uplift_pp": -0.5149097968528054,
+          "gap_to_oracle_improvement_pp": -0.02702847292755628,
+          "same_choice_pct": 81.03061986557132
+        }
+      },
+      {
+        "window": {
+          "name": "B",
+          "train_start_day": 0,
+          "train_end_day": 45,
+          "test_start_day": 46,
+          "test_end_day": 59
+        },
+        "train_rows": 256962,
+        "test_rows": 74560,
+        "train_moments": 12862,
+        "test_moments": 3729,
+        "feature_count": 38,
+        "baseline": {
+          "n_moments": 3729,
+          "mean_pct": 0.5486791531912041,
+          "median_pct": 2.119491,
+          "pf": 1.1156960337049289,
+          "win_pct": 62.02735317779565,
+          "oracle_hit_pct": 22.338428533118798,
+          "mean_realized_percentile": 61.7495695191317,
+          "mean_gap_to_oracle_pct": 11.998729376441405,
+          "max_market_share_pct": 6.543309198176455
+        },
+        "challenger": {
+          "n_moments": 3729,
+          "mean_pct": 0.7464638551890588,
+          "median_pct": 2.19536875,
+          "pf": 1.1615709123060132,
+          "win_pct": 62.080986859747924,
+          "oracle_hit_pct": 22.338428533118798,
+          "mean_realized_percentile": 61.940433103512916,
+          "mean_gap_to_oracle_pct": 11.800944674443551,
+          "max_market_share_pct": 6.731027085009386
+        },
+        "comparison": {
+          "mean_uplift_pp": 0.1977847019978547,
+          "pf_uplift": 0.0458748786010843,
+          "oracle_hit_uplift_pp": 0.0,
+          "realized_percentile_uplift_pp": 0.1908635843812192,
+          "gap_to_oracle_improvement_pp": 0.19778470199785403,
+          "same_choice_pct": 81.06731027085009
+        }
+      }
+    ],
+    "passed_each_window": [
+      false,
+      false
+    ],
+    "passed": false,
+    "decision": "KEEP_FROZEN_BASELINE_RANKER"
+  },
+  "RANGE": {
+    "state": "RANGE",
+    "dataset_rows_total": 309306,
+    "dataset_moments_total": 25776,
+    "development_rows_used": 206000,
+    "development_moments_used": 17167,
+    "dataset_end_ms": 1789364100000,
+    "days_60_plus_used": false,
+    "method": "same fixed HGB capacity; challenger predicts training within-moment residual instead of absolute outcome",
+    "windows": [
+      {
+        "window": {
+          "name": "A",
+          "train_start_day": 0,
+          "train_end_day": 30,
+          "test_start_day": 31,
+          "test_end_day": 45
+        },
+        "train_rows": 102683,
+        "test_rows": 48202,
+        "train_moments": 8557,
+        "test_moments": 4017,
+        "feature_count": 40,
+        "baseline": {
+          "n_moments": 4017,
+          "mean_pct": 0.655090789395071,
+          "median_pct": 0.78283125,
+          "pf": 1.3109672474571166,
+          "win_pct": 59.248195170525264,
+          "oracle_hit_pct": 31.491162559123726,
+          "mean_realized_percentile": 62.67861588249938,
+          "mean_gap_to_oracle_pct": 4.349673231080408,
+          "max_market_share_pct": 2.788150360965895,
+          "range_long_share_pct": 8.862335075927309
+        },
+        "challenger": {
+          "n_moments": 4017,
+          "mean_pct": 0.6427626920587504,
+          "median_pct": 0.76955275,
+          "pf": 1.3084901785218985,
+          "win_pct": 59.32287776947971,
+          "oracle_hit_pct": 31.76499875529002,
+          "mean_realized_percentile": 62.809876207934465,
+          "mean_gap_to_oracle_pct": 4.362001328416729,
+          "max_market_share_pct": 2.663679362708489,
+          "range_long_share_pct": 6.472491909385113
+        },
+        "comparison": {
+          "mean_uplift_pp": -0.012328097336320676,
+          "pf_uplift": -0.002477068935218041,
+          "oracle_hit_uplift_pp": 0.2738361961662932,
+          "realized_percentile_uplift_pp": 0.13126032543508614,
+          "gap_to_oracle_improvement_pp": -0.012328097336320454,
+          "same_choice_pct": 80.73188946975355
+        }
+      },
+      {
+        "window": {
+          "name": "B",
+          "train_start_day": 0,
+          "train_end_day": 45,
+          "test_start_day": 46,
+          "test_end_day": 59
+        },
+        "train_rows": 154341,
+        "test_rows": 44747,
+        "train_moments": 12862,
+        "test_moments": 3729,
+        "feature_count": 40,
+        "baseline": {
+          "n_moments": 3729,
+          "mean_pct": 0.0371123305846073,
+          "median_pct": 0.82857925,
+          "pf": 1.0116737730445238,
+          "win_pct": 58.326629123089305,
+          "oracle_hit_pct": 32.01930812550282,
+          "mean_realized_percentile": 61.24942100002438,
+          "mean_gap_to_oracle_pct": 6.004954946165191,
+          "max_market_share_pct": 4.18342719227675,
+          "range_long_share_pct": 11.102172164119068
+        },
+        "challenger": {
+          "n_moments": 3729,
+          "mean_pct": 0.10580169629927615,
+          "median_pct": 0.9542735,
+          "pf": 1.0331333015693973,
+          "win_pct": 59.104317511397156,
+          "oracle_hit_pct": 33.19924912845267,
+          "mean_realized_percentile": 61.78405129330311,
+          "mean_gap_to_oracle_pct": 5.936265580450523,
+          "max_market_share_pct": 4.397961920085814,
+          "range_long_share_pct": 10.136765888978278
+        },
+        "comparison": {
+          "mean_uplift_pp": 0.06868936571466885,
+          "pf_uplift": 0.02145952852487354,
+          "oracle_hit_uplift_pp": 1.1799410029498532,
+          "realized_percentile_uplift_pp": 0.534630293278731,
+          "gap_to_oracle_improvement_pp": 0.06868936571466833,
+          "same_choice_pct": 81.79136497720569
+        }
+      }
+    ],
+    "passed_each_window": [
+      false,
+      false
+    ],
+    "passed": false,
+    "decision": "KEEP_FROZEN_BASELINE_RANKER"
+  },
+  "decision": "KEEP_EXISTING_FROZEN_RANKERS",
+  "notes": [
+    "Een PROMOTE-beslissing betekent alleen challenger-status voor nieuw/future OOS; geen PAPER/runtime-wijziging.",
+    "Geen data vanaf dag 60 gebruikt; bekende Step 5/6 validation en final15 zijn niet opnieuw ingezet om de challenger te kiezen.",
+    "Step 10 blijft verantwoordelijk voor kosten/spread/liquiditeit/L2-veto; die factoren worden hier niet opnieuw getuned."
+  ]
+}
