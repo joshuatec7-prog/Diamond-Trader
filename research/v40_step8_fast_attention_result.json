@@ -1,0 +1,144 @@
+{
+  "version": "v40-step8-fast-attention-2",
+  "mode": "OFFLINE_MEASUREMENT_ONLY",
+  "execution_enabled": false,
+  "live_orders_possible": false,
+  "active_paper_changed": false,
+  "new_untouched_test": false,
+  "source_states": "Frozen Step 7 SHORT priority, then RANGE_SHORT as RANGE; LONG and RANGE_LONG excluded.",
+  "purpose": "Conditional precursor diagnostic only; tests whether closed 1m data can prioritize attention 2 minutes before current 5m signal close.",
+  "fixed_rule": "FAST_CONFIRM iff first 3m move of current 5m candle is down AND last 1m move at +3m is down.",
+  "attention_lead_minutes": 2,
+  "data_semantics": {
+    "bitvavo_candle_timestamp": "start_of_interval",
+    "request_end": "exact aligned cutoff; no end_ms-1 helper",
+    "zero_trade_minutes": "missing candle treated as zero price move via last-close carry-forward and zero volume",
+    "lookback_minutes_for_price_anchor": 60
+  },
+  "sample": {
+    "target_per_state": 150,
+    "requested": 300,
+    "usable": 299,
+    "errors": 1,
+    "error_examples": [
+      "RANGE OSMO-EUR 1787571900000: RuntimeError: geen historische 1m candles vóór attention cutoff"
+    ],
+    "method": "deterministic evenly-spaced sample across frozen evaluation events"
+  },
+  "pass_criteria": {
+    "usable_n_min": 240,
+    "confirm_n_min": 80,
+    "mean_uplift_pp_min": 0.5,
+    "both_halves_positive_uplift": true,
+    "confirm_pf_must_exceed_nonconfirm": true
+  },
+  "overall": {
+    "all": {
+      "n": 299,
+      "mean_pct": 2.5672118887959865,
+      "pf": 1.5439443093211418,
+      "win_pct": 67.55852842809364
+    },
+    "confirm": {
+      "n": 78,
+      "mean_pct": 4.244633477564102,
+      "pf": 1.9387075917596879,
+      "win_pct": 76.92307692307693
+    },
+    "nonconfirm": {
+      "n": 221,
+      "mean_pct": 1.9751807398190047,
+      "pf": 1.4124025961384266,
+      "win_pct": 64.25339366515837
+    },
+    "confirm_share_pct": 26.08695652173913,
+    "uplift_pp": 2.2694527377450977,
+    "corr_short_pressure_1m_vs_outcome": -0.039603319662619936,
+    "corr_short_pressure_3m_vs_outcome": -0.020324882613326333,
+    "first_half": {
+      "confirm": {
+        "n": 41,
+        "mean_pct": 5.432965719512195,
+        "pf": 2.428766952222593,
+        "win_pct": 80.48780487804879
+      },
+      "nonconfirm": {
+        "n": 108,
+        "mean_pct": 3.0558566157407405,
+        "pf": 1.8387960275130704,
+        "win_pct": 62.03703703703704
+      },
+      "uplift_pp": 2.3771091037714545
+    },
+    "second_half": {
+      "confirm": {
+        "n": 37,
+        "mean_pct": 2.927832885135135,
+        "pf": 1.5504720043092175,
+        "win_pct": 72.97297297297297
+      },
+      "nonconfirm": {
+        "n": 113,
+        "mean_pct": 0.9423223805309734,
+        "pf": 1.1601219826189515,
+        "win_pct": 66.3716814159292
+      },
+      "uplift_pp": 1.9855105046041617
+    },
+    "median_trade_candles_first3": 3.0,
+    "median_stale_minutes_at_cutoff": 0.0
+  },
+  "by_state": {
+    "SHORT": {
+      "all": {
+        "n": 150,
+        "mean_pct": 3.5909390716666665,
+        "pf": 1.6694406972042208,
+        "win_pct": 72.0
+      },
+      "confirm": {
+        "n": 58,
+        "mean_pct": 7.810716512931035,
+        "pf": 4.489886272791936,
+        "win_pct": 84.48275862068965
+      },
+      "nonconfirm": {
+        "n": 92,
+        "mean_pct": 0.9306445978260871,
+        "pf": 1.1268803623269104,
+        "win_pct": 64.13043478260869
+      },
+      "uplift_pp": 6.880071915104947
+    },
+    "RANGE": {
+      "all": {
+        "n": 149,
+        "mean_pct": 1.5366140536912754,
+        "pf": 1.377469318866228,
+        "win_pct": 63.08724832214765
+      },
+      "confirm": {
+        "n": 20,
+        "mean_pct": -6.097007325000001,
+        "pf": 0.45291176589484594,
+        "win_pct": 55.00000000000001
+      },
+      "nonconfirm": {
+        "n": 129,
+        "mean_pct": 2.7201212441860467,
+        "pf": 1.914589669798454,
+        "win_pct": 64.34108527131784
+      },
+      "uplift_pp": -8.817128569186048
+    }
+  },
+  "passed": false,
+  "decision": "REJECT_1M_3M_FAST_ATTENTION_UPLIFT",
+  "notes": [
+    "Geen parameter- of drempelsweep.",
+    "Alle 1m-features gebruiken uitsluitend data waarvan de candle uiterlijk op signal+3m gesloten is.",
+    "Bitvavo kan zero-trade minuten overslaan; die minuten krijgen geen fictieve trade maar wel een vlakke carried-forward prijs en nul volume.",
+    "De uiteindelijke 5m-selector is conditioneel achteraf bekend; dit bewijst dus niet dat 1m/3m zelfstandig kandidaten kan genereren.",
+    "Geen wijziging aan handelslogica, Render, PAPER of live-orders."
+  ]
+}
