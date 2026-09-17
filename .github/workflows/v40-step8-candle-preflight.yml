@@ -1,0 +1,62 @@
+name: v4.0 step 8 candle preflight
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - "research/v40_step8_candle_preflight.py"
+      - ".github/workflows/v40-step8-candle-preflight.yml"
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install project dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Import and compile preflight
+        run: |
+          PYTHONPATH=. python -m py_compile research/v40_step8_candle_preflight.py
+          PYTHONPATH=. python - <<'PY'
+          import bitvavo_public
+          import research.v40_step8_candle_preflight
+          print('imports OK')
+          PY
+      - name: Run historical 1m timing preflight
+        run: PYTHONPATH=. python research/v40_step8_candle_preflight.py | tee v40_step8_candle_preflight.log
+      - name: Validate safety
+        if: always()
+        run: |
+          if [ -f v40_step8_candle_preflight_result.json ]; then
+            python - <<'PY'
+          import json
+          r=json.load(open('v40_step8_candle_preflight_result.json',encoding='utf-8'))
+          assert r['mode']=='OFFLINE_MEASUREMENT_ONLY'
+          assert r['execution_enabled'] is False
+          assert r['live_orders_possible'] is False
+          assert r['active_paper_changed'] is False
+          print('preflight safety OK')
+          PY
+          else
+            echo 'No result file produced'
+          fi
+      - name: Upload preflight evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step8-candle-preflight
+          path: |
+            v40_step8_candle_preflight_result.json
+            v40_step8_candle_preflight.log
+          if-no-files-found: warn
+          retention-days: 14
