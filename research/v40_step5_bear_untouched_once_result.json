@@ -1,0 +1,48 @@
+{
+  "version": "v40-step5-bear-untouched-once-1",
+  "mode": "OFFLINE_MEASUREMENT_ONLY",
+  "execution_enabled": false,
+  "live_orders_possible": false,
+  "active_paper_changed": false,
+  "untouched_opened": true,
+  "frozen_from_validation_commit": "f0f6d990fc62fd93a8c373396c3b25f1d2c4d951",
+  "model": {
+    "type": "HistGradientBoostingRegressor",
+    "max_iter": 100,
+    "learning_rate": 0.05,
+    "max_leaf_nodes": 7,
+    "min_samples_leaf": 40,
+    "l2_regularization": 1.0,
+    "random_state": 52,
+    "candidate_threshold": 3.5633123191484324,
+    "features": ["relative_weakness_vs_btc_1h_pct","ef_return_5m_pct","ef_return_10m_pct","ef_return_15m_pct","ef_return_30m_pct","ef_return_1h_pct","ef_return_4h_pct","ef_accel_5m_vs_15m","ef_accel_10m_vs_30m","ef_volume_accel_ratio","ef_weakness_score","mc_markets_used","mc_breadth_positive_5m_pct","mc_breadth_positive_10m_pct","mc_breadth_positive_15m_pct","mc_breadth_positive_1h_pct","mc_breadth_positive_4h_pct","mc_breadth_strong_5m_pct","mc_breadth_weak_5m_pct","mc_breadth_accelerating_5m_pct","mc_mean_return_5m_pct","mc_mean_return_10m_pct","mc_mean_return_15m_pct","mc_mean_return_1h_pct","mc_mean_return_4h_pct","mc_dispersion_return_5m_pct","mc_dispersion_return_1h_pct","mc_breadth_change_5m_pp","mc_btc_return_5m_pct","mc_btc_return_10m_pct","mc_btc_return_15m_pct","mc_btc_return_1h_pct","cs_simultaneous_bear_candidate_count","cs_rank_weakness_score","cs_rank_weakest_5m","cs_rank_weakest_10m","cs_rank_relative_weakness_1h","cs_rank_volume_accel"]
+  },
+  "untouched": {
+    "rows": 86002,
+    "moments": 4304,
+    "selected": {
+      "n": 819,
+      "mean_pct": 5.663957021062272,
+      "median_pct": 8.95124225,
+      "pf": 2.4311265364179966,
+      "win_pct": 77.41147741147742,
+      "240_mean_pct": 3.568486794871795,
+      "240_pf": 2.0110006722864564,
+      "480_mean_pct": 4.336722838827839,
+      "480_pf": 2.0198353056097864,
+      "720_mean_pct": 5.664912137973137,
+      "720_pf": 2.1133200335450444,
+      "1440_mean_pct": 9.085706312576313,
+      "1440_pf": 2.8032755828384723,
+      "positive_horizons": 4,
+      "days": 16,
+      "positive_days_pct": 93.75,
+      "max_market_share_pct": 7.326007326007327
+    }
+  },
+  "pass_criteria": {"n_min":100,"mean_gt_pct":0.0,"pf_min":1.2,"positive_horizons_min":3,"positive_days_pct_min":50.0},
+  "passed": true,
+  "decision": "PASS_BEAR_SHORT_UNTOUCHED",
+  "no_tuning_after_open": true,
+  "notes": ["De untouched-window beslaat exact 15x24 uur maar raakt 16 UTC-kalenderdatums door de niet-middernachtelijke periodestart.","Dit is een onderzoeksuitkomst op forward close-to-close shortlabels na het vaste kostenmodel; nog geen uitvoerbare handelsstrategie, stoplogica of venue-validatie."]
+}
