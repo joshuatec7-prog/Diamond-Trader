@@ -1,0 +1,107 @@
+{
+  "version": "v40-step12-interim-20260918-1",
+  "recorded_at_utc": "2026-09-18",
+  "mode": "RESEARCH_RECORD_ONLY",
+  "source_replay": {
+    "run_id": 34925232366,
+    "commit": "3a566ee42d5c09a957b694c30da7625178b0f084",
+    "signals": 13244,
+    "shadow_selected": 14,
+    "shadow_wins": 1,
+    "shadow_losses": 13,
+    "shadow_total_result_eur": -63.87352963,
+    "shadow_profit_factor": 0.1931,
+    "memory_veto_count": 12968,
+    "conclusion": "OLD_DECISION_DESK_REJECTED_DO_NOT_REPEAT"
+  },
+  "step12a": {
+    "run_id": 35316151781,
+    "trigger_commit": "03b5dd729be21c445527ef818ee8618cb5603076",
+    "status_at_record": "IN_PROGRESS_BLOCK2",
+    "block1_artifact_id": 10545747124,
+    "block1": {
+      "cycles": 67,
+      "qualified_candidates": 38,
+      "state_counts": {
+        "SHORT": 25,
+        "RANGE": 13
+      },
+      "actions": {
+        "BLOCK": 38,
+        "NO_TRADE": 29
+      },
+      "blockers": {
+        "l2_fixed_veto_faalt": 37,
+        "l2_spread_instabiel": 28
+      },
+      "l2_pass_counts": {
+        "0": 36,
+        "1": 1,
+        "2": 1
+      },
+      "candidate_failed_checks": {
+        "top_spread": 37,
+        "execution_spread": 37,
+        "near_depth": 33,
+        "volume": 12
+      },
+      "snapshot_stats": {
+        "top_spread_median_pct": 0.4255711854675992,
+        "top_spread_p90_pct": 1.689041295782867,
+        "top_spread_max_pct": 4.413068804228737,
+        "execution_spread_median_pct": 0.43648091495372965,
+        "execution_spread_p90_pct": 2.0150098517935477,
+        "execution_spread_max_pct": 4.413068804228737
+      },
+      "interpretation": "Do not retune L2 thresholds from block1. First label blocked candidates counterfactually and measure whether liquidity/spread evidence separates good from bad outcomes."
+    }
+  },
+  "step12b_websocket": {
+    "implementation_commit": "6556d17dcb248ad7dc11405aea8e1e4f4af654b4",
+    "smoke_run_id": 35343961665,
+    "smoke_artifact_id": 10546091790,
+    "status": "TECHNICAL_SMOKE_PASSED",
+    "public_market_data_only": true,
+    "authenticated_api_used": false,
+    "order_actions": 0,
+    "decision_influence": "NONE_OBSERVE_ONLY",
+    "smoke": {
+      "market": "BTC-EUR",
+      "captured_seconds": 22.975,
+      "book_events": 200,
+      "trades": 1,
+      "book_resyncs": 0,
+      "book_samples": 20,
+      "spread_median_pct": 0.00147009,
+      "spread_range_pct": 0.00294102,
+      "book_imbalance_median": -0.00085132,
+      "taker_flow_imbalance": -1
+    },
+    "fields_for_future_candidate_capture": [
+      "taker_flow_imbalance",
+      "taker_buy_quote",
+      "taker_sell_quote",
+      "spread_median_pct",
+      "spread_p90_pct",
+      "spread_range_pct",
+      "book_imbalance_median",
+      "book_imbalance_p10",
+      "book_imbalance_p90",
+      "bid_heavy_share_pct",
+      "ask_heavy_share_pct",
+      "book_resyncs"
+    ]
+  },
+  "frozen_rules": {
+    "selector": "Step 12A frozen SHORT > RANGE_SHORT > NO_TRADE",
+    "long": "DISABLED",
+    "exit": "TP10_STOP15",
+    "baseline_shadow_stake_eur": 300,
+    "max_open": 4,
+    "l2_thresholds_unchanged": true,
+    "render_changed": false,
+    "active_paper_changed": false,
+    "live_orders_possible": false
+  },
+  "next_action": "Let current Step 12A day finish; then counterfactually label every qualified candidate, preserve frozen thresholds, and attach Step 12B WebSocket microstructure only in the next prospective observe-only capture. No threshold tuning before that comparison."
+}
