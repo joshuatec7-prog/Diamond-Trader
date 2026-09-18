@@ -1,0 +1,92 @@
+name: v4.0 step 12B websocket microstructure smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - "research/v40_step12b_ws_microstructure_observer.py"
+      - "tests/test_v40_step12b_ws_microstructure_observer.py"
+      - ".github/workflows/v40-step12b-ws-microstructure-smoke.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  observe-public-websocket:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install research dependencies
+        run: |
+          python -m pip install -r research/requirements-research.txt
+          python -m pip install websockets==15.0.1
+
+      - name: Compile and unit-test observer
+        run: |
+          python -m py_compile research/v40_step12b_ws_microstructure_observer.py
+          python -m unittest tests.test_v40_step12b_ws_microstructure_observer -v
+
+      - name: Public BTC WebSocket smoke capture
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python research/v40_step12b_ws_microstructure_observer.py \
+            BTC-EUR \
+            --seconds 20 \
+            --output v40_step12b_ws_microstructure_observation.json \
+            | tee v40_step12b_ws_microstructure_observation.log
+
+      - name: Validate observe-only guards
+        run: |
+          python - <<'PY'
+          import json
+          r=json.load(open("v40_step12b_ws_microstructure_observation.json",encoding="utf-8"))
+          assert r["mode"]=="PUBLIC_WEBSOCKET_OBSERVE_ONLY"
+          assert r["execution_enabled"] is False
+          assert r["authenticated_api_used"] is False
+          assert r["order_actions"] == 0
+          assert r["active_paper_changed"] is False
+          assert r["live_orders_possible"] is False
+          assert r["decision_influence"]=="NONE_OBSERVE_ONLY"
+          assert r["book"]["sample_count"] >= 1
+          assert r["book"]["spread_median_pct"] is not None
+          assert r["continuity"]["snapshots"] >= 1
+          print("step12B observe-only guards OK")
+          PY
+
+      - name: Write summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r=json.load(open("v40_step12b_ws_microstructure_observation.json",encoding="utf-8"))
+          print("# Step 12B — Bitvavo public WebSocket microstructure")
+          print()
+          print(f"- Market: {r['market']}")
+          print(f"- Captured: {r['captured_seconds']} sec")
+          print(f"- Trades: {r['flow']['trade_count']}")
+          print(f"- Taker flow imbalance: {r['flow']['taker_flow_imbalance']}")
+          print(f"- Median spread: {r['book']['spread_median_pct']}%")
+          print(f"- Median near-book imbalance: {r['book']['book_imbalance_median']}")
+          print(f"- Book resyncs: {r['continuity']['book_resyncs']}")
+          print("- Decision influence: NONE / OBSERVE ONLY")
+          print("- PAPER/runtime/live: unchanged")
+          PY
+
+      - name: Upload observation
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step12b-ws-microstructure-smoke
+          path: |
+            v40_step12b_ws_microstructure_observation.json
+            v40_step12b_ws_microstructure_observation.log
+          retention-days: 14
