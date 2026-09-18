@@ -1,0 +1,53 @@
+{
+  "version": "v40-step12-readiness-1",
+  "checked_at_utc": "2026-09-18",
+  "mode": "OFFLINE_READINESS_ONLY",
+  "step11c_decision": "STEP11C_RISK_ENVELOPE_READY_FOR_FUTURE_SHADOW",
+  "bitvavo_short_route": {
+    "user_facing_short_available": true,
+    "api_automated_short_confirmed": false,
+    "conclusion": "BLOCK_AUTOMATED_BITVAVO_SHORT_EXECUTION_UNTIL_API_ROUTE_CONFIRMED",
+    "evidence": [
+      {
+        "source": "Bitvavo Help Center",
+        "url": "https://support.bitvavo.com/hc/en-us/articles/38119430437393-What-is-short-selling-on-Bitvavo-and-how-does-it-work",
+        "note": "States short selling is supported in app/Bitvavo Pro and is not yet available over the API."
+      },
+      {
+        "source": "Bitvavo Leveraged Accounts REST API",
+        "url": "https://docs.bitvavo.com/docs/leveraged-accounts-api/",
+        "note": "Documents leveraged account position/net-liquidation endpoints, including negative short positions."
+      },
+      {
+        "source": "Bitvavo Exchange REST create order",
+        "url": "https://docs.bitvavo.com/docs/rest-api/create-order/",
+        "note": "Public create-order schema exposes generic buy/sell orders and no explicit retail short/margin opening parameter."
+      },
+      {
+        "source": "Bitvavo API releases",
+        "url": "https://docs.bitvavo.com/releases/",
+        "note": "Exchange API release notes through 2026-08-07 do not announce retail short-selling order execution over API."
+      }
+    ],
+    "interpretation": "The documentation is not sufficient to prove that this standard private-account bot can programmatically open/close Bitvavo short positions. Do not enable live short execution on this basis."
+  },
+  "step12_safe_path": {
+    "prospective_shadow_without_orders": true,
+    "repeated_l2_collection_required": true,
+    "synthetic_short_signal_tracking_allowed": true,
+    "paper_or_live_execution_change_requires_explicit_permission": true
+  },
+  "frozen_risk_envelope": {
+    "research_capital_eur": 3600,
+    "reserve_eur": 200,
+    "baseline_future_shadow_stake_eur": 300,
+    "baseline_future_shadow_max_open": 4,
+    "stake_ceiling_eur": 400,
+    "max_open_at_ceiling": 3,
+    "variable_strength_sizing_validated": false
+  },
+  "next_action": "Prepare prospective observe-only Step 12 shadow specification; do not deploy or alter PAPER/runtime without explicit permission.",
+  "runtime_changes": false,
+  "paper_changes": false,
+  "live_changes": false
+}
