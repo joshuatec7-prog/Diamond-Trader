@@ -1,0 +1,318 @@
+name: v4.0 step 12A 5m prospective shadow day
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - "research/v40_step12a_shadow_runner.py"
+      - ".github/workflows/v40-step12a-shadow-day.yml"
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  SELECTOR_ARTIFACT_ID: "10535385494"
+  BLOCK_SECONDS: "19800"
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned research environment
+        run: python -m pip install -r research/requirements-research.txt
+
+      - name: Compile and import runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile research/v40_step12a_shadow_runner.py
+          PYTHONPATH=. python - <<'PY'
+          import research.v40_step12a_shadow_runner as m
+          assert m.BASELINE_STAKE_EUR == 300.0
+          assert m.REDUCED_STAKE_EUR == 200.0
+          assert m.MAX_OPEN == 4
+          assert m.TAKE_PROFIT_PCT == 10.0
+          assert m.STOP_PCT == 15.0
+          assert m.ROUNDTRIP_COST_PCT == 0.78
+          assert m.TOP_SPREAD_MAX_PCT == 0.25
+          assert m.EXECUTION_SPREAD_MAX_PCT == 0.28
+          assert m.L2_SAMPLES == 3
+          print("step 12A runner import/frozen rules OK")
+          PY
+
+      - name: Download frozen selector bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail             -H "Authorization: Bearer $GH_TOKEN"             -H "Accept: application/vnd.github+json"             -o selector.zip             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${SELECTOR_ARTIFACT_ID}/zip"
+          unzip -tq selector.zip
+          mkdir -p selector
+          unzip -q selector.zip -d selector
+          test -s selector/v40_step12a_selector_bundle.pkl
+          test -s selector/v40_step12a_selector_bundle_manifest.json
+          python - <<'PY'
+          import json
+          m=json.load(open("selector/v40_step12a_selector_bundle_manifest.json",encoding="utf-8"))
+          assert m["decision"]=="SELECTOR_BUNDLE_READY_FOR_PROSPECTIVE_SHADOW"
+          assert m["days_60_plus_used"] is False
+          assert m["validation_reused_for_fit"] is False
+          assert m["final15_reused_for_fit"] is False
+          assert m["SHORT"]["threshold"]==3.5633123191484324
+          assert m["RANGE"]["threshold"]==1.0510491510557503
+          assert m["execution_enabled"] is False
+          print("selector manifest OK")
+          PY
+
+      - name: Public API smoke scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p smoke
+          PYTHONPATH=. python research/v40_step12a_shadow_runner.py             selector/v40_step12a_selector_bundle.pkl             --state smoke/state.json             --jsonl smoke/cycles.jsonl             --once             --focus-delay-seconds 0             | tee smoke/preflight.log
+          test -s smoke/state.json
+          test -s smoke/cycles.jsonl
+          python - <<'PY'
+          import json
+          s=json.load(open("smoke/state.json",encoding="utf-8"))
+          assert s["execution_enabled"] is False
+          assert s["live_orders_possible"] is False
+          assert s["active_paper_changed"] is False
+          assert s["cycles"]==1
+          print("public smoke scan OK")
+          PY
+
+      - name: Upload same-run selector bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: step12a-selector-current
+          path: |
+            selector/v40_step12a_selector_bundle.pkl
+            selector/v40_step12a_selector_bundle_manifest.json
+          retention-days: 2
+
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step12a-shadow-smoke
+          path: smoke/
+          if-no-files-found: warn
+          retention-days: 14
+
+  block1:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install pinned research environment
+        run: python -m pip install -r research/requirements-research.txt
+      - name: Download selector
+        uses: actions/download-artifact@v5
+        with:
+          name: step12a-selector-current
+          path: selector
+      - name: Run 5m shadow block 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p shadow
+          PYTHONPATH=. python research/v40_step12a_shadow_runner.py             selector/v40_step12a_selector_bundle.pkl             --state shadow/v40_step12a_shadow_state.json             --jsonl shadow/v40_step12a_shadow_cycles.jsonl             --duration-seconds "$BLOCK_SECONDS"             --focus-delay-seconds 20             | tee shadow/block.log
+      - name: Safety validation block 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          s=json.load(open("shadow/v40_step12a_shadow_state.json",encoding="utf-8"))
+          q=json.load(open("v40_step12a_shadow_block_summary.json",encoding="utf-8"))
+          assert s["execution_enabled"] is False and s["live_orders_possible"] is False
+          assert s["active_paper_changed"] is False
+          assert q["execution_enabled"] is False and q["active_paper_changed"] is False
+          assert len(s["positions"]) <= 4
+          print("block 1 safety OK")
+          PY
+          cp v40_step12a_shadow_block_summary.json shadow/
+      - name: Upload block 1
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step12a-shadow-block-1
+          path: shadow/
+          if-no-files-found: warn
+          retention-days: 14
+
+  block2:
+    needs: block1
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install pinned research environment
+        run: python -m pip install -r research/requirements-research.txt
+      - name: Download selector
+        uses: actions/download-artifact@v5
+        with:
+          name: step12a-selector-current
+          path: selector
+      - name: Restore block 1 state
+        uses: actions/download-artifact@v5
+        with:
+          name: cryptobot-v40-step12a-shadow-block-1
+          path: prior
+      - name: Run 5m shadow block 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p shadow
+          cp prior/v40_step12a_shadow_state.json shadow/
+          cp prior/v40_step12a_shadow_cycles.jsonl shadow/
+          PYTHONPATH=. python research/v40_step12a_shadow_runner.py             selector/v40_step12a_selector_bundle.pkl             --state shadow/v40_step12a_shadow_state.json             --jsonl shadow/v40_step12a_shadow_cycles.jsonl             --duration-seconds "$BLOCK_SECONDS"             --focus-delay-seconds 20             | tee shadow/block.log
+      - name: Safety validation block 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          s=json.load(open("shadow/v40_step12a_shadow_state.json",encoding="utf-8"))
+          assert s["execution_enabled"] is False and s["active_paper_changed"] is False
+          assert len(s["positions"]) <= 4
+          print("block 2 safety OK")
+          PY
+          cp v40_step12a_shadow_block_summary.json shadow/
+      - name: Upload block 2
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step12a-shadow-block-2
+          path: shadow/
+          if-no-files-found: warn
+          retention-days: 14
+
+  block3:
+    needs: block2
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install pinned research environment
+        run: python -m pip install -r research/requirements-research.txt
+      - name: Download selector
+        uses: actions/download-artifact@v5
+        with:
+          name: step12a-selector-current
+          path: selector
+      - name: Restore block 2 state
+        uses: actions/download-artifact@v5
+        with:
+          name: cryptobot-v40-step12a-shadow-block-2
+          path: prior
+      - name: Run 5m shadow block 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p shadow
+          cp prior/v40_step12a_shadow_state.json shadow/
+          cp prior/v40_step12a_shadow_cycles.jsonl shadow/
+          PYTHONPATH=. python research/v40_step12a_shadow_runner.py             selector/v40_step12a_selector_bundle.pkl             --state shadow/v40_step12a_shadow_state.json             --jsonl shadow/v40_step12a_shadow_cycles.jsonl             --duration-seconds "$BLOCK_SECONDS"             --focus-delay-seconds 20             | tee shadow/block.log
+      - name: Safety validation block 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          s=json.load(open("shadow/v40_step12a_shadow_state.json",encoding="utf-8"))
+          assert s["execution_enabled"] is False and s["active_paper_changed"] is False
+          assert len(s["positions"]) <= 4
+          print("block 3 safety OK")
+          PY
+          cp v40_step12a_shadow_block_summary.json shadow/
+      - name: Upload block 3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step12a-shadow-block-3
+          path: shadow/
+          if-no-files-found: warn
+          retention-days: 14
+
+  block4:
+    needs: block3
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install pinned research environment
+        run: python -m pip install -r research/requirements-research.txt
+      - name: Download selector
+        uses: actions/download-artifact@v5
+        with:
+          name: step12a-selector-current
+          path: selector
+      - name: Restore block 3 state
+        uses: actions/download-artifact@v5
+        with:
+          name: cryptobot-v40-step12a-shadow-block-3
+          path: prior
+      - name: Run 5m shadow block 4
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p shadow
+          cp prior/v40_step12a_shadow_state.json shadow/
+          cp prior/v40_step12a_shadow_cycles.jsonl shadow/
+          PYTHONPATH=. python research/v40_step12a_shadow_runner.py             selector/v40_step12a_selector_bundle.pkl             --state shadow/v40_step12a_shadow_state.json             --jsonl shadow/v40_step12a_shadow_cycles.jsonl             --duration-seconds "$BLOCK_SECONDS"             --focus-delay-seconds 20             | tee shadow/block.log
+      - name: Safety validation block 4
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          s=json.load(open("shadow/v40_step12a_shadow_state.json",encoding="utf-8"))
+          assert s["execution_enabled"] is False and s["active_paper_changed"] is False
+          assert len(s["positions"]) <= 4
+          print("block 4 safety OK")
+          PY
+          cp v40_step12a_shadow_block_summary.json shadow/
+      - name: Upload block 4
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step12a-shadow-block-4
+          path: shadow/
+          if-no-files-found: warn
+          retention-days: 14
