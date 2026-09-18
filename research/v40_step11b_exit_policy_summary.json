@@ -1,0 +1,79 @@
+{
+  "version": "v40-step11b-exit-policy-summary-1",
+  "source_run": 35312861669,
+  "source_artifact_id": 10534645656,
+  "source_artifact_digest": "sha256:49d0b1364df49d0c487f00f3b2ac2b2bd24553a51afe21f510468c245ed89420",
+  "source_commit": "d42e2a16b3b122b1bed50818f1c4dd2e35d4ebaa",
+  "decision": "STEP11B_EXIT_CANDIDATES_READY_FOR_STEP11C",
+  "chosen_policy": {
+    "SHORT": "TP10_STOP15",
+    "RANGE": "TP10_STOP15"
+  },
+  "policy_definition": {
+    "take_profit_pct": 10,
+    "stop_pct": 15,
+    "roundtrip_cost_pct": 0.78
+  },
+  "SHORT": {
+    "A": {
+      "n": 120,
+      "mean_net_pct": 2.495150241136324,
+      "pf": 1.6055288242423278,
+      "win_pct": 73.33333333333333,
+      "worst10_mean_net_pct": -15.78,
+      "median_hold_minutes": 90
+    },
+    "B": {
+      "n": 120,
+      "mean_net_pct": 2.815839074697534,
+      "pf": 1.7121710660335339,
+      "win_pct": 74.16666666666667,
+      "worst10_mean_net_pct": -15.78,
+      "median_hold_minutes": 105
+    },
+    "POOLED": {
+      "n": 240,
+      "mean_net_pct": 2.6554946579169285,
+      "pf": 1.657748897025517,
+      "win_pct": 73.75,
+      "worst10_mean_net_pct": -15.78,
+      "median_hold_minutes": 95
+    }
+  },
+  "RANGE": {
+    "A": {
+      "n": 120,
+      "mean_net_pct": 1.6106793427230912,
+      "pf": 1.3482365701043952,
+      "win_pct": 70,
+      "worst10_mean_net_pct": -15.78,
+      "median_hold_minutes": 52.5
+    },
+    "B": {
+      "n": 120,
+      "mean_net_pct": 1.500776183938249,
+      "pf": 1.325144218090449,
+      "win_pct": 70,
+      "worst10_mean_net_pct": -15.78,
+      "median_hold_minutes": 85
+    },
+    "POOLED": {
+      "n": 240,
+      "mean_net_pct": 1.55572776333067,
+      "pf": 1.3367022889387723,
+      "win_pct": 70,
+      "worst10_mean_net_pct": -15.78,
+      "median_hold_minutes": 65
+    }
+  },
+  "guards": {
+    "development_only": true,
+    "days_60_plus_used": false,
+    "step5_6_validation_reused": false,
+    "final15_reused": false,
+    "no_policy_sweep": true
+  },
+  "runtime_changes": false,
+  "paper_changes": false,
+  "live_changes": false
+}
