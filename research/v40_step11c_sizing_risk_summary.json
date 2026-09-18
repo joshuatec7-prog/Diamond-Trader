@@ -1,0 +1,51 @@
+{
+  "version": "v40-step11c-sizing-risk-summary-1",
+  "source_run": 35313545317,
+  "source_artifact_id": 10534127980,
+  "source_artifact_digest": "sha256:a666a2d9e5cfa9201f0c0fcd61b14367a90b069c2599b20890574909b0465a6f",
+  "source_commit": "a85b24a9c7de9ea419bb07825586307e0ccb2b3a",
+  "decision": "STEP11C_RISK_ENVELOPE_READY_FOR_FUTURE_SHADOW",
+  "capital_model": {
+    "research_equity_eur": 3600,
+    "reserve_eur": 200,
+    "available_above_reserve_eur": 3400
+  },
+  "frozen_exit_policy": "TP10_STOP15",
+  "risk_model": {
+    "stop_pct": 15,
+    "roundtrip_cost_pct": 0.78,
+    "extra_execution_stress_pct": 0.5,
+    "stressed_stop_net_loss_pct": 16.28,
+    "mathematical_single_stake_ceiling_eur": 442.26044226044223
+  },
+  "passing_envelopes": [
+    "STAKE200_MAX4",
+    "STAKE300_MAX4",
+    "STAKE400_MAX3"
+  ],
+  "blocked_envelopes": {
+    "STAKE400_MAX4": "aggregate stressed stop risk exceeds 6% equity",
+    "STAKE500_MAX2": "single stressed stop exceeds 2% equity and five stressed stops exceed 10%"
+  },
+  "provisional": {
+    "stake_ceiling_eur": 400,
+    "max_open_at_stake_ceiling": 3,
+    "future_shadow_baseline_stake_eur": 300,
+    "future_shadow_baseline_max_open": 4,
+    "variable_strength_sizing_validated": false
+  },
+  "guards": {
+    "development_only": true,
+    "days_60_plus_used": false,
+    "step5_6_validation_reused": false,
+    "final15_reused": false
+  },
+  "next_blockers": [
+    "Prospective shadow validation",
+    "Repeated prospective L2 evidence because Step 10 execution veto was not promoted",
+    "SHORT execution venue/borrow/derivatives route validation"
+  ],
+  "runtime_changes": false,
+  "paper_changes": false,
+  "live_changes": false
+}
