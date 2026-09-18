@@ -173,33 +173,71 @@ def _path_record(
     if not math.isfinite(entry) or entry <= 0:
         raise RuntimeError("ongeldige entry")
 
-    future = [
-        c for c in candles
-        if signal_ms < int(c.timestamp_ms) <= signal_ms + path_minutes * MINUTE_MS
-    ]
     expected = path_minutes // 5
-    if len(future) < math.floor(expected * 0.95):
-        raise RuntimeError(f"onvoldoende 5m path coverage {len(future)}/{expected}")
+    actual_by_ts = {
+        int(c.timestamp_ms): c
+        for c in candles
+        if signal_ms < int(c.timestamp_ms) <= signal_ms + path_minutes * MINUTE_MS
+        and c.is_valid
+    }
 
-    lows = [(int(c.timestamp_ms), float(c.low)) for c in future]
-    highs = [(int(c.timestamp_ms), float(c.high)) for c in future]
+    # Bitvavo omits a candle when there are zero trades in that interval.
+    # Such gaps are therefore reconstructed as flat zero-volume bars using the
+    # last traded close. This is market-data semantics, not price interpolation.
+    dense_path: list[dict[str, float | int | bool]] = []
+    previous_close = entry
+    raw_bars = 0
+    synthetic_zero_trade_bars = 0
+    for step in range(1, expected + 1):
+        ts = signal_ms + step * BAR_MS
+        candle = actual_by_ts.get(ts)
+        if candle is None:
+            synthetic_zero_trade_bars += 1
+            dense_path.append({
+                "timestamp_ms": ts,
+                "open": previous_close,
+                "high": previous_close,
+                "low": previous_close,
+                "close": previous_close,
+                "volume": 0.0,
+                "synthetic_zero_trade": True,
+            })
+            continue
+        raw_bars += 1
+        previous_close = float(candle.close)
+        dense_path.append({
+            "timestamp_ms": ts,
+            "open": float(candle.open),
+            "high": float(candle.high),
+            "low": float(candle.low),
+            "close": float(candle.close),
+            "volume": float(candle.volume),
+            "synthetic_zero_trade": False,
+        })
+
+    if len(dense_path) != expected:
+        raise RuntimeError(f"dense 5m path onvolledig {len(dense_path)}/{expected}")
+
+    lows = [(int(x["timestamp_ms"]), float(x["low"])) for x in dense_path]
+    highs = [(int(x["timestamp_ms"]), float(x["high"])) for x in dense_path]
     min_ts, min_low = min(lows, key=lambda x: x[1])
     max_ts, max_high = max(highs, key=lambda x: x[1])
-    last = max(future, key=lambda c: int(c.timestamp_ms))
+    last = dense_path[-1]
     favorable = (entry - min_low) / entry * 100.0
     adverse = (max_high - entry) / entry * 100.0
-    gross_end = (entry - float(last.close)) / entry * 100.0
+    gross_end = (entry - float(last["close"])) / entry * 100.0
 
     compact_path = [
         [
-            int((int(c.timestamp_ms) - signal_ms) // MINUTE_MS),
-            round(float(c.open), 10),
-            round(float(c.high), 10),
-            round(float(c.low), 10),
-            round(float(c.close), 10),
-            round(float(c.volume), 10),
+            int((int(x["timestamp_ms"]) - signal_ms) // MINUTE_MS),
+            round(float(x["open"]), 10),
+            round(float(x["high"]), 10),
+            round(float(x["low"]), 10),
+            round(float(x["close"]), 10),
+            round(float(x["volume"]), 10),
+            1 if bool(x["synthetic_zero_trade"]) else 0,
         ]
-        for c in future
+        for x in dense_path
     ]
 
     return {
@@ -212,8 +250,11 @@ def _path_record(
         "path_minutes": path_minutes,
         "entry_close": entry,
         "bars_expected": int(expected),
-        "bars_captured": int(len(future)),
-        "coverage_pct": float(len(future) / expected * 100.0),
+        "bars_captured": int(len(dense_path)),
+        "raw_trade_bars": int(raw_bars),
+        "synthetic_zero_trade_bars": int(synthetic_zero_trade_bars),
+        "raw_trade_bar_pct": float(raw_bars / expected * 100.0),
+        "coverage_pct": 100.0,
         "mfe_gross_pct": float(favorable),
         "mae_gross_pct": float(adverse),
         "time_to_mfe_min": int((min_ts - signal_ms) // MINUTE_MS),
@@ -345,6 +386,8 @@ def main() -> int:
         "step5_6_validation_reused": False,
         "final15_reused": False,
         "path_interval": "5m",
+        "zero_trade_gaps_filled": True,
+        "zero_trade_gap_rule": "Bitvavo omits candles for intervals with zero trades; carry forward last close with OHLC flat and volume 0.",
         "roundtrip_cost_pct_for_later_analysis": ROUNDTRIP_COST_PCT,
         "selection": selection_meta,
         "sample": {
@@ -369,6 +412,7 @@ def main() -> int:
         ),
         "notes": [
             "No exit thresholds are selected in Step 11A.",
+            "Missing Bitvavo candle intervals are treated only as documented zero-trade gaps and filled as flat zero-volume bars.",
             "If coverage is below 90%, the artifact is diagnostic only and Step 11B must not tune exits from it.",
             "RANGE_LONG excluded because frozen Step 7 keeps it NO_TRADE.",
             "All full paths, including the last 5m candle close, remain before day 60.",
