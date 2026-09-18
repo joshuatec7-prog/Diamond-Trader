@@ -1,0 +1,113 @@
+name: v4.0 step 11C sizing risk
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - "research/v40_step11c_sizing_risk.py"
+      - "research/v40_step11b_exit_policy_summary.json"
+      - ".github/workflows/v40-step11c-sizing-risk.yml"
+
+jobs:
+  analyze-sizing-risk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Preflight compile and frozen inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile research/v40_step11c_sizing_risk.py
+          PYTHONPATH=. python - <<'PY'
+          import json
+          import research.v40_step11c_sizing_risk as m
+          s=json.load(open("research/v40_step11b_exit_policy_summary.json",encoding="utf-8"))
+          assert s["decision"]=="STEP11B_EXIT_CANDIDATES_READY_FOR_STEP11C"
+          assert s["chosen_policy"]["SHORT"]=="TP10_STOP15"
+          assert s["chosen_policy"]["RANGE"]=="TP10_STOP15"
+          assert m.CAPITAL_EUR==3600.0
+          assert m.RESERVE_EUR==200.0
+          assert m.STOP_PCT==15.0
+          assert m.ROUNDTRIP_COST_PCT==0.78
+          assert m.EXTRA_STRESS_PCT==0.50
+          assert len(m.ENVELOPES)==5
+          print("step 11C preflight OK")
+          PY
+
+      - name: Run Step 11C sizing risk
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python research/v40_step11c_sizing_risk.py             research/v40_step11b_exit_policy_summary.json             --output v40_step11c_sizing_risk_result.json             | tee v40_step11c_sizing_risk.log
+
+      - name: Validate safety and fixed rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          r=json.load(open("v40_step11c_sizing_risk_result.json",encoding="utf-8"))
+          assert r["mode"]=="OFFLINE_RISK_CALCULATION_ONLY"
+          assert r["execution_enabled"] is False
+          assert r["active_paper_changed"] is False
+          assert r["live_orders_possible"] is False
+          assert r["development_only"] is True
+          assert r["days_60_plus_used"] is False
+          assert r["step5_6_validation_reused"] is False
+          assert r["final15_reused"] is False
+          assert r["capital_model"]["research_equity_eur"]==3600.0
+          assert r["capital_model"]["reserve_eur"]==200.0
+          assert r["risk_model"]["stressed_stop_net_loss_pct"]==16.28
+          assert r["guardrails"]["single_stop_equity_pct_max"]==2.0
+          assert r["guardrails"]["aggregate_stop_equity_pct_max"]==6.0
+          assert r["guardrails"]["five_consecutive_stop_drawdown_pct_max"]==10.0
+          assert r["decision"] in (
+            "STEP11C_RISK_ENVELOPE_READY_FOR_FUTURE_SHADOW",
+            "STEP11C_NO_RISK_ENVELOPE_PASSES",
+          )
+          print("step 11C safety/frozen rules OK")
+          PY
+
+      - name: Write summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r=json.load(open("v40_step11c_sizing_risk_result.json",encoding="utf-8"))
+          print("# Step 11C — sizing / risk")
+          print()
+          print(f"- Beslissing: {r['decision']}")
+          print(f"- Wiskundige single-stake ceiling: EUR {r['risk_model']['mathematical_single_stake_ceiling_eur']:.2f}")
+          print(f"- Passing envelopes: {', '.join(r['passing_envelopes'])}")
+          p=r["provisional"]
+          print(f"- Provisional stake ceiling: EUR {p['stake_ceiling_eur']}")
+          print(f"- Max open at ceiling: {p['max_open_at_stake_ceiling']}")
+          print(f"- Lower future-shadow baseline: EUR {p['baseline_stake_candidate_eur']} x {p['baseline_max_open_candidate']}")
+          for e in r["candidate_envelopes"]:
+              print(f"- {e['name']}: pass={e['passed']} | single={e['stress_single_stop_equity_pct']:.3f}% | aggregate={e['stress_aggregate_stop_equity_pct']:.3f}% | 5stops={e['five_consecutive_stress_stops_drawdown_pct']:.3f}%")
+          print("- Geen PAPER/runtime/live wijzigingen.")
+          PY
+
+      - name: Upload Step 11C result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step11c-sizing-risk
+          path: |
+            v40_step11c_sizing_risk_result.json
+            v40_step11c_sizing_risk.log
+          if-no-files-found: warn
+          retention-days: 14
