@@ -1,0 +1,62 @@
+{
+  "version": "v40-step11a-path-capture-summary-1",
+  "source_run": 35311560641,
+  "source_artifact_id": 10534065200,
+  "source_artifact_digest": "sha256:563d24bde4074e65b9e91757d8470984240110fb6b8243a771185908960d5f34",
+  "source_commit": "b417296fed4cb864601e05c29a104735e3046e1c",
+  "decision": "PATH_DATASET_READY_FOR_STEP11B",
+  "requested": 480,
+  "usable": 480,
+  "usable_pct": 100,
+  "errors": 0,
+  "group_coverage": {
+    "SHORT_A": {
+      "requested": 120,
+      "usable": 120,
+      "usable_pct": 100
+    },
+    "SHORT_B": {
+      "requested": 120,
+      "usable": 120,
+      "usable_pct": 100
+    },
+    "RANGE_A": {
+      "requested": 120,
+      "usable": 120,
+      "usable_pct": 100
+    },
+    "RANGE_B": {
+      "requested": 120,
+      "usable": 120,
+      "usable_pct": 100
+    }
+  },
+  "descriptive": {
+    "SHORT": {
+      "n": 240,
+      "mfe_gross_pct_median": 18.492902009278822,
+      "mae_gross_pct_median": 13.141602645087474,
+      "time_to_mfe_min_median": 915,
+      "end_net_short_pct_median": 12.733625797553811
+    },
+    "RANGE": {
+      "n": 240,
+      "mfe_gross_pct_median": 14.879937916004417,
+      "mae_gross_pct_median": 9.706765727910529,
+      "time_to_mfe_min_median": 267.5,
+      "end_net_short_pct_median": 8.714664441574303
+    }
+  },
+  "zero_trade_gap_handling": {
+    "enabled": true,
+    "rule": "Bitvavo zero-trade candle gaps are filled as flat OHLC at last close with volume 0; no price interpolation."
+  },
+  "split_guards": {
+    "days_60_plus_used": false,
+    "step5_6_validation_reused": false,
+    "final15_reused": false
+  },
+  "runtime_changes": false,
+  "paper_changes": false,
+  "live_changes": false
+}
