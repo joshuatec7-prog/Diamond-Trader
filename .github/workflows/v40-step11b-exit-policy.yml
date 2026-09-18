@@ -1,0 +1,137 @@
+name: v4.0 step 11B exit policy
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - "research/v40_step11b_exit_policy.py"
+      - ".github/workflows/v40-step11b-exit-policy.yml"
+
+jobs:
+  analyze-exit-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned research environment
+        run: python -m pip install -r research/requirements-research.txt
+
+      - name: Preflight compile and imports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile research/v40_step11b_exit_policy.py
+          PYTHONPATH=. python - <<'PY'
+          import research.v40_step11b_exit_policy as m
+          assert len(m.POLICIES) == 8
+          assert m.ROUNDTRIP_COST_PCT == 0.78
+          assert m.PASS["pf_min_each_window"] == 1.20
+          assert m.PASS["worst10_improvement_pct_each_window"] == 40.0
+          print("step 11B imports/frozen rules OK")
+          PY
+
+      - name: Preflight download frozen Step 11A artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail             -H "Authorization: Bearer $GH_TOKEN"             -H "Accept: application/vnd.github+json"             -o step11a.zip             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/10534065200/zip"
+          unzip -tq step11a.zip
+          mkdir -p step11a
+          unzip -q step11a.zip -d step11a
+          test -s step11a/v40_step11a_path_capture_result.json
+          python - <<'PY'
+          import json
+          p="step11a/v40_step11a_path_capture_result.json"
+          r=json.load(open(p,encoding="utf-8"))
+          assert r["decision"]=="PATH_DATASET_READY_FOR_STEP11B"
+          assert r["sample"]["usable"]==480
+          assert r["sample"]["usable_pct"]==100.0
+          assert len(r["events"])==480
+          assert r["days_60_plus_used"] is False
+          assert r["step5_6_validation_reused"] is False
+          assert r["final15_reused"] is False
+          assert r["zero_trade_gaps_filled"] is True
+          print("step 11B Step 11A artifact preflight OK")
+          PY
+
+      - name: Run Step 11B fixed exit research
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python research/v40_step11b_exit_policy.py             step11a/v40_step11a_path_capture_result.json             --output v40_step11b_exit_policy_result.json             | tee v40_step11b_exit_policy.log
+
+      - name: Validate research safety and frozen rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          r=json.load(open("v40_step11b_exit_policy_result.json",encoding="utf-8"))
+          assert r["mode"]=="OFFLINE_DEVELOPMENT_ONLY"
+          assert r["execution_enabled"] is False
+          assert r["active_paper_changed"] is False
+          assert r["live_orders_possible"] is False
+          assert r["development_only"] is True
+          assert r["days_60_plus_used"] is False
+          assert r["step5_6_validation_reused"] is False
+          assert r["final15_reused"] is False
+          assert r["source_event_count"]==480
+          assert r["source_usable_pct"]==100.0
+          expected={
+            "BASE_TIME","STOP10","STOP15","STOP20","TP10_STOP15","TP15_STOP15",
+            "RUN10_TRAIL7P5_STOP15","RUN15_TRAIL10_STOP20"
+          }
+          assert set(r["policy_set"])==expected
+          assert r["decision"] in (
+            "STEP11B_EXIT_CANDIDATES_READY_FOR_STEP11C",
+            "STEP11B_INSUFFICIENT_EXIT_EVIDENCE",
+          )
+          print("step 11B safety/frozen rules OK")
+          PY
+
+      - name: Write summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r=json.load(open("v40_step11b_exit_policy_result.json",encoding="utf-8"))
+          print("# Step 11B — exits / stops / runners")
+          print()
+          print(f"- Beslissing: {r['decision']}")
+          for state in ("SHORT","RANGE"):
+              s=r["states"][state]
+              print(f"- {state} gekozen: {s['chosen_policy']}")
+              if s["chosen_policy"]:
+                  c=s["policies"][s["chosen_policy"]]
+                  for w in ("A","B","POOLED"):
+                      m=c[w]
+                      print(f"  - {w}: mean {m['mean_net_pct']:.3f}% | PF {m['pf']:.3f} | win {m['win_pct']:.1f}% | worst10 {m['worst10_mean_net_pct']:.3f}% | median hold {m['median_hold_minutes']:.0f}m")
+          print("- Alleen development-data; geen validation/final15.")
+          print("- Geen PAPER/runtime/live wijzigingen.")
+          PY
+
+      - name: Upload Step 11B result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step11b-exit-policy
+          path: |
+            v40_step11b_exit_policy_result.json
+            v40_step11b_exit_policy.log
+          if-no-files-found: warn
+          retention-days: 14
