@@ -113,10 +113,18 @@ jobs:
           assert r["step5_6_validation_reused"] is False
           assert r["final15_reused"] is False
           assert r["path_interval"]=="5m"
-          assert r["sample"]["usable_pct"] >= 90.0
-          assert r["decision"]=="PATH_DATASET_READY_FOR_STEP11B"
           assert len(r["events"]) == r["sample"]["usable"]
-          print("step 11A safety/split guards OK")
+          assert r["decision"] in (
+              "PATH_DATASET_READY_FOR_STEP11B",
+              "PATH_CAPTURE_DIAGNOSTIC_INSUFFICIENT_COVERAGE",
+          )
+          if r["decision"] == "PATH_DATASET_READY_FOR_STEP11B":
+              assert r["sample"]["usable_pct"] >= r["sample"]["required_usable_pct"]
+              assert r["sample"]["coverage_ready_for_step11b"] is True
+          else:
+              assert r["sample"]["usable_pct"] < r["sample"]["required_usable_pct"]
+              assert r["sample"]["coverage_ready_for_step11b"] is False
+          print("step 11A safety/split guards OK; research decision =", r["decision"])
           PY
 
       - name: Write summary
@@ -132,7 +140,9 @@ jobs:
           print(f"- Bruikbaar: {r['sample']['usable']}/{r['sample']['requested']} ({r['sample']['usable_pct']:.1f}%)")
           for state in ("SHORT","RANGE"):
               d=r["descriptive"][state]
-              print(f"- {state}: n={d['n']} | MFE median={d['mfe_gross_pct']['median']:.3f}% | MAE median={d['mae_gross_pct']['median']:.3f}% | time-to-MFE median={d['time_to_mfe_min']['median']:.0f}m")
+              print(f"- {state}: n={d['n']} | MFE median={d['mfe_gross_pct']['median']} | MAE median={d['mae_gross_pct']['median']} | time-to-MFE median={d['time_to_mfe_min']['median']}")
+          print(f"- Foutcategorieën: {r['sample']['error_category_counts']}")
+          print(f"- Dekking per state/window: {r['sample']['group_coverage']}")
           print("- Dag 60+, Step5/6 validation en final15 niet gebruikt")
           print("- Nog geen exit/stop/runner-regel gekozen")
           PY

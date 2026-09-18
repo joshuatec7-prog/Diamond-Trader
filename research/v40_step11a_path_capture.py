@@ -270,15 +270,29 @@ def main() -> int:
 
     api = BitvavoPublic("https://api.bitvavo.com/v2", timeout_seconds=15, retries=4)
     records: list[dict[str, Any]] = []
-    errors: list[str] = []
+    errors: list[dict[str, Any]] = []
     for i, row in events.iterrows():
         try:
             records.append(_path_record(api, row, development_cutoff))
         except Exception as exc:
-            errors.append(
-                f"{row.state} {row.window} {row.market} {int(row.signal_ms)}: "
-                f"{type(exc).__name__}: {exc}"
-            )
+            message = str(exc)
+            if "entry candle ontbreekt" in message:
+                category = "entry_candle_missing"
+            elif "onvoldoende 5m path coverage" in message:
+                category = "insufficient_5m_path_coverage"
+            elif "HTTP" in message or "request" in message.lower():
+                category = "api_request_error"
+            else:
+                category = type(exc).__name__
+            errors.append({
+                "state": str(row.state),
+                "window": str(row.window),
+                "market": str(row.market),
+                "signal_ms": int(row.signal_ms),
+                "category": category,
+                "exception_type": type(exc).__name__,
+                "message": message,
+            })
         if (i + 1) % 40 == 0:
             print(
                 f"path progress {i + 1}/{len(events)} usable={len(records)} errors={len(errors)}",
@@ -289,8 +303,22 @@ def main() -> int:
     requested = int(len(events))
     usable = int(len(records))
     usable_pct = float(usable / requested * 100.0) if requested else 0.0
-    if usable_pct < 90.0:
-        raise RuntimeError(f"path capture te onvolledig: {usable}/{requested}")
+    coverage_ready = usable_pct >= 90.0
+
+    error_category_counts = dict(Counter(str(e["category"]) for e in errors))
+    group_coverage: dict[str, Any] = {}
+    for state in ("SHORT", "RANGE"):
+        for window in ("A", "B"):
+            key = f"{state}_{window}"
+            req = int(((events.state == state) & (events.window == window)).sum())
+            ok = sum(1 for r in records if r["state"] == state and r["window"] == window)
+            err = sum(1 for e in errors if e["state"] == state and e["window"] == window)
+            group_coverage[key] = {
+                "requested": req,
+                "usable": int(ok),
+                "errors": int(err),
+                "usable_pct": float(ok / req * 100.0) if req else None,
+            }
 
     by_state: dict[str, Any] = {}
     for state in ("SHORT", "RANGE"):
@@ -304,7 +332,7 @@ def main() -> int:
         }
 
     result = {
-        "version": "v40-step11a-path-capture-1",
+        "version": "v40-step11a-path-capture-2",
         "mode": "OFFLINE_MEASUREMENT_ONLY",
         "execution_enabled": False,
         "live_orders_possible": False,
@@ -324,14 +352,23 @@ def main() -> int:
             "usable": usable,
             "usable_pct": usable_pct,
             "errors": len(errors),
-            "error_examples": errors[:20],
+            "error_category_counts": error_category_counts,
+            "group_coverage": group_coverage,
+            "error_examples": errors[:30],
+            "coverage_ready_for_step11b": coverage_ready,
+            "required_usable_pct": 90.0,
             "method": "training-only 80th percentile confidence then deterministic even sample",
         },
         "descriptive": by_state,
         "events": records,
-        "decision": "PATH_DATASET_READY_FOR_STEP11B",
+        "decision": (
+            "PATH_DATASET_READY_FOR_STEP11B"
+            if coverage_ready
+            else "PATH_CAPTURE_DIAGNOSTIC_INSUFFICIENT_COVERAGE"
+        ),
         "notes": [
             "No exit thresholds are selected in Step 11A.",
+            "If coverage is below 90%, the artifact is diagnostic only and Step 11B must not tune exits from it.",
             "RANGE_LONG excluded because frozen Step 7 keeps it NO_TRADE.",
             "All full paths, including the last 5m candle close, remain before day 60.",
             "No Render/PAPER/live/runtime changes.",
@@ -349,6 +386,8 @@ def main() -> int:
         "short_mae_median": by_state["SHORT"]["mae_gross_pct"]["median"],
         "range_mfe_median": by_state["RANGE"]["mfe_gross_pct"]["median"],
         "range_mae_median": by_state["RANGE"]["mae_gross_pct"]["median"],
+        "error_category_counts": error_category_counts,
+        "group_coverage": group_coverage,
     }, indent=2))
     return 0
 
