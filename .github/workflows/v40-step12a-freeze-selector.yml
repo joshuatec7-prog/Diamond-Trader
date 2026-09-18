@@ -1,0 +1,99 @@
+name: v4.0 step 12A freeze selector
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - "research/v40_step12a_freeze_selector.py"
+      - ".github/workflows/v40-step12a-freeze-selector.yml"
+
+jobs:
+  freeze-selector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned research environment
+        run: python -m pip install -r research/requirements-research.txt
+
+      - name: Preflight compile and import
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile research/v40_step12a_freeze_selector.py
+          PYTHONPATH=. python - <<'PY'
+          import research.v40_step12a_freeze_selector as m
+          assert m.HGB["max_leaf_nodes"] == 7
+          print("selector freeze import OK")
+          PY
+
+      - name: Download frozen bear and range datasets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail             -H "Authorization: Bearer $GH_TOKEN"             -H "Accept: application/vnd.github+json"             -o bear.zip             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/10498130810/zip"
+          curl -L --fail             -H "Authorization: Bearer $GH_TOKEN"             -H "Accept: application/vnd.github+json"             -o range.zip             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/10508180818/zip"
+          unzip -tq bear.zip
+          unzip -tq range.zip
+          mkdir -p bear range
+          unzip -q bear.zip -d bear
+          unzip -q range.zip -d range
+          BEAR=$(find bear -type f -name '*bear*dataset*.json' | head -1)
+          RANGE=$(find range -type f -name '*range*dataset*.json' | head -1)
+          test -s "$BEAR"
+          test -s "$RANGE"
+          echo "BEAR_DATASET=$BEAR" >> "$GITHUB_ENV"
+          echo "RANGE_DATASET=$RANGE" >> "$GITHUB_ENV"
+
+      - name: Freeze validated selector bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python research/v40_step12a_freeze_selector.py             "$BEAR_DATASET" "$RANGE_DATASET"             --bundle v40_step12a_selector_bundle.pkl             --manifest v40_step12a_selector_bundle_manifest.json             | tee v40_step12a_selector_freeze.log
+
+      - name: Validate frozen bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, pickle
+          raw=open("v40_step12a_selector_bundle.pkl","rb").read()
+          m=json.load(open("v40_step12a_selector_bundle_manifest.json",encoding="utf-8"))
+          b=pickle.loads(raw)
+          assert hashlib.sha256(raw).hexdigest()==m["bundle_sha256"]
+          assert m["decision"]=="SELECTOR_BUNDLE_READY_FOR_PROSPECTIVE_SHADOW"
+          assert m["days_60_plus_used"] is False
+          assert m["validation_reused_for_fit"] is False
+          assert m["final15_reused_for_fit"] is False
+          assert b["SHORT"]["threshold"]==3.5633123191484324
+          assert b["RANGE"]["threshold"]==1.0510491510557503
+          assert b["arbiter"]["LONG"]=="DISABLED"
+          assert b["execution_enabled"] is False
+          print("selector bundle validation OK")
+          PY
+
+      - name: Upload selector bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step12a-selector-bundle
+          path: |
+            v40_step12a_selector_bundle.pkl
+            v40_step12a_selector_bundle_manifest.json
+            v40_step12a_selector_freeze.log
+          if-no-files-found: warn
+          retention-days: 14
