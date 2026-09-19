@@ -1,0 +1,106 @@
+name: v4.0 step 12A counterfactual outcomes
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - clean-room-20260826
+    paths:
+      - "research/v40_step12a_counterfactual_label.py"
+      - ".github/workflows/v40-step12a-counterfactual.yml"
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  STEP12A_BLOCK4_ARTIFACT_ID: "10577819855"
+
+jobs:
+  label-mature-candidates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned research environment
+        run: python -m pip install -r research/requirements-research.txt
+
+      - name: Compile labeler
+        run: python -m py_compile research/v40_step12a_counterfactual_label.py
+
+      - name: Download final Step 12A shadow artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -o block4.zip \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${STEP12A_BLOCK4_ARTIFACT_ID}/zip"
+          unzip -tq block4.zip
+          mkdir -p source
+          unzip -q block4.zip -d source
+          test -s source/v40_step12a_shadow_cycles.jsonl
+
+      - name: Label all currently mature candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python research/v40_step12a_counterfactual_label.py \
+            source/v40_step12a_shadow_cycles.jsonl \
+            --output v40_step12a_counterfactual_result.json \
+            | tee v40_step12a_counterfactual.log
+
+      - name: Validate safety
+        run: |
+          python - <<'PY'
+          import json
+          r=json.load(open("v40_step12a_counterfactual_result.json",encoding="utf-8"))
+          assert r["mode"]=="PUBLIC_CANDLE_READ_ONLY_RESEARCH"
+          assert r["qualified_total"]==119
+          assert r["frozen_policy"]["l2_thresholds_retuned"] is False
+          assert r["execution_enabled"] is False
+          assert r["authenticated_api_used"] is False
+          assert r["order_actions"] == 0
+          assert r["active_paper_changed"] is False
+          assert r["live_orders_possible"] is False
+          assert r["labeled_total"] + len(r["errors"]) >= r["mature_total"]
+          print("counterfactual safety OK")
+          PY
+
+      - name: Write summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r=json.load(open("v40_step12a_counterfactual_result.json",encoding="utf-8"))
+          print("# Step 12A counterfactual outcomes")
+          print()
+          print(f"- Qualified: {r['qualified_total']}")
+          print(f"- Mature now: {r['mature_total']}")
+          print(f"- Pending: {r['pending_total']}")
+          for name in ("overall","blocked","allowed_or_reduced"):
+              s=r[name]
+              print(f"- {name}: n={s['n']} W/L={s['wins']}/{s['losses']} mean={s['mean_net_pct']}% PF={s['profit_factor']}")
+          for state,s in r["by_state"].items():
+              print(f"- {state}: n={s['n']} W/L={s['wins']}/{s['losses']} mean={s['mean_net_pct']}% PF={s['profit_factor']}")
+          print("- L2 thresholds were not retuned.")
+          print("- PAPER/runtime/live unchanged.")
+          PY
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-v40-step12a-counterfactual
+          path: |
+            v40_step12a_counterfactual_result.json
+            v40_step12a_counterfactual.log
+          retention-days: 14
